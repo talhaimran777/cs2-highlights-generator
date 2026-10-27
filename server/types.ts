@@ -36,6 +36,13 @@ export interface BombEvent {
   site: string;
 }
 
+/** A shot (victim null) or a damage event, used to find when a fight starts. */
+export interface CombatEvent {
+  tick: number;
+  attacker: string | null;
+  victim: string | null;
+}
+
 export interface Round {
   num: number; // 1-based, as shown on the scoreboard
   startTick: number; // freeze time end (action starts)
@@ -56,6 +63,7 @@ export interface MatchData {
   rounds: Round[];
   kills: Kill[];
   bombs: BombEvent[];
+  combat: CombatEvent[];
 }
 
 /** Where I ended up after leaving spawn, per round. */
@@ -65,7 +73,7 @@ export interface RoundIntro {
   place: string;
 }
 
-export type MomentKind = 'intro' | 'kills' | 'clutch' | 'bomb' | 'assist' | 'decider' | 'death' | 'funny';
+export type MomentKind = 'intro' | 'kills' | 'clutch' | 'bomb' | 'assist' | 'team' | 'decider' | 'death' | 'funny';
 
 export interface Moment {
   id: string;
@@ -77,6 +85,8 @@ export interface Moment {
   /** first and last "action" ticks of the moment, before pre/post-roll */
   startTick: number;
   endTick: number;
+  /** played pieces with cuts between them (the intro); default [[startTick, endTick]] */
+  segments?: [number, number][];
   enabled: boolean;
   /** manual trim adjustments in seconds, applied after pre/post-roll */
   trimStart: number;

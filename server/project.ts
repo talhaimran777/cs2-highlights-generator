@@ -11,7 +11,7 @@ import { probe, type VideoInfo } from './util/ffmpeg.ts';
 import { DEFAULT_SETTINGS, type MatchData, type Moment, type RoundIntro, type Settings, type SyncModel } from './types.ts';
 
 /** Bump when parsing/moments change in a way saved projects should pick up. */
-const PROJECT_VERSION = 5;
+const PROJECT_VERSION = 9;
 
 export const DATA_DIR = resolve(process.env.CS2H_DATA ?? 'data');
 const PROJECTS_DIR = join(DATA_DIR, 'projects');

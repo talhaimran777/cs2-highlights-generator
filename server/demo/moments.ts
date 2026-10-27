@@ -1,7 +1,23 @@
 import type { Kill, MatchData, Moment, MomentKind, Round, RoundIntro } from '../types.ts';
 
 const CHAIN_GAP_S = 10; // own kills closer than this become one multi-kill clip
+const TEAM_FIGHT_GAP_S = 5; // teammate kills/deaths closer than this are one fight
 const INTRO_MIN_S = 2;
+
+// Round editing guidelines:
+// 2. Rotation: a short rotation plays whole; a long one shows enough to
+//    establish direction, then jumps to just before I arrive.
+const ROTATION_FULL_S = 12;
+const ROTATION_SHOW_S = 5;
+const ARRIVE_LEADIN_S = 2;
+// 3. Holding: a short hold plays unbroken into contact (tension); a long one
+//    keeps a few seconds of holding, then cuts closer to the action.
+const HOLD_FULL_S = 10;
+const HOLD_KEEP_S = 4;
+// 4. Contact: a fight starts at the first shot or damage involving the player,
+//    chained back through gaps shorter than CONTACT_GAP_S.
+const CONTACT_GAP_S = 5;
+const CONTACT_LOOKBACK_S = 12;
 const MULTI_BONUS: Record<number, number> = { 2: 5, 3: 15, 4: 30, 5: 60 };
 const MULTI_LABEL: Record<number, string> = { 1: 'Kill', 2: '2K', 3: '3K', 4: '4K', 5: 'ACE' };
 
@@ -29,6 +45,8 @@ export function buildMoments(match: MatchData, me: string, intros: Record<number
 
     const myKills = kills.filter((k) => k.attacker === me && k.victim !== me && !isTeamkill(k));
     const roundTotal = myKills.length;
+    const contact = (players: (string | null)[], tick: number) =>
+      Math.min(...players.filter((p): p is string => !!p).map((p) => contactStart(match, p, tick)), tick);
 
     for (const chain of chainKills(myKills, CHAIN_GAP_S * match.tickrate)) {
       const n = chain.length;
@@ -39,7 +57,7 @@ export function buildMoments(match: MatchData, me: string, intros: Record<number
         label: n === 1 ? `Kill · ${chain[0].weapon}` : MULTI_LABEL[Math.min(n, 5)],
         tags,
         score: chain.reduce((s, k) => s + killScore(k), 0) + (MULTI_BONUS[n] ?? 0),
-        startTick: chain[0].tick,
+        startTick: contact([me], chain[0].tick),
         endTick: chain[n - 1].tick,
       });
     }
@@ -82,7 +100,7 @@ export function buildMoments(match: MatchData, me: string, intros: Record<number
         label: funny ?? `Died to ${myDeath.attackerName || 'world'} · ${myDeath.weapon}`,
         tags: funny ? ['funny'] : ['death'],
         score: funny ? 6 : 2,
-        startTick: myDeath.tick,
+        startTick: contact([me], myDeath.tick),
         endTick: myDeath.tick,
       });
     }
@@ -94,7 +112,7 @@ export function buildMoments(match: MatchData, me: string, intros: Record<number
           label: `${k.flashAssist ? 'Flash assist' : 'Assist'} · ${k.attackerName} → ${k.victimName}`,
           tags: [k.flashAssist ? 'flash' : 'assist'],
           score: k.flashAssist ? 5 : 4,
-          startTick: k.tick,
+          startTick: contact([me], k.tick),
           endTick: k.tick,
         });
       }
@@ -110,6 +128,76 @@ export function buildMoments(match: MatchData, me: string, intros: Record<number
       }
     }
 
+    // Every action of mine this round: the opening runs to the first one, and
+    // the rest of the round (teammates, bomb) is told after the last one.
+    const ownTicks = [
+      ...kills.filter((k) => k.attacker === me || k.victim === me || k.assister === me).map((k) => k.tick),
+      ...bombs.filter((b) => b.player === me && b.kind !== 'exploded').map((b) => b.tick),
+    ].filter((t) => t <= round.endTick);
+    const lastAction = ownTicks.length ? Math.max(...ownTicks) : round.startTick;
+    // everything in roundMoments so far is my own play
+    const firstContact = roundMoments.length ? Math.min(...roundMoments.map((m) => m.startTick)) : null;
+
+    // 5. After I die, keep teammates' fights selectively: a multi-kill, a
+    // teammate clutch, or a fight while the round is still winnable.
+    if (myDeath) {
+      const mySide = round.roster[me];
+      const isMate = (id: string | null) => !!id && id !== me && !!mySide && round.roster[id] === mySide;
+      const after = kills.filter(
+        (k) => k.tick > myDeath.tick && k.tick <= round.endTick && (isMate(k.attacker) || isMate(k.victim)),
+      );
+      for (const fight of chainKills(after, TEAM_FIGHT_GAP_S * match.tickrate)) {
+        const won = fight.filter((k) => isMate(k.attacker) && !isMate(k.victim)).length;
+        const lost = fight.filter((k) => isMate(k.victim)).length;
+        const { mates, enemies } = aliveBefore(round, kills, me, fight[0].tick);
+
+        if (mates.length === 1 && enemies >= 1) {
+          // A teammate clutch is one moment to the end of the round. Long odds
+          // (1v4, 1v5) only count if they actually get a kill.
+          const rest = after.filter((k) => k.tick >= fight[0].tick);
+          const clutchKills = rest.filter((k) => k.attacker === mates[0] && !isMate(k.victim)).length;
+          if (enemies <= 3 || clutchKills > 0) {
+            add({
+              kind: 'team',
+              label: `Teammate clutch · ${playerName(match, rest, mates[0])} 1v${enemies}${clutchKills ? ` · ${clutchKills}K` : ''}`,
+              tags: ['teammates', 'clutch'],
+              score: 10 + 5 * clutchKills,
+              startTick: contact([fight[0].attacker, fight[0].victim], fight[0].tick),
+              endTick: rest.at(-1)!.tick,
+            });
+          }
+          break;
+        }
+        if (won < 2 && mates.length < enemies - 1) continue; // one-sided trade: skip
+
+        add({
+          kind: 'team',
+          label:
+            fight.length === 1
+              ? `Teammates · ${fight[0].attackerName || 'world'} killed ${fight[0].victimName}`
+              : `Teammates · ${[won && plural(won, 'kill'), lost && plural(lost, 'death')].filter(Boolean).join(', ')}`,
+          tags: won >= 2 ? ['teammates', 'multi-kill'] : ['teammates'],
+          score: 6 + 4 * won,
+          startTick: contact([fight[0].attacker, fight[0].victim], fight[0].tick),
+          endTick: fight.at(-1)!.tick,
+        });
+      }
+    }
+
+    // Bomb plays by others after my last action (mine are added above).
+    for (const b of bombs) {
+      if (b.player === me || b.kind === 'exploded' || b.tick <= lastAction || b.tick > round.endTick) continue;
+      const planted = b.kind === 'planted';
+      add({
+        kind: 'bomb',
+        label: `${planted ? `Bomb planted${b.site ? ` (${b.site})` : ''}` : 'Defused'}${b.player ? ` · ${nameOf(match, b.player)}` : ''}`,
+        tags: [b.kind],
+        score: planted ? 4 : 8,
+        startTick: b.tick - (planted ? 3 : 5) * match.tickrate,
+        endTick: b.tick,
+      });
+    }
+
     const decider = findDecider(round, kills, bombs.filter((b) => b.kind !== 'planted'), match.tickrate);
     if (decider && decider.player !== me && !roundMoments.some((m) => covers(m, decider.tick))) {
       add({
@@ -122,32 +210,79 @@ export function buildMoments(match: MatchData, me: string, intros: Record<number
       });
     }
 
-    // Rounds where I do something open on me leaving spawn and run, in real
-    // time, up to my first action. While this moment is enabled the planner
-    // plays the whole round unbroken up to its last highlight.
-    const ownTicks = [
-      ...kills.filter((k) => k.attacker === me || k.victim === me || k.assister === me).map((k) => k.tick),
-      ...bombs.filter((b) => b.player === me && b.kind !== 'exploded').map((b) => b.tick),
-    ].filter((t) => t <= round.endTick);
-    if (ownTicks.length > 0) {
-      const firstAction = Math.min(...ownTicks);
-      const place = intros[round.num]?.place;
-      if (firstAction - round.startTick >= INTRO_MIN_S * match.tickrate) {
-        add({
-          kind: 'intro',
-          label: place ? `Spawn → ${place}` : 'Round start',
-          tags: ['full round'],
-          score: 0,
-          startTick: round.startTick,
-          endTick: firstAction,
-        });
-      }
+    // 1-3. Rounds where I do something open as the buy phase ends: the
+    // rotation to my spot, some holding, then into first contact.
+    if (firstContact !== null && firstContact - round.startTick >= INTRO_MIN_S * match.tickrate) {
+      const intro = intros[round.num];
+      const segments = openingSegments(round.startTick, intro?.arriveTick ?? firstContact, firstContact, match.tickrate);
+      add({
+        kind: 'intro',
+        label: intro?.place ? `Spawn → ${intro.place}` : 'Round start',
+        tags: ['opening'],
+        score: 0,
+        startTick: round.startTick,
+        endTick: segments.at(-1)![1],
+        segments,
+      });
     }
 
     out.push(...roundMoments.sort((a, b) => a.startTick - b.startTick));
   }
   return out;
 }
+
+/**
+ * The opening as played pieces: spawn → spot (shortened if long), a few
+ * seconds of holding (unbroken into contact if the hold is short).
+ * `contact` is where my first play's own clip begins.
+ */
+export function openingSegments(start: number, arrive: number, contact: number, tickrate: number): [number, number][] {
+  const s = (sec: number) => sec * tickrate;
+  const a = Math.min(Math.max(arrive, start), contact);
+  const pieces: [number, number][] =
+    a - start <= s(ROTATION_FULL_S)
+      ? [[start, a]]
+      : [[start, start + s(ROTATION_SHOW_S)], [a - s(ARRIVE_LEADIN_S), a]];
+  pieces.push(contact - a <= s(HOLD_FULL_S) ? [a, contact] : [a, a + s(HOLD_KEEP_S)]);
+  // join touching pieces
+  return pieces.reduce<[number, number][]>((acc, p) => {
+    const last = acc.at(-1);
+    if (last && p[0] <= last[1]) last[1] = Math.max(last[1], p[1]);
+    else if (p[1] > p[0]) acc.push([...p]);
+    return acc;
+  }, []);
+}
+
+/** First shot or damage of `player` in the fight that ends at `tick`. */
+export function contactStart(match: MatchData, player: string, tick: number): number {
+  const from = tick - CONTACT_LOOKBACK_S * match.tickrate;
+  const ticks = match.combat
+    .filter((c) => c.tick >= from && c.tick <= tick && (c.attacker === player || c.victim === player))
+    .map((c) => c.tick)
+    .sort((a, b) => b - a);
+  let start = tick;
+  for (const t of ticks) {
+    if (start - t > CONTACT_GAP_S * match.tickrate) break;
+    start = t;
+  }
+  return start;
+}
+
+/** Who is alive just before `tick`: my teammates (excluding me) and the number of enemies. */
+function aliveBefore(round: Round, kills: Kill[], me: string, tick: number) {
+  const mySide = round.roster[me];
+  const dead = new Set(kills.filter((k) => k.tick < tick).map((k) => k.victim));
+  const alive = Object.entries(round.roster).filter(([id]) => !dead.has(id));
+  return {
+    mates: alive.filter(([id, s]) => s === mySide && id !== me).map(([id]) => id),
+    enemies: alive.filter(([, s]) => s !== mySide).length,
+  };
+}
+
+const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
+const nameOf = (match: MatchData, id: string) => match.players.find((p) => p.steamId === id)?.name ?? 'someone';
+const playerName = (match: MatchData, kills: Kill[], id: string) =>
+  kills.find((k) => k.attacker === id)?.attackerName ?? kills.find((k) => k.victim === id)?.victimName ?? nameOf(match, id);
 
 export function chainKills(kills: Kill[], maxGapTicks: number): Kill[][] {
   const chains: Kill[][] = [];
@@ -240,4 +375,4 @@ function findDecider(
 
 const covers = (m: Moment, tick: number) => tick >= m.startTick && tick <= m.endTick;
 
-export const KIND_ORDER: MomentKind[] = ['intro', 'clutch', 'kills', 'bomb', 'assist', 'decider', 'funny', 'death'];
+export const KIND_ORDER: MomentKind[] = ['intro', 'clutch', 'kills', 'bomb', 'assist', 'team', 'decider', 'funny', 'death'];

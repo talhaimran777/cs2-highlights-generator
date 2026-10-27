@@ -2,7 +2,7 @@ import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
 import { gunzipSync } from 'node:zlib';
 import { decompress as zstdDecompress } from 'fzstd';
-import type { BombEvent, Kill, MatchData, Player, Round, RoundIntro, Side } from '../types.ts';
+import type { BombEvent, CombatEvent, Kill, MatchData, Player, Round, RoundIntro, Side } from '../types.ts';
 
 const require = createRequire(import.meta.url);
 const dp = require('@laihoe/demoparser2') as typeof import('@laihoe/demoparser2');
@@ -47,6 +47,8 @@ export function parseDemo(demoPath: string, mySteamId?: string): MatchData {
       'bomb_planted',
       'bomb_defused',
       'bomb_exploded',
+      'weapon_fire',
+      'player_hurt',
     ],
     ['team_num'],
     ['is_warmup_period'],
@@ -58,10 +60,15 @@ export function parseDemo(demoPath: string, mySteamId?: string): MatchData {
   const roundAt = makeRoundLookup(rounds);
   const kills: Kill[] = [];
   const bombs: BombEvent[] = [];
+  const combat: CombatEvent[] = [];
   for (const e of events) {
     const round = roundAt(e.tick);
     if (round === 0) continue;
-    if (e.event_name === 'player_death') {
+    if (e.event_name === 'weapon_fire') {
+      combat.push({ tick: e.tick, attacker: sid(e.user_steamid), victim: null });
+    } else if (e.event_name === 'player_hurt') {
+      combat.push({ tick: e.tick, attacker: sid(e.attacker_steamid), victim: sid(e.user_steamid) });
+    } else if (e.event_name === 'player_death') {
       const victim = sid(e.user_steamid);
       if (!victim) continue;
       kills.push({
@@ -94,6 +101,7 @@ export function parseDemo(demoPath: string, mySteamId?: string): MatchData {
     }
   }
 
+  nameBombSites(buf, bombs);
   if (mySteamId) scoreRounds(rounds, mySteamId);
 
   return {
@@ -104,6 +112,7 @@ export function parseDemo(demoPath: string, mySteamId?: string): MatchData {
     rounds,
     kills,
     bombs,
+    combat,
   };
 }
 
@@ -142,6 +151,20 @@ export function buildRounds(events: Row[]): Round[] {
     }
   }
   return rounds;
+}
+
+/**
+ * bomb_planted's `site` is an entity index, not A/B. The planter's place name
+ * at the plant tick ("BombsiteA") gives the readable site.
+ */
+function nameBombSites(buf: Buffer, bombs: BombEvent[]) {
+  const plants = bombs.filter((b) => b.kind === 'planted' && b.player);
+  const rows = plants.length ? (dp.parseTicks(buf, ['last_place_name'], plants.map((b) => b.tick)) as Row[]) : [];
+  for (const b of bombs) {
+    const row = rows.find((r) => r.tick === b.tick && String(r.steamid) === b.player);
+    const place = humanizePlace(row?.last_place_name);
+    b.site = /^Bombsite ([AB])$/.exec(place)?.[1] ?? place;
+  }
 }
 
 /** Round that owns a tick: from its freeze end until the next round's freeze end. */

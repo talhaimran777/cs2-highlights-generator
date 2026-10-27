@@ -40,6 +40,7 @@ const match: MatchData = {
   ],
   kills,
   bombs: [],
+  combat: [],
 };
 scoreRounds(match.rounds, ME);
 

@@ -3,27 +3,25 @@ import type { Clip, MatchData, Moment, Settings, SyncModel } from '../types.ts';
 
 /**
  * Enabled moments -> recording time ranges with pre/post-roll. Overlapping or
- * nearly touching ranges in the same round merge into one clip. A round whose
- * intro is enabled plays unbroken from spawn to its last highlight. Everything
- * not covered (freeze time, pauses, dead time) is simply never cut in.
+ * nearly touching ranges in the same round merge into one clip. The intro ends
+ * exactly where my first action's clip begins, so the two play as one unbroken
+ * opening. Everything not covered (holds, dead time, pauses) is never cut in.
  */
 export function planClips(moments: Moment[], sync: SyncModel, settings: Settings, videoDuration: number): Clip[] {
-  const fullRounds = new Set(moments.filter((m) => m.kind === 'intro' && m.enabled).map((m) => m.round));
   const ranges = moments
     .filter((m) => m.enabled)
-    .map((m) => {
-      // The intro starts right as freeze time ends and runs into the first action.
+    .flatMap((m) => {
+      // The intro starts right as freeze time ends; its pieces are played as-is.
       const pre = m.kind === 'intro' ? 1 : m.kind === 'clutch' ? settings.clutchPreRoll : settings.preRoll;
       const post = m.kind === 'intro' ? 0 : settings.postRoll;
-      const start = videoTime(sync, m.startTick, m.round) - pre + m.trimStart;
-      const end = videoTime(sync, m.endTick, m.round) + post + m.trimEnd;
-      return {
+      const pieces = m.segments ?? [[m.startTick, m.endTick]];
+      return pieces.map(([from, to], i) => ({
         round: m.round,
-        start: Math.max(0, start),
-        end: Math.min(videoDuration, end),
+        start: Math.max(0, videoTime(sync, from, m.round) + (i === 0 ? m.trimStart - pre : 0)),
+        end: Math.min(videoDuration, videoTime(sync, to, m.round) + (i === pieces.length - 1 ? post + m.trimEnd : 0)),
         momentIds: [m.id],
         label: m.label,
-      };
+      }));
     })
     .filter((c) => c.end - c.start > 0.5)
     .sort((a, b) => a.start - b.start);
@@ -31,10 +29,14 @@ export function planClips(moments: Moment[], sync: SyncModel, settings: Settings
   const clips: Clip[] = [];
   for (const r of ranges) {
     const last = clips.at(-1);
-    if (last && last.round === r.round && (fullRounds.has(r.round) || r.start - last.end <= settings.mergeGap)) {
+    if (last && last.round === r.round && r.start - last.end <= settings.mergeGap) {
       last.end = Math.max(last.end, r.end);
-      last.momentIds.push(...r.momentIds);
-      last.label += ` + ${r.label}`;
+      for (const id of r.momentIds) {
+        if (!last.momentIds.includes(id)) {
+          last.momentIds.push(id);
+          last.label += ` + ${r.label}`;
+        }
+      }
     } else {
       clips.push({ ...r });
     }

@@ -11,9 +11,10 @@ const STEPS: { id: Step; label: string }[] = [
 ];
 
 const KIND_LABEL: Record<Moment['kind'], string> = {
-  intro: 'Full round', clutch: 'Clutch', kills: 'Kills', bomb: 'Bomb', assist: 'Assist', decider: 'Round end', funny: 'Funny', death: 'Death',
+  intro: 'Opening', clutch: 'Clutch', kills: 'Kills', bomb: 'Bomb', assist: 'Assist', team: 'Teammates', decider: 'Round end', funny: 'Funny', death: 'Death',
 };
-const FULL_ROUND_HINT = 'Plays the round unbroken from spawn to its last highlight. Untick to cut straight to the action.';
+const FULL_ROUND_HINT =
+  'Opening: your rotation to your spot (shortened if long) and a few seconds of holding, leading into first contact. Untick to start the round at your first fight.';
 
 export function App() {
   const [projectId, setProjectId] = useState(() => location.hash.slice(1));

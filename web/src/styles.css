@@ -18,6 +18,7 @@
   --death: #94a3b8;
   --intro: #2dd4bf;
   --assist: #fbbf24;
+  --team: #38bdf8;
   color-scheme: dark;
 }
 
@@ -137,6 +138,7 @@ select.input { width: auto; max-width: 100%; flex: 1; }
 .kind-death { --c: var(--death); }
 .kind-intro { --c: var(--intro); }
 .kind-assist { --c: var(--assist); }
+.kind-team { --c: var(--team); }
 
 .round { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; display: grid; gap: 6px; }
 .round.empty { opacity: 0.55; padding: 8px 12px; }

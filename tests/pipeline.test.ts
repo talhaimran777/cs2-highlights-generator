@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { arrival, buildRounds, humanizePlace } from '../server/demo/parse.ts';
-import { buildMoments, findClutch } from '../server/demo/moments.ts';
+import { buildMoments, contactStart, findClutch, openingSegments } from '../server/demo/moments.ts';
 import { fitSync, manualSync, videoTime } from '../server/sync/align.ts';
 import { countHighlightedEntries, countsToEvents } from '../server/sync/killfeed.ts';
 import { planClips } from '../server/edit/plan.ts';
@@ -49,7 +49,7 @@ describe('buildRounds', () => {
 describe('moments', () => {
   it('chains close kills into a multi-kill, keeps separate kills apart', () => {
     const match: MatchData = {
-      demoPath: '', map: 'de_mirage', tickrate: TR, players: [], bombs: [],
+      demoPath: '', map: 'de_mirage', tickrate: TR, players: [], bombs: [], combat: [],
       rounds: [round(1, 0, 100, 'CT')],
       kills: [
         kill(s(10), 1, ME, 'e1', { headshot: true }),
@@ -73,7 +73,7 @@ describe('moments', () => {
       kill(s(35), 1, ME, 'e3'),
     ];
     expect(findClutch(r, kills, ME)).toEqual({ startTick: s(20), vs: 3 });
-    const m = buildMoments({ demoPath: '', map: '', tickrate: TR, players: [], bombs: [], rounds: [r], kills }, ME);
+    const m = buildMoments({ demoPath: '', map: '', tickrate: TR, players: [], bombs: [], combat: [], rounds: [r], kills }, ME);
     expect(m.map((x) => x.kind)).toEqual(['intro', 'clutch']);
     expect(m[1].label).toBe('1v3 clutch · 3K');
   });
@@ -85,7 +85,7 @@ describe('moments', () => {
 
   it('adds the round decider when it is not mine, and funny deaths', () => {
     const match: MatchData = {
-      demoPath: '', map: '', tickrate: TR, players: [], bombs: [],
+      demoPath: '', map: '', tickrate: TR, players: [], bombs: [], combat: [],
       rounds: [round(1, 0, 60, 'CT')],
       kills: [kill(s(20), 1, 'e1', ME, { weapon: 'knife_karambit' }), kill(s(58), 1, 'm2', 'e3')],
     };
@@ -93,7 +93,8 @@ describe('moments', () => {
     expect(m.map((x) => [x.kind, x.label])).toEqual([
       ['intro', 'Round start'],
       ['funny', 'Knifed by e1'],
-      ['decider', 'Round-ending kill · m2 (ak47)'],
+      // the round-ending kill is my teammate's fight after I died, so no separate round end
+      ['team', 'Teammates · m2 killed e3'],
     ]);
   });
 });
@@ -130,12 +131,40 @@ describe('round intro', () => {
   });
 
   const match = (kills: Kill[]): MatchData => ({
-    demoPath: '', map: '', tickrate: TR, players: [], bombs: [], rounds: [round(1, 100, 200, 'CT')], kills,
+    demoPath: '', map: '', tickrate: TR, players: [], bombs: [], combat: [], rounds: [round(1, 100, 200, 'CT')], kills,
   });
 
-  it('runs from spawn to my first action, however long the hold', () => {
+  it('opening: short rotation plays whole, short hold runs unbroken into contact', () => {
+    // arrive after 8 s, contact 6 s later
+    expect(openingSegments(s(100), s(108), s(114), TR)).toEqual([[s(100), s(114)]]);
+  });
+
+  it('opening: long rotation is shortened, long hold keeps 4 s', () => {
+    // arrive after 20 s, contact 40 s later
+    expect(openingSegments(s(100), s(120), s(160), TR)).toEqual([
+      [s(100), s(105)], // establish direction
+      [s(118), s(124)], // just before arriving + 4 s holding
+    ]);
+  });
+
+  it('intro uses the opening pieces and leads into my first fight', () => {
     const m = buildMoments(match([kill(s(180), 1, ME, 'e1')]), ME, { 1: { arriveTick: s(110), place: 'Banana' } });
-    expect(m[0]).toMatchObject({ kind: 'intro', label: 'Spawn → Banana', startTick: s(100), endTick: s(180) });
+    expect(m[0]).toMatchObject({
+      kind: 'intro',
+      label: 'Spawn → Banana',
+      segments: [[s(100), s(114)]],
+    });
+  });
+
+  it('a fight starts at first contact, not at the kill', () => {
+    const fight = { ...match([kill(s(150), 1, ME, 'e1')]), combat: [
+      { tick: s(120), attacker: ME, victim: null }, // unrelated earlier shot (gap > 5 s)
+      { tick: s(141), attacker: 'e1', victim: ME }, // got hit: the fight starts
+      { tick: s(144), attacker: ME, victim: null },
+      { tick: s(149), attacker: ME, victim: 'e1' },
+    ] };
+    expect(contactStart(fight, ME, s(150))).toBe(s(141));
+    expect(buildMoments(fight, ME).find((x) => x.kind === 'kills')!.startTick).toBe(s(141));
   });
 
   it('an assist or my death also ends the opening', () => {
@@ -150,12 +179,79 @@ describe('round intro', () => {
       { ...match([]), bombs: [{ tick: s(140), round: 1, kind: 'planted', player: ME, site: 'B' }] },
       ME,
     );
-    expect(m[0]).toMatchObject({ kind: 'intro', endTick: s(140) });
+    // the plant's own clip starts 3 s earlier (animation); the opening leads into that
+    expect(m[0]).toMatchObject({ kind: 'intro', endTick: s(137) });
   });
 
   it('quiet rounds (nothing from me) get no opening', () => {
     const m = buildMoments(match([kill(s(195), 1, 'm2', 'e1')]), ME, { 1: { arriveTick: s(110), place: '' } });
     expect(m.map((x) => x.kind)).toEqual(['decider']);
+  });
+
+  it('after I die: teammates fights, grouped by 5 s', () => {
+    const m = buildMoments(
+      match([
+        kill(s(110), 1, 'm2', 'e1'), // before my death: not a teammate clip
+        kill(s(120), 1, 'e1', ME),
+        kill(s(140), 1, 'm2', 'e2'),
+        kill(s(143), 1, 'e3', 'm2'),
+        kill(s(170), 1, 'm3', 'e3'),
+      ]),
+      ME,
+    );
+    expect(m.filter((x) => x.kind === 'team').map((x) => [x.label, x.startTick, x.endTick])).toEqual([
+      ['Teammates · 1 kill, 1 death', s(140), s(143)], // 2v2: still winnable
+      ['Teammate clutch · m3 1v1 · 1K', s(170), s(170)],
+    ]);
+  });
+
+  it('after I die: a hopeless fight is skipped, a teammate clutch is kept', () => {
+    const roster = { [ME]: 'CT', m2: 'CT', m3: 'CT', e1: 'T', e2: 'T', e3: 'T', e4: 'T' } as Round['roster'];
+    const m = buildMoments(
+      {
+        ...match([]),
+        rounds: [{ ...round(1, 100, 200, 'T'), roster }],
+        kills: [
+          kill(s(120), 1, 'e1', ME), // now 2v4
+          kill(s(150), 1, 'e1', 'm2'), // 2v4, one-sided: skipped
+          kill(s(170), 1, 'm3', 'e2'), // m3 alone vs 4 gets a kill: clutch kept,
+          kill(s(185), 1, 'e3', 'm3'), // as one moment to the end
+        ],
+      },
+      ME,
+    );
+    expect(m.filter((x) => x.kind === 'team').map((x) => [x.label, x.endTick])).toEqual([
+      ['Teammate clutch · m3 1v4 · 1K', s(185)],
+    ]);
+  });
+
+  it('after I die: a 1v4 with no kill is not worth showing', () => {
+    const roster = { [ME]: 'CT', m3: 'CT', e1: 'T', e2: 'T', e3: 'T', e4: 'T' } as Round['roster'];
+    const m = buildMoments(
+      { ...match([]), rounds: [{ ...round(1, 100, 200, 'T'), roster }], kills: [kill(s(120), 1, 'e1', ME), kill(s(170), 1, 'e2', 'm3')] },
+      ME,
+    );
+    expect(m.filter((x) => x.kind === 'team')).toEqual([]);
+  });
+
+  it('when I survive: no teammate clips; others bomb plays only after my last action', () => {
+    const m = buildMoments(
+      {
+        ...match([kill(s(130), 1, ME, 'e1'), kill(s(150), 1, 'm2', 'e2')]),
+        bombs: [
+          { tick: s(120), round: 1, kind: 'planted', player: 'e1', site: 'A' }, // before my last kill
+          { tick: s(195), round: 1, kind: 'defused', player: 'm2', site: '' }, // ends the round
+        ],
+        players: [{ steamId: 'm2', name: 'Buddy' }],
+      },
+      ME,
+    );
+    expect(m.map((x) => [x.kind, x.label])).toEqual([
+      ['intro', 'Round start'],
+      ['kills', 'Kill · ak47'],
+      // the defuse is the round end, so no separate round-end clip
+      ['bomb', 'Defused · Buddy'],
+    ]);
   });
 
   it('adds assists as their own moments', () => {
@@ -256,10 +352,12 @@ describe('clip planning', () => {
     { ...base, id: 'n', round: 4, kind: 'kills', label: 'Kill', startTick: s(240), endTick: s(240) },
   ];
 
-  it('plays a round with its intro on unbroken, from spawn to the last highlight', () => {
+  it('the opening plays unbroken into my first action, later moments are cut', () => {
     const clips = planClips(fullRound(true), manualSync(0, 0, TR), DEFAULT_SETTINGS, 1000);
     expect(clips.map((c) => [c.round, c.start, c.end, c.momentIds])).toEqual([
-      [3, 99, 192, ['i', 'k', 'k2', 'd']],
+      [3, 99, 142, ['i', 'k']],
+      [3, 167, 172, ['k2']],
+      [3, 185, 192, ['d']],
       [4, 237, 242, ['n']],
     ]);
   });
