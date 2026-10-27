@@ -11,7 +11,7 @@ import { probe, type VideoInfo } from './util/ffmpeg.ts';
 import { DEFAULT_SETTINGS, type MatchData, type Moment, type RoundIntro, type Settings, type SyncModel } from './types.ts';
 
 /** Bump when parsing/moments change in a way saved projects should pick up. */
-const PROJECT_VERSION = 9;
+const PROJECT_VERSION = 10;
 
 export const DATA_DIR = resolve(process.env.CS2H_DATA ?? 'data');
 const PROJECTS_DIR = join(DATA_DIR, 'projects');
@@ -66,6 +66,7 @@ export function getProject(id: string): Project | null {
  */
 function upgradeProject(p: Project) {
   p.settings = { ...DEFAULT_SETTINGS, ...p.settings };
+  if (existsSync(p.videoPath)) p.video = probe(p.videoPath); // newer probes read the encoding settings
   if (existsSync(p.demoPath)) {
     p.match = parseDemo(p.demoPath);
     if (hasPlayer(p)) analyzePlayer(p);

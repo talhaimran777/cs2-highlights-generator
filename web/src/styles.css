@@ -140,6 +140,14 @@ select.input { width: auto; max-width: 100%; flex: 1; }
 .kind-assist { --c: var(--assist); }
 .kind-team { --c: var(--team); }
 
+.quality { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; display: grid; gap: 6px; }
+.quality-head { display: flex; align-items: baseline; gap: 8px; }
+.quality table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.quality th { text-align: left; font-size: 11px; font-weight: 600; color: var(--muted); padding: 2px 8px 4px 0; }
+.quality td { padding: 3px 8px 3px 0; border-top: 1px solid var(--line); }
+.quality td.match { color: var(--ok); }
+.quality td.mismatch { color: var(--warn); }
+
 .round { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; display: grid; gap: 6px; }
 .round.empty { opacity: 0.55; padding: 8px 12px; }
 .round-head { display: flex; align-items: center; gap: 8px; }

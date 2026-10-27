@@ -1,8 +1,9 @@
 import type { Clip, Kill, MatchData, Moment, Settings, SyncModel } from '../../server/types.ts';
 import type { VideoInfo } from '../../server/util/ffmpeg.ts';
 import type { Job } from '../../server/jobs.ts';
+import type { ExportSettings } from '../../server/edit/render.ts';
 
-export type { Clip, Kill, Moment, Settings, SyncModel, Job };
+export type { Clip, Kill, Moment, Settings, SyncModel, Job, ExportSettings };
 
 export interface ProjectView {
   id: string;
@@ -21,6 +22,7 @@ export interface ProjectView {
   defaultOutputPath: string;
   /** false when the remembered player isn't in this match */
   hasPlayer: boolean;
+  exportSettings: ExportSettings;
   anchors: { tick: number; round: number }[];
 }
 

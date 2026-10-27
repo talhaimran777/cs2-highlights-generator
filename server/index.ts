@@ -9,6 +9,7 @@ import {
 } from './project.ts';
 import { manualSync } from './sync/align.ts';
 import { totalDuration } from './edit/plan.ts';
+import { exportSettings } from './edit/render.ts';
 import { checkFfmpeg, hasNvenc } from './util/ffmpeg.ts';
 import type { Settings } from './types.ts';
 
@@ -33,6 +34,7 @@ function view(p: Project) {
     reelDuration: totalDuration(clips),
     defaultOutputPath: defaultOutputPath(p),
     hasPlayer: hasPlayer(p),
+    exportSettings: exportSettings(p.video),
     anchors: hasPlayer(p) ? syncAnchors(p) : [],
   };
 }

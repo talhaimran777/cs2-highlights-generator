@@ -510,6 +510,7 @@ function ExportStep({ p, setP, update }: { p: ProjectView; setP: (p: ProjectView
             <span>Round title cards (ROUND 7 · 4–2 · 3K)</span>
           </label>
         </div>
+        <QualityMatch p={p} />
         <label className="field">
           <span>Save to</span>
           <input className="input mono" value={out} onChange={(e) => setOut(e.target.value)} />
@@ -537,6 +538,60 @@ function ExportStep({ p, setP, update }: { p: ProjectView; setP: (p: ProjectView
         </section>
       )}
     </>
+  );
+}
+
+const CODEC_NAME: Record<string, string> = { h264: 'H.264', hevc: 'HEVC (H.265)', av1: 'AV1' };
+const mbps = (b: number | null) => (b ? `${(b / 1e6).toFixed(1)} Mbps` : 'unknown');
+const kbps = (b: number | null) => (b ? `${Math.round(b / 1000)} kbps` : 'unknown');
+
+/** Source recording vs export encoding, so it's clear the reel keeps the original quality. */
+function QualityMatch({ p }: { p: ProjectView }) {
+  const src = p.video.encoding;
+  const x = p.exportSettings;
+  const fps = (() => {
+    const [n, d] = p.video.fps.split('/').map(Number);
+    return d ? Math.round((n / d) * 100) / 100 : n;
+  })();
+  const rows: [string, string, string, boolean][] = [
+    ['Video', `${CODEC_NAME[src.codec] ?? src.codec}${src.profile ? ` ${src.profile}` : ''}`, `${CODEC_NAME[x.codec] ?? x.codec}${x.profile ? ` ${x.profile}` : ''} · ${x.encoder}`, x.sameCodec],
+    ['Bitrate', mbps(src.bitRate), x.bitRate ? mbps(x.bitRate) : 'quality mode (CQ)', !!x.bitRate],
+    ['Resolution', `${p.video.width}×${p.video.height} @ ${fps} fps`, `${p.video.width}×${p.video.height} @ ${fps} fps`, true],
+    ...p.video.audio.map((a, i): [string, string, string, boolean] => [
+      p.video.audio.length > 1 ? `Audio ${i + 1}` : 'Audio',
+      `${a.codec.toUpperCase()} ${a.sampleRate / 1000} kHz · ${kbps(a.bitRate)}`,
+      `${x.audio[i].encoder.toUpperCase()} ${x.audio[i].sampleRate / 1000} kHz · ${kbps(x.audio[i].bitRate)}`,
+      true,
+    ]),
+  ];
+  return (
+    <div className="quality">
+      <div className="quality-head">
+        <strong>Quality</strong>
+        <span className="muted small">Export matches your original recording</span>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th />
+            <th>Original</th>
+            <th>Export</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(([name, a, b, ok]) => (
+            <tr key={name}>
+              <td className="muted">{name}</td>
+              <td>{a}</td>
+              <td className={ok ? 'match' : 'mismatch'}>
+                {ok ? '✓ ' : '⚠ '}
+                {b}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }
 
