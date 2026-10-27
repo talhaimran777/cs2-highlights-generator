@@ -19,6 +19,12 @@ const DEMO_EXT = ['.dem', '.zst', '.gz'];
 
 const app = Fastify({ logger: { level: 'warn' } });
 
+// Must be set before the routes: Fastify binds each route to the handler in place when it's declared.
+app.setErrorHandler((err: any, _req, reply) => {
+  console.error(err);
+  reply.code(err.statusCode ?? 500).send({ error: err.message || String(err) });
+});
+
 function load(id: string): Project {
   const p = getProject(id);
   if (!p) throw Object.assign(new Error('Project not found'), { statusCode: 404 });
@@ -196,9 +202,6 @@ if (existsSync(webDist)) {
   app.setNotFoundHandler((req, reply) => (req.url.startsWith('/api') ? reply.code(404).send() : reply.sendFile('index.html')));
 }
 
-app.setErrorHandler((err: any, _req, reply) => {
-  reply.code(err.statusCode ?? 500).send({ error: err.message });
-});
 
 await app.listen({ port: PORT, host: '127.0.0.1' });
 console.log(`CS2 Highlights → http://localhost:${existsSync(webDist) ? PORT : 5173}`);

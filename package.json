@@ -18,7 +18,8 @@
     "@fastify/static": "^10.1.7",
     "@laihoe/demoparser2": "^0.42.0",
     "fastify": "^5.12.7",
-    "fzstd": "^0.1.1"
+    "fzstd": "^0.1.1",
+    "snappyjs": "^0.7.0"
   },
   "devDependencies": {
     "@types/node": "^22.20.5",

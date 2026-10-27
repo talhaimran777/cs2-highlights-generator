@@ -41,7 +41,8 @@ async function req<T>(method: string, url: string, body?: unknown): Promise<T> {
     body: body ? JSON.stringify(body) : undefined,
   });
   const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(data.error ?? `${r.status} ${r.statusText}`);
+  // Fastify's own error bodies put the reason in `message` and the status text in `error`.
+  if (!r.ok) throw new Error(data.message ?? data.error ?? `${r.status} ${r.statusText}`);
   return data as T;
 }
 

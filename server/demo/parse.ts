@@ -2,6 +2,7 @@ import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
 import { gunzipSync } from 'node:zlib';
 import { decompress as zstdDecompress } from 'fzstd';
+import { repairDemo } from './repair.ts';
 import type { BombEvent, CombatEvent, Kill, MatchData, Player, Round, RoundIntro, Side } from '../types.ts';
 
 const require = createRequire(import.meta.url);
@@ -31,7 +32,21 @@ const sid = (v: unknown): string | null =>
 
 export function parseDemo(demoPath: string, mySteamId?: string): MatchData {
   const buf = loadDemo(demoPath);
+  try {
+    return parseBuffer(demoPath, buf, mySteamId);
+  } catch (e) {
+    if (!/MalformedMessage/.test(String((e as Error)?.message ?? e))) throw e;
+    // A game event with a broken string makes the parser reject the whole demo.
+    const fixed = repairDemo(buf);
+    if (fixed.repaired === 0) {
+      throw new Error('The demo parser could not read this demo (MalformedMessage), and no broken text was found to repair. The file may be damaged; try downloading it again.');
+    }
+    console.warn(`Repaired ${fixed.repaired} broken text value(s) in ${demoPath}`);
+    return parseBuffer(demoPath, fixed.buf, mySteamId);
+  }
+}
 
+function parseBuffer(demoPath: string, buf: Buffer, mySteamId?: string): MatchData {
   const header = dp.parseHeader(buf) as Row;
   const players: Player[] = (dp.parsePlayerInfo(buf) as Row[])
     .filter((p) => sid(p.steamid))
