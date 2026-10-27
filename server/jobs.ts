@@ -31,6 +31,13 @@ export function startJob(
   return view(job);
 }
 
+/** The most recent job of a kind for a project (running or finished). */
+export function latestJob(projectId: string, kind: string): Job | null {
+  const all = [...jobs.values()].filter((j) => j.projectId === projectId && j.kind === kind);
+  const last = all.at(-1);
+  return last ? view(last) : null;
+}
+
 export function getJob(id: string): Job | null {
   const j = jobs.get(id);
   return j ? view(j) : null;

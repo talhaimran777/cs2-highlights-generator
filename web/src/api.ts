@@ -23,6 +23,8 @@ export interface ProjectView {
   /** false when the remembered player isn't in this match */
   hasPlayer: boolean;
   exportSettings: ExportSettings;
+  speech?: { tracks: number[]; raw: [number, number][]; utterances: [number, number][] } | null;
+  speechJob: Job | null;
   anchors: { tick: number; round: number }[];
 }
 
@@ -58,6 +60,7 @@ export const api = {
     req<ProjectView>('POST', `/api/projects/${id}/sync/manual`, { tick, videoSec }),
   nudge: (id: string, delta: number, round?: number) => req<ProjectView>('POST', `/api/projects/${id}/sync/nudge`, { delta, round }),
   render: (id: string) => req<Job>('POST', `/api/projects/${id}/render`),
+  detectSpeech: (id: string) => req<Job>('POST', `/api/projects/${id}/speech`),
   job: (id: string) => req<Job | null>('GET', `/api/jobs/${id}`),
   cancel: (id: string) => req('DELETE', `/api/jobs/${id}`),
 };

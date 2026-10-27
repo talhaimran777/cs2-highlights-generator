@@ -8,6 +8,7 @@ import { fitSync, type Anchor } from './sync/align.ts';
 import { planClips, roundCardText } from './edit/plan.ts';
 import { renderReel } from './edit/render.ts';
 import { probe, type VideoInfo } from './util/ffmpeg.ts';
+import { detectSpeech, type Speech } from './audio/speech.ts';
 import { DEFAULT_SETTINGS, type MatchData, type Moment, type RoundIntro, type Settings, type SyncModel } from './types.ts';
 
 /** Bump when parsing/moments change in a way saved projects should pick up. */
@@ -31,6 +32,8 @@ export interface Project {
   moments: Moment[];
   sync: SyncModel | null;
   killfeedEvents: number[] | null;
+  /** speech in the recording's voice track(s), so cuts never land mid-sentence */
+  speech?: Speech | null;
   outputPath: string | null;
 }
 
@@ -53,6 +56,8 @@ export function getProject(id: string): Project | null {
   const f = join(PROJECTS_DIR, `${basename(id)}.json`);
   if (!existsSync(f)) return null;
   const p: Project = JSON.parse(readFileSync(f, 'utf8'));
+  // settings added after this project was saved get their defaults
+  p.settings = { ...DEFAULT_SETTINGS, ...p.settings };
   if (p.version !== PROJECT_VERSION) {
     upgradeProject(p);
     saveProject(p);
@@ -164,7 +169,14 @@ export async function autoSync(p: Project, onProgress?: (f: number) => void, sig
 
 export function clipsFor(p: Project) {
   if (!p.sync) return [];
-  return planClips(p.moments, p.sync, p.settings, p.video.duration);
+  return planClips(p.moments, p.sync, p.settings, p.video.duration, p.speech);
+}
+
+export const voiceTracks = (p: Project) => p.settings.voiceTracks ?? p.video.audio.map((_, i) => i);
+
+export async function analyzeSpeech(p: Project, onProgress?: (f: number) => void, signal?: AbortSignal): Promise<Speech> {
+  p.speech = await detectSpeech(p.videoPath, p.video, voiceTracks(p), onProgress, signal);
+  return p.speech;
 }
 
 export function defaultOutputPath(p: Project) {

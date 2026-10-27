@@ -17,6 +17,7 @@
   "dependencies": {
     "@fastify/static": "^10.1.7",
     "@laihoe/demoparser2": "^0.42.0",
+    "@ricky0123/vad-node": "^0.0.3",
     "fastify": "^5.12.7",
     "fzstd": "^0.1.1",
     "snappyjs": "^0.7.0"

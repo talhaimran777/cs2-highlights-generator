@@ -3,7 +3,7 @@ import { inspectDemo, parseDemo } from './demo/parse.ts';
 import { buildMoments } from './demo/moments.ts';
 import { manualSync } from './sync/align.ts';
 import { totalDuration } from './edit/plan.ts';
-import { autoSync, clipsFor, createProject, renderProject, saveProject, setPlayer } from './project.ts';
+import { analyzeSpeech, autoSync, clipsFor, createProject, renderProject, saveProject, setPlayer } from './project.ts';
 import { checkFfmpeg, hasNvenc } from './util/ffmpeg.ts';
 
 const USAGE = `
@@ -58,6 +58,9 @@ async function main() {
       console.log(`\n  ${p.killfeedEvents?.length} kill-feed events, ${s.inliers} matched, rms ${s.rmsError.toFixed(2)}s, offset ${s.offset.toFixed(2)}s`);
       if (!s.confident) console.warn('  ⚠ Low confidence. Check the clips, or pass --sync <tick>:<seconds> from a kill you can find in the video.');
     }
+    console.log('Detecting speech…');
+    const speech = await analyzeSpeech(p, (f) => process.stdout.write(`\r  ${(f * 100).toFixed(0)}%`));
+    console.log(`\n  ${speech.utterances.length} speech segments; cuts will wait for sentences to finish`);
     saveProject(p);
 
     const clips = clipsFor(p);

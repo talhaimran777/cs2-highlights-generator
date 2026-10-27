@@ -156,6 +156,14 @@ function ProjectScreen({ id }: { id: string }) {
     [],
   );
 
+  // Speech detection runs in the background; refresh until it's done so clips pick it up.
+  const speechStatus = p?.speechJob?.status;
+  useEffect(() => {
+    if (speechStatus !== 'running') return;
+    const t = setInterval(() => api.get(id).then(setP).catch(() => {}), 2000);
+    return () => clearInterval(t);
+  }, [id, speechStatus]);
+
   if (!p) return <main className="home">{error ? <div className="error">{error}</div> : <div className="muted">Loading…</div>}</main>;
 
   const enabled = (s: Step) => s === 'player' || (p.hasPlayer && (s === 'sync' || !!p.sync));
@@ -438,6 +446,11 @@ function HighlightsStep({ p, update, preview, onNext }: { p: ProjectView; update
                     ))}
                   </span>
                   <span className="grow" />
+                  {clip?.speech && clip.speech.start + clip.speech.end >= 0.1 && (
+                    <span className="tag speech" title="Cut moved so nobody is cut off mid-sentence">
+                      🎙 +{(clip.speech.start + clip.speech.end).toFixed(1)}s
+                    </span>
+                  )}
                   {clip && <span className="muted small mono">{fmtTime(clip.start)}</span>}
                   <span className="trim">
                     <button className="btn btn-xs" title="Start earlier" onClick={() => patchMoments({ [m.id]: { trimStart: m.trimStart - 1 } })}>
@@ -510,6 +523,7 @@ function ExportStep({ p, setP, update }: { p: ProjectView; setP: (p: ProjectView
             <span>Round title cards (ROUND 7 · 4–2 · 3K)</span>
           </label>
         </div>
+        <SpeechProtection p={p} setting={setting} update={update} />
         <QualityMatch p={p} />
         <label className="field">
           <span>Save to</span>
@@ -538,6 +552,81 @@ function ExportStep({ p, setP, update }: { p: ProjectView; setP: (p: ProjectView
         </section>
       )}
     </>
+  );
+}
+
+/** Keeps cuts out of sentences: status of speech detection, toggle, max wait, voice tracks. */
+function SpeechProtection({
+  p,
+  setting,
+  update,
+}: {
+  p: ProjectView;
+  setting: (patch: Partial<ProjectView['settings']>) => Promise<void>;
+  update: Update;
+}) {
+  const st = p.settings;
+  const job = p.speechJob;
+  const running = job?.status === 'running';
+  const held = p.clips.filter((c) => c.speech && c.speech.start + c.speech.end >= 0.1);
+  const tracks = st.voiceTracks ?? p.video.audio.map((_, i) => i);
+  const status = running
+    ? `Detecting speech… ${Math.round(job.progress * 100)}%`
+    : p.speech
+      ? `${p.speech.utterances.length} speech segments found · ${held.length} cuts held for speech`
+      : job?.status === 'error'
+        ? `Speech detection failed: ${job.error}`
+        : 'Speech not analyzed yet';
+
+  return (
+    <div className="quality">
+      <div className="quality-head">
+        <strong>Speech</strong>
+        <span className="muted small">Never cut while you or your team are talking</span>
+      </div>
+      <div className="row wrap">
+        <label className="field check">
+          <input type="checkbox" checked={st.protectSpeech} onChange={(e) => setting({ protectSpeech: e.target.checked })} />
+          <span>Let sentences finish before a cut</span>
+        </label>
+        <label className="row small">
+          <span className="muted">wait up to</span>
+          <input
+            className="input narrow"
+            type="number"
+            min={1}
+            max={30}
+            step={1}
+            value={st.speechMaxWait}
+            onChange={(e) => setting({ speechMaxWait: Number(e.target.value) })}
+          />
+          <span className="muted">s</span>
+        </label>
+      </div>
+      {p.video.audio.length > 1 && (
+        <div className="row wrap small">
+          <span className="muted">Voice tracks:</span>
+          {p.video.audio.map((_, i) => (
+            <label key={i} className="row">
+              <input
+                type="checkbox"
+                checked={tracks.includes(i)}
+                onChange={(e) => setting({ voiceTracks: e.target.checked ? [...tracks, i].sort() : tracks.filter((t) => t !== i) })}
+              />
+              Track {i + 1}
+            </label>
+          ))}
+        </div>
+      )}
+      <div className="row small">
+        <span className={job?.status === 'error' ? 'error' : 'muted'}>{status}</span>
+        {!running && (
+          <button className="btn btn-xs" onClick={() => update(async () => (await api.detectSpeech(p.id), api.get(p.id)))}>
+            {p.speech ? 'Re-detect' : 'Detect speech'}
+          </button>
+        )}
+      </div>
+    </div>
   );
 }
 

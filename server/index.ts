@@ -2,9 +2,9 @@ import Fastify from 'fastify';
 import fastifyStatic from '@fastify/static';
 import { createReadStream, existsSync, readdirSync, statSync } from 'node:fs';
 import { extname, join, resolve } from 'node:path';
-import { cancelJob, getJob, startJob } from './jobs.ts';
+import { cancelJob, getJob, latestJob, startJob } from './jobs.ts';
 import {
-  autoSync, clipsFor, createProject, defaultOutputPath, getProject, hasPlayer, listProjects, loadSettings, renderProject,
+  analyzeSpeech, autoSync, clipsFor, createProject, defaultOutputPath, getProject, hasPlayer, listProjects, loadSettings, renderProject,
   saveProject, saveSettings, setPlayer, syncAnchors, type Project,
 } from './project.ts';
 import { manualSync } from './sync/align.ts';
@@ -41,6 +41,7 @@ function view(p: Project) {
     defaultOutputPath: defaultOutputPath(p),
     hasPlayer: hasPlayer(p),
     exportSettings: exportSettings(p.video),
+    speechJob: latestJob(p.id, 'speech'),
     anchors: hasPlayer(p) ? syncAnchors(p) : [],
   };
 }
@@ -76,9 +77,25 @@ app.get<{ Querystring: { path?: string } }>('/api/fs', async (req) => {
 
 app.get('/api/projects', async () => listProjects());
 
+/** Speech detection runs in the background; the planner uses it once it's there. */
+function startSpeechJob(id: string) {
+  return startJob('speech', id, async (progress, signal) => {
+    const working = load(id);
+    await analyzeSpeech(working, progress, signal);
+    const p = load(id); // keep edits made meanwhile
+    p.speech = working.speech;
+    saveProject(p);
+    return p.speech!.utterances.length;
+  });
+}
+
 app.post<{ Body: { videoPath: string; demoPath: string } }>('/api/projects', async (req) => {
-  return view(createProject(req.body.videoPath, req.body.demoPath));
+  const p = createProject(req.body.videoPath, req.body.demoPath);
+  startSpeechJob(p.id);
+  return view(p);
 });
+
+app.post<{ Params: { id: string } }>('/api/projects/:id/speech', async (req) => startSpeechJob(load(req.params.id).id));
 
 app.get<{ Params: { id: string } }>('/api/projects/:id', async (req) => view(load(req.params.id)));
 
@@ -94,10 +111,14 @@ app.patch<{
   const p = load(req.params.id);
   const { steamId, settings, moments, outputPath } = req.body;
   if (steamId && steamId !== p.settings.steamId) setPlayer(p, steamId);
+  let redetectSpeech = false;
   if (settings) {
+    redetectSpeech = 'voiceTracks' in settings && JSON.stringify(settings.voiceTracks) !== JSON.stringify(p.settings.voiceTracks);
     p.settings = { ...p.settings, ...settings, steamId: p.settings.steamId };
-    const { steamId: _, ...shared } = p.settings;
+    // steamId and voice tracks belong to this match; the rest are defaults for the next one
+    const { steamId: _, voiceTracks: __, ...shared } = p.settings;
     saveSettings({ ...loadSettings(), ...shared });
+    if (redetectSpeech) p.speech = null;
   }
   for (const [id, patch] of Object.entries(moments ?? {})) {
     const m = p.moments.find((x) => x.id === id);
@@ -105,6 +126,7 @@ app.patch<{
   }
   if (outputPath !== undefined) p.outputPath = outputPath || null;
   saveProject(p);
+  if (redetectSpeech) startSpeechJob(p.id);
   return view(p);
 });
 

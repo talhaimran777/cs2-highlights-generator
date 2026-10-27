@@ -113,6 +113,8 @@ export interface Clip {
   end: number;
   momentIds: string[];
   label: string;
+  /** seconds added to keep speech whole: start moved earlier / end moved later */
+  speech?: { start: number; end: number };
 }
 
 export interface Settings {
@@ -122,6 +124,12 @@ export interface Settings {
   clutchPreRoll: number;
   mergeGap: number;
   titleCards: boolean;
+  /** never cut while someone is talking */
+  protectSpeech: boolean;
+  /** longest a cut waits for a sentence to finish before taking a breath pause */
+  speechMaxWait: number;
+  /** audio tracks that carry voice (mic / Discord); null = all tracks */
+  voiceTracks: number[] | null;
   /** kill-feed region as fractions of frame size */
   killfeed: { x: number; y: number; w: number; h: number };
 }
@@ -133,5 +141,8 @@ export const DEFAULT_SETTINGS: Settings = {
   clutchPreRoll: 5,
   mergeGap: 1.5,
   titleCards: true,
+  protectSpeech: true,
+  speechMaxWait: 8,
+  voiceTracks: null,
   killfeed: { x: 0.7, y: 0.04, w: 0.3, h: 0.3 },
 };
