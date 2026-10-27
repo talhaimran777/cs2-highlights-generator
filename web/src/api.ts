@@ -7,6 +7,8 @@ export type { CaptionLine, CaptionSettings, Clip, Kill, Moment, Settings, SyncMo
 
 export interface ProjectView {
   id: string;
+  /** 'captions': a recording without a demo, captioned whole */
+  mode?: 'match' | 'captions';
   name: string;
   videoPath: string;
   demoPath: string;
@@ -57,6 +59,7 @@ export const api = {
   fs: (path = '') => req<{ path: string; parent: string | null; entries: FsEntry[] }>('GET', `/api/fs?path=${encodeURIComponent(path)}`),
   projects: () => req<{ id: string; name: string; createdAt: string }[]>('GET', '/api/projects'),
   create: (videoPath: string, demoPath: string) => req<ProjectView>('POST', '/api/projects', { videoPath, demoPath }),
+  createCaptionTest: (videoPath: string) => req<ProjectView>('POST', '/api/projects/captions-test', { videoPath }),
   get: (id: string) => req<ProjectView>('GET', `/api/projects/${id}`),
   patch: (id: string, body: object) => req<ProjectView>('PATCH', `/api/projects/${id}`, body),
   autoSync: (id: string) => req<Job>('POST', `/api/projects/${id}/sync/auto`),

@@ -24,6 +24,8 @@ const SETTINGS_FILE = join(DATA_DIR, 'settings.json');
 export interface Project {
   id: string;
   version?: number;
+  /** 'captions': a recording without a demo, captioned whole (to try captions out) */
+  mode?: 'match' | 'captions';
   name: string;
   createdAt: string;
   videoPath: string;
@@ -112,6 +114,30 @@ export function listProjects(): Pick<Project, 'id' | 'name' | 'createdAt'>[] {
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 
+/** A recording on its own (no demo): the whole video is the reel, so captions can be tried on any clip. */
+export function createCaptionTest(videoPath: string): Project {
+  if (!existsSync(videoPath)) throw new Error(`File not found: ${videoPath}`);
+  const settings = loadSettings();
+  const p: Project = {
+    id: randomUUID().slice(0, 8),
+    version: PROJECT_VERSION,
+    mode: 'captions',
+    name: `Captions test · ${basename(videoPath, extname(videoPath))}`,
+    createdAt: new Date().toISOString(),
+    videoPath,
+    demoPath: '',
+    video: probe(videoPath),
+    settings: { ...settings, steamId: '', voiceTracks: null },
+    match: { demoPath: '', map: '', tickrate: 64, players: [], rounds: [], kills: [], bombs: [], combat: [] },
+    moments: [],
+    sync: null,
+    killfeedEvents: null,
+    outputPath: null,
+  };
+  saveProject(p);
+  return p;
+}
+
 export function createProject(videoPath: string, demoPath: string): Project {
   for (const f of [videoPath, demoPath]) if (!existsSync(f)) throw new Error(`File not found: ${f}`);
   const settings = loadSettings();
@@ -172,7 +198,10 @@ export async function autoSync(p: Project, onProgress?: (f: number) => void, sig
   return p.sync;
 }
 
-export function clipsFor(p: Project) {
+export function clipsFor(p: Project): Clip[] {
+  if (p.mode === 'captions') {
+    return [{ round: 0, start: 0, end: p.video.duration, momentIds: [], label: 'Full recording' }];
+  }
   if (!p.sync) return [];
   return planClips(p.moments, p.sync, p.settings, p.video.duration, p.speech);
 }
@@ -197,7 +226,7 @@ export function reelCaptions(p: Project, clips = clipsFor(p)): CaptionLine[] {
  */
 export async function transcribeProject(p: Project, onProgress?: (f: number) => void, signal?: AbortSignal) {
   if (!p.speech) throw new Error('Speech detection has to finish first');
-  if (!p.sync) throw new Error('Sync the recording first');
+  if (!p.sync && p.mode !== 'captions') throw new Error('Sync the recording first');
   const clips = clipsFor(p);
   const known = new Map((p.transcript ?? []).map((l) => [l.id, l]));
   const wanted = p.speech.utterances.filter((u) => overlaps(u, clips));
@@ -235,15 +264,16 @@ export function clipCaptions(p: Project) {
 }
 
 export function defaultOutputPath(p: Project) {
-  return join(dirname(p.videoPath), `${basename(p.videoPath, extname(p.videoPath))}_highlights.mp4`);
+  const suffix = p.mode === 'captions' ? '_captions' : '_highlights';
+  return join(dirname(p.videoPath), `${basename(p.videoPath, extname(p.videoPath))}${suffix}.mp4`);
 }
 
 export async function renderProject(p: Project, onProgress?: (f: number) => void, signal?: AbortSignal): Promise<string> {
-  if (!p.sync) throw new Error('Sync the recording first');
+  if (!p.sync && p.mode !== 'captions') throw new Error('Sync the recording first');
   const clips = clipsFor(p);
   if (clips.length === 0) throw new Error('No clips enabled');
   const cards = new Map<number, { title: string; subtitle: string }>();
-  if (p.settings.titleCards) {
+  if (p.settings.titleCards && p.mode !== 'captions') {
     for (const c of clips) cards.set(c.round, roundCardText(p.match, c.round, p.moments));
   }
   const outPath = p.outputPath ?? defaultOutputPath(p);

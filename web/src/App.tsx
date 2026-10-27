@@ -53,6 +53,7 @@ function Health() {
 function Home() {
   const [video, setVideo] = useState('');
   const [demo, setDemo] = useState('');
+  const [captionsOnly, setCaptionsOnly] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [recent, setRecent] = useState<{ id: string; name: string; createdAt: string }[]>([]);
@@ -62,7 +63,7 @@ function Home() {
     setBusy(true);
     setError('');
     try {
-      const p = await api.create(video.trim(), demo.trim());
+      const p = captionsOnly ? await api.createCaptionTest(video.trim()) : await api.create(video.trim(), demo.trim());
       location.hash = p.id;
     } catch (e: any) {
       setError(e.message);
@@ -74,21 +75,35 @@ function Home() {
   return (
     <main className="home">
       <section className="card">
-        <h1>New match</h1>
+        <div className="row spread">
+          <h1>{captionsOnly ? 'Captions test' : 'New match'}</h1>
+          <div className="steps">
+            <button className={`step ${!captionsOnly ? 'active' : ''}`} onClick={() => setCaptionsOnly(false)}>
+              Match + demo
+            </button>
+            <button className={`step ${captionsOnly ? 'active' : ''}`} onClick={() => setCaptionsOnly(true)}>
+              Captions test
+            </button>
+          </div>
+        </div>
         <p className="muted">
-          Pick your full OBS recording and the FACEIT demo of the same match. Files are read where they are and nothing is uploaded.
+          {captionsOnly
+            ? 'Pick any recording, no demo needed. The whole clip gets captioned so you can check how accurate the captions are. Files are read where they are and nothing is uploaded.'
+            : 'Pick your full OBS recording and the FACEIT demo of the same match. Files are read where they are and nothing is uploaded.'}
         </p>
         <label className="field">
-          <span>Match recording</span>
+          <span>{captionsOnly ? 'Recording' : 'Match recording'}</span>
           <FilePicker kind="video" value={video} onChange={setVideo} />
         </label>
-        <label className="field">
-          <span>FACEIT demo (.dem or .dem.zst)</span>
-          <FilePicker kind="demo" value={demo} onChange={setDemo} />
-        </label>
+        {!captionsOnly && (
+          <label className="field">
+            <span>FACEIT demo (.dem or .dem.zst)</span>
+            <FilePicker kind="demo" value={demo} onChange={setDemo} />
+          </label>
+        )}
         {error && <div className="error">{error}</div>}
-        <button className="btn btn-primary" disabled={!video || !demo || busy} onClick={create}>
-          {busy ? 'Parsing demo…' : 'Analyze match'}
+        <button className="btn btn-primary" disabled={!video || (!captionsOnly && !demo) || busy} onClick={create}>
+          {captionsOnly ? (busy ? 'Reading recording…' : 'Start captions test') : busy ? 'Parsing demo…' : 'Analyze match'}
         </button>
       </section>
       {recent.length > 0 && (
@@ -140,7 +155,7 @@ function ProjectScreen({ id }: { id: string }) {
       .get(id)
       .then((proj) => {
         setP(proj);
-        setStep(!proj.hasPlayer ? 'player' : !proj.sync ? 'sync' : 'highlights');
+        setStep(proj.mode === 'captions' ? 'captions' : !proj.hasPlayer ? 'player' : !proj.sync ? 'sync' : 'highlights');
       })
       .catch((e) => setError(e.message));
   }, [id]);
@@ -168,7 +183,12 @@ function ProjectScreen({ id }: { id: string }) {
 
   if (!p) return <main className="home">{error ? <div className="error">{error}</div> : <div className="muted">Loading…</div>}</main>;
 
-  const enabled = (s: Step) => s === 'player' || (p.hasPlayer && (s === 'sync' || !!p.sync));
+  const captionsTest = p.mode === 'captions';
+  // a captions test has no demo: just the captions and export steps
+  const steps = captionsTest
+    ? [{ id: 'captions' as Step, label: '1 · Captions' }, { id: 'export' as Step, label: '2 · Export' }]
+    : STEPS;
+  const enabled = (s: Step) => captionsTest || s === 'player' || (p.hasPlayer && (s === 'sync' || !!p.sync));
 
   return (
     <main className="project">
@@ -176,12 +196,12 @@ function ProjectScreen({ id }: { id: string }) {
         <div>
           <h1>{p.name}</h1>
           <div className="muted">
-            {p.match.rounds.length} rounds · recording {fmtTime(p.video.duration)} · {p.video.width}×{p.video.height}
+            {captionsTest ? 'No demo' : `${p.match.rounds.length} rounds`} · recording {fmtTime(p.video.duration)} · {p.video.width}×{p.video.height}
             {p.video.audio.length > 1 && ` · ${p.video.audio.length} audio tracks`}
           </div>
         </div>
         <nav className="steps">
-          {STEPS.map((s) => (
+          {steps.map((s) => (
             <button key={s.id} className={`step ${step === s.id ? 'active' : ''}`} disabled={!enabled(s.id)} onClick={() => setStep(s.id)}>
               {s.label}
             </button>
@@ -500,7 +520,8 @@ function ExportStep({ p, setP, update }: { p: ProjectView; setP: (p: ProjectView
   return (
     <>
       <section className="card">
-        <h2>Export highlight reel</h2>
+        <h2>{p.mode === 'captions' ? 'Export captioned recording' : 'Export highlight reel'}</h2>
+        {p.mode !== 'captions' && (
         <div className="grid2">
           <label className="field">
             <span>Seconds before each moment</span>
@@ -526,7 +547,9 @@ function ExportStep({ p, setP, update }: { p: ProjectView; setP: (p: ProjectView
             <span>Round title cards (ROUND 7 · 4–2 · 3K)</span>
           </label>
         </div>
-        <SpeechProtection p={p} setting={setting} update={update} />
+        )}
+        {/* a captions test has no cuts to protect; its voice tracks are chosen on the Captions page */}
+        {p.mode !== 'captions' && <SpeechProtection p={p} setting={setting} update={update} />}
         <QualityMatch p={p} />
         <label className="field">
           <span>Save to</span>
@@ -534,7 +557,11 @@ function ExportStep({ p, setP, update }: { p: ProjectView; setP: (p: ProjectView
         </label>
         <div className="row">
           <button className="btn btn-primary" disabled={job?.status === 'running' || p.clips.length === 0} onClick={render}>
-            {job?.status === 'running' ? 'Rendering…' : `Render ${p.clips.length} clips (${fmtTime(p.reelDuration)})`}
+            {job?.status === 'running'
+              ? 'Rendering…'
+              : p.mode === 'captions'
+                ? `Render with captions (${fmtTime(p.reelDuration)})`
+                : `Render ${p.clips.length} clips (${fmtTime(p.reelDuration)})`}
           </button>
           {job?.status === 'running' && (
             <>
@@ -594,7 +621,47 @@ function CaptionsStep({ p, update, preview, onNext }: { p: ProjectView; update: 
           your PC with Whisper; nothing is uploaded.
         </p>
         {status && !status.ok && <div className="error">Captions aren’t set up: missing {status.missing.join(', ')}.</div>}
-        {!p.speech && <div className="muted">Waiting for speech detection to finish…</div>}
+        {p.video.audio.length > 1 && (
+          <div className="row wrap small">
+            <span className="muted">Voice tracks (your mic, Discord):</span>
+            {p.video.audio.map((_, i) => {
+              const tracks = p.settings.voiceTracks ?? p.video.audio.map((__, j) => j);
+              return (
+                <label key={i} className="row">
+                  <input
+                    type="checkbox"
+                    checked={tracks.includes(i)}
+                    disabled={running}
+                    onChange={(e) =>
+                      update(() =>
+                        api.patch(p.id, {
+                          settings: { voiceTracks: e.target.checked ? [...tracks, i].sort() : tracks.filter((t) => t !== i) },
+                        }),
+                      )
+                    }
+                  />
+                  Track {i + 1}
+                </label>
+              );
+            })}
+          </div>
+        )}
+        {!p.speech &&
+          (p.speechJob?.status === 'running' ? (
+            <div className="row">
+              <span className="muted">Finding speech…</span>
+              <Progress value={p.speechJob.progress} />
+            </div>
+          ) : p.speechJob?.status === 'error' ? (
+            <div className="error">Speech detection failed: {p.speechJob.error}</div>
+          ) : (
+            <div className="row">
+              <span className="muted">Speech hasn't been detected for these tracks yet.</span>
+              <button className="btn btn-sm" onClick={() => update(async () => (await api.detectSpeech(p.id), api.get(p.id)))}>
+                Detect speech
+              </button>
+            </div>
+          ))}
         <div className="row wrap">
           <button
             className="btn btn-primary"

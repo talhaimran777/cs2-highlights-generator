@@ -4,7 +4,7 @@ import { createReadStream, existsSync, readdirSync, statSync } from 'node:fs';
 import { extname, join, resolve } from 'node:path';
 import { cancelJob, getJob, latestJob, startJob } from './jobs.ts';
 import {
-  analyzeSpeech, autoSync, clipsFor, createProject, defaultOutputPath, editCaption, getProject, hasPlayer, listProjects, loadSettings,
+  analyzeSpeech, autoSync, clipsFor, createCaptionTest, createProject, defaultOutputPath, editCaption, getProject, hasPlayer, listProjects, loadSettings,
   reelCaptions, renderProject, saveProject, saveSettings, setPlayer, syncAnchors, transcribeProject, type Project,
 } from './project.ts';
 import { captionsReady } from './captions/transcribe.ts';
@@ -124,6 +124,13 @@ app.post<{ Body: { videoPath: string; demoPath: string } }>('/api/projects', asy
 
 app.post<{ Params: { id: string } }>('/api/projects/:id/speech', async (req) => startSpeechJob(load(req.params.id).id));
 
+/** Captions test: just a recording, no demo; the whole video gets captioned. */
+app.post<{ Body: { videoPath: string } }>('/api/projects/captions-test', async (req) => {
+  const p = createCaptionTest(req.body.videoPath);
+  startSpeechJob(p.id);
+  return view(p);
+});
+
 app.get<{ Params: { id: string } }>('/api/projects/:id', async (req) => view(load(req.params.id)));
 
 app.patch<{
@@ -148,7 +155,11 @@ app.patch<{
     // steamId and voice tracks belong to this match; the rest are defaults for the next one
     const { steamId: _, voiceTracks: __, ...shared } = p.settings;
     saveSettings({ ...loadSettings(), ...shared });
-    if (redetectSpeech) p.speech = null;
+    if (redetectSpeech) {
+      // new voice tracks, new speech: drop lines transcribed from the old tracks (keep hand edits)
+      p.speech = null;
+      p.transcript = (p.transcript ?? []).filter((l) => l.edited);
+    }
   }
   for (const [id, patch] of Object.entries(moments ?? {})) {
     const m = p.moments.find((x) => x.id === id);
