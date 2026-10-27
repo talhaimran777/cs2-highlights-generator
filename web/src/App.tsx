@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api, fmtTime, videoTime, waitJob, type Job, type Moment, type ProjectView } from './api.ts';
+import { api, fmtTime, videoTime, waitJob, type CaptionSettings, type Job, type Moment, type ProjectView } from './api.ts';
 import { FilePicker } from './FilePicker.tsx';
 
-type Step = 'player' | 'sync' | 'highlights' | 'export';
+type Step = 'player' | 'sync' | 'highlights' | 'captions' | 'export';
 const STEPS: { id: Step; label: string }[] = [
   { id: 'player', label: '1 · Player' },
   { id: 'sync', label: '2 · Sync' },
   { id: 'highlights', label: '3 · Highlights' },
-  { id: 'export', label: '4 · Export' },
+  { id: 'captions', label: '4 · Captions' },
+  { id: 'export', label: '5 · Export' },
 ];
 
 const KIND_LABEL: Record<Moment['kind'], string> = {
@@ -157,12 +158,13 @@ function ProjectScreen({ id }: { id: string }) {
   );
 
   // Speech detection runs in the background; refresh until it's done so clips pick it up.
-  const speechStatus = p?.speechJob?.status;
+  // (transcription too)
+  const backgroundRunning = p?.speechJob?.status === 'running' || p?.transcriptJob?.status === 'running';
   useEffect(() => {
-    if (speechStatus !== 'running') return;
+    if (!backgroundRunning) return;
     const t = setInterval(() => api.get(id).then(setP).catch(() => {}), 2000);
     return () => clearInterval(t);
-  }, [id, speechStatus]);
+  }, [id, backgroundRunning]);
 
   if (!p) return <main className="home">{error ? <div className="error">{error}</div> : <div className="muted">Loading…</div>}</main>;
 
@@ -194,7 +196,8 @@ function ProjectScreen({ id }: { id: string }) {
             <PlayerStep p={p} onPick={(steamId) => update(() => api.patch(p.id, { steamId })).then(() => setStep('sync'))} />
           )}
           {step === 'sync' && <SyncStep p={p} setP={setP} update={update} preview={preview} onNext={() => setStep('highlights')} />}
-          {step === 'highlights' && <HighlightsStep p={p} update={update} preview={preview} onNext={() => setStep('export')} />}
+          {step === 'highlights' && <HighlightsStep p={p} update={update} preview={preview} onNext={() => setStep('captions')} />}
+          {step === 'captions' && <CaptionsStep p={p} update={update} preview={preview} onNext={() => setStep('export')} />}
           {step === 'export' && <ExportStep p={p} setP={setP} update={update} />}
         </div>
         <aside className="preview">
@@ -549,6 +552,144 @@ function ExportStep({ p, setP, update }: { p: ProjectView; setP: (p: ProjectView
           <h2>Your reel</h2>
           <video className="output" src={`/api/projects/${p.id}/output?v=${stamp}`} controls />
           <div className="mono small">{p.outputPath}</div>
+        </section>
+      )}
+    </>
+  );
+}
+
+const CAPTION_STYLES: { id: CaptionSettings['style']; label: string; hint: string }[] = [
+  { id: 'pop', label: 'Word pop', hint: 'The spoken word pops in yellow' },
+  { id: 'clean', label: 'Clean bold', hint: 'One calm line, fades in and out' },
+  { id: 'karaoke', label: 'Karaoke fill', hint: 'Fills with yellow as it’s spoken' },
+];
+
+/** Animated captions: transcription status, style controls, live preview, editable lines. */
+function CaptionsStep({ p, update, preview, onNext }: { p: ProjectView; update: Update; preview: Preview; onNext: () => void }) {
+  const [status, setStatus] = useState<{ ok: boolean; missing: string[]; fonts: string[] } | null>(null);
+  useEffect(() => void api.captionsStatus().then(setStatus).catch(() => {}), []);
+  const caps = p.settings.captions;
+  const setCaps = (patch: Partial<CaptionSettings>) => update(() => api.patch(p.id, { settings: { captions: { ...caps, ...patch } } }));
+  const job = p.transcriptJob;
+  const running = job?.status === 'running';
+  const lines = p.reelCaptions;
+  const urdu = lines.filter((l) => l.lang === 'ur').length;
+  const fonts = status?.fonts ?? [];
+  const sample = (lines.find((l) => l.words.length >= 3)?.words.slice(0, 3).map((w) => w.text) ?? ['bhai', 'peeche', 'dekho']).map((t) =>
+    caps.uppercase ? t.toUpperCase() : t,
+  );
+
+  return (
+    <>
+      <style>{fonts.map((f) => `@font-face{font-family:'${f}';src:url('/api/fonts/${encodeURIComponent(f)}')}`).join('')}</style>
+      <section className="card">
+        <div className="row spread">
+          <h2>Captions</h2>
+          <button className="btn btn-primary" onClick={onNext}>
+            Export →
+          </button>
+        </div>
+        <p className="muted">
+          Bold animated captions while you or your team talk. English stays English; Urdu is written in Roman Urdu. Transcription runs on
+          your PC with Whisper; nothing is uploaded.
+        </p>
+        {status && !status.ok && <div className="error">Captions aren’t set up: missing {status.missing.join(', ')}.</div>}
+        {!p.speech && <div className="muted">Waiting for speech detection to finish…</div>}
+        <div className="row wrap">
+          <button
+            className="btn btn-primary"
+            disabled={running || !status?.ok || !p.speech}
+            onClick={() => update(async () => (await api.transcribe(p.id), api.get(p.id)))}
+          >
+            {running ? 'Transcribing…' : lines.length ? 'Transcribe new speech' : 'Transcribe'}
+          </button>
+          {running && <Progress value={job!.progress} />}
+          {!running && lines.length > 0 && (
+            <span className="muted">
+              {lines.length} lines · {lines.length - urdu} English · {urdu} Roman Urdu
+            </span>
+          )}
+          {job?.status === 'error' && <span className="error">{job.error}</span>}
+        </div>
+      </section>
+
+      <section className="card">
+        <div className="row spread">
+          <h2>Style</h2>
+          <label className="field check">
+            <input type="checkbox" checked={caps.enabled} onChange={(e) => setCaps({ enabled: e.target.checked })} />
+            <span>Burn captions into the reel</span>
+          </label>
+        </div>
+        <div className="caption-preview" style={{ ['--pos' as string]: `${caps.positionPct}%`, ['--size' as string]: `${caps.sizePct * 0.5625}cqw` }}>
+          <div className={`caption-sample style-${caps.style}`} style={{ fontFamily: `'${caps.font}', 'Arial Black', sans-serif` }}>
+            {sample.map((t, i) => (
+              <span key={i} className={i === 1 ? 'active' : ''}>
+                {t}
+              </span>
+            ))}
+          </div>
+        </div>
+        <div className="row wrap">
+          {CAPTION_STYLES.map((s) => (
+            <button key={s.id} className={`chip ${caps.style === s.id ? 'on kind-assist' : ''}`} title={s.hint} onClick={() => setCaps({ style: s.id })}>
+              {s.label}
+            </button>
+          ))}
+        </div>
+        <div className="grid2">
+          <label className="field">
+            <span>Font</span>
+            <select className="input" value={caps.font} onChange={(e) => setCaps({ font: e.target.value })}>
+              {[...new Set([...fonts, caps.font])].map((f) => (
+                <option key={f} value={f}>
+                  {f}
+                  {!fonts.includes(f) ? ' (not installed, uses Arial Black)' : ''}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="field check">
+            <input type="checkbox" checked={caps.uppercase} onChange={(e) => setCaps({ uppercase: e.target.checked })} />
+            <span>ALL CAPS</span>
+          </label>
+          <label className="field">
+            <span>Size · {caps.sizePct}% of height</span>
+            <input type="range" min={4} max={11} step={0.5} value={caps.sizePct} onChange={(e) => setCaps({ sizePct: Number(e.target.value) })} />
+          </label>
+          <label className="field">
+            <span>Position · {caps.positionPct}% down</span>
+            <input type="range" min={40} max={92} step={1} value={caps.positionPct} onChange={(e) => setCaps({ positionPct: Number(e.target.value) })} />
+          </label>
+        </div>
+      </section>
+
+      {lines.length > 0 && (
+        <section className="card">
+          <h2>Lines</h2>
+          <p className="muted small">Fix any word: click a line, type, and click outside it. Timing is kept.</p>
+          <div className="caption-lines">
+            {lines.map((l) => (
+              <div key={l.id} className="caption-line">
+                <span className="muted small mono">{fmtTime(l.start)}</span>
+                <span className={`tag ${l.lang === 'ur' ? 'speech' : ''}`} title={l.source}>
+                  {l.lang === 'ur' ? 'UR' : 'EN'}
+                </span>
+                <input
+                  className="input"
+                  defaultValue={l.words.map((w) => w.text).join(' ')}
+                  onBlur={(e) => {
+                    const text = e.target.value.trim();
+                    if (text && text !== l.words.map((w) => w.text).join(' ')) update(() => api.patch(p.id, { captions: { [l.id]: text } }));
+                  }}
+                />
+                {l.edited && <span className="muted small">edited</span>}
+                <button className="btn btn-sm" onClick={() => preview.play(l.start - 0.5, l.end + 0.5)}>
+                  ▶
+                </button>
+              </div>
+            ))}
+          </div>
         </section>
       )}
     </>

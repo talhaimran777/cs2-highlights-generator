@@ -1,9 +1,9 @@
-import type { Clip, Kill, MatchData, Moment, Settings, SyncModel } from '../../server/types.ts';
+import type { CaptionLine, CaptionSettings, Clip, Kill, MatchData, Moment, Settings, SyncModel } from '../../server/types.ts';
 import type { VideoInfo } from '../../server/util/ffmpeg.ts';
 import type { Job } from '../../server/jobs.ts';
 import type { ExportSettings } from '../../server/edit/render.ts';
 
-export type { Clip, Kill, Moment, Settings, SyncModel, Job, ExportSettings };
+export type { CaptionLine, CaptionSettings, Clip, Kill, Moment, Settings, SyncModel, Job, ExportSettings };
 
 export interface ProjectView {
   id: string;
@@ -25,6 +25,10 @@ export interface ProjectView {
   exportSettings: ExportSettings;
   speech?: { tracks: number[]; raw: [number, number][]; utterances: [number, number][] } | null;
   speechJob: Job | null;
+  transcript?: CaptionLine[] | null;
+  transcriptJob: Job | null;
+  /** caption lines for speech inside the current reel */
+  reelCaptions: CaptionLine[];
   anchors: { tick: number; round: number }[];
 }
 
@@ -61,6 +65,8 @@ export const api = {
   nudge: (id: string, delta: number, round?: number) => req<ProjectView>('POST', `/api/projects/${id}/sync/nudge`, { delta, round }),
   render: (id: string) => req<Job>('POST', `/api/projects/${id}/render`),
   detectSpeech: (id: string) => req<Job>('POST', `/api/projects/${id}/speech`),
+  transcribe: (id: string) => req<Job>('POST', `/api/projects/${id}/transcribe`),
+  captionsStatus: () => req<{ ok: boolean; missing: string[]; fonts: string[] }>('GET', '/api/captions/status'),
   job: (id: string) => req<Job | null>('GET', `/api/jobs/${id}`),
   cancel: (id: string) => req('DELETE', `/api/jobs/${id}`),
 };

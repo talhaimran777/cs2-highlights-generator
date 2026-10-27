@@ -9,7 +9,10 @@ import { planClips, roundCardText } from './edit/plan.ts';
 import { renderReel } from './edit/render.ts';
 import { probe, type VideoInfo } from './util/ffmpeg.ts';
 import { detectSpeech, type Speech } from './audio/speech.ts';
-import { DEFAULT_SETTINGS, type MatchData, type Moment, type RoundIntro, type Settings, type SyncModel } from './types.ts';
+import { DEFAULT_SETTINGS, type CaptionLine, type Clip, type MatchData, type Moment, type RoundIntro, type Settings, type SyncModel } from './types.ts';
+import { transcribe } from './captions/transcribe.ts';
+import { buildAss } from './captions/ass.ts';
+import { resolveFont } from './captions/fonts.ts';
 
 /** Bump when parsing/moments change in a way saved projects should pick up. */
 const PROJECT_VERSION = 10;
@@ -34,6 +37,8 @@ export interface Project {
   killfeedEvents: number[] | null;
   /** speech in the recording's voice track(s), so cuts never land mid-sentence */
   speech?: Speech | null;
+  /** captions for the speech inside the reel (English / Roman Urdu), editable */
+  transcript?: CaptionLine[] | null;
   outputPath: string | null;
 }
 
@@ -179,6 +184,56 @@ export async function analyzeSpeech(p: Project, onProgress?: (f: number) => void
   return p.speech;
 }
 
+const overlaps = (a: [number, number], clips: Clip[]) => clips.some((c) => a[1] > c.start && a[0] < c.end);
+
+/** Caption lines for speech that's in the reel right now. */
+export function reelCaptions(p: Project, clips = clipsFor(p)): CaptionLine[] {
+  return (p.transcript ?? []).filter((l) => overlaps([l.start, l.end], clips));
+}
+
+/**
+ * Transcribes the speech inside the reel. Lines already transcribed (and any
+ * you edited) are kept; only new speech goes through Whisper.
+ */
+export async function transcribeProject(p: Project, onProgress?: (f: number) => void, signal?: AbortSignal) {
+  if (!p.speech) throw new Error('Speech detection has to finish first');
+  if (!p.sync) throw new Error('Sync the recording first');
+  const clips = clipsFor(p);
+  const known = new Map((p.transcript ?? []).map((l) => [l.id, l]));
+  const wanted = p.speech.utterances.filter((u) => overlaps(u, clips));
+  const todo = wanted.filter((u) => !known.has(`u${u[0].toFixed(2)}`));
+  const fresh = await transcribe(p.videoPath, todo, voiceTracks(p), join(DATA_DIR, 'work', p.id, 'whisper'), onProgress, signal);
+  p.transcript = [...known.values(), ...fresh].sort((a, b) => a.start - b.start);
+  return p.transcript;
+}
+
+/** Replaces a caption's text, spreading the line's time over the new words by length. */
+export function editCaption(p: Project, id: string, text: string) {
+  const line = p.transcript?.find((l) => l.id === id);
+  if (!line) return;
+  const tokens = text.trim().split(/\s+/).filter(Boolean);
+  const from = line.words[0]?.start ?? line.start;
+  const to = line.words.at(-1)?.end ?? line.end;
+  const weights = tokens.map((t) => t.length + 1);
+  const total = weights.reduce((a, b) => a + b, 0) || 1;
+  let t = from;
+  line.words = tokens.map((tok, i) => {
+    const d = ((to - from) * weights[i]) / total;
+    const w = { start: t, end: t + d, text: tok };
+    t += d;
+    return w;
+  });
+  line.edited = true;
+}
+
+/** ASS subtitles for one clip of the render, or null when captions are off or nothing is said. */
+export function clipCaptions(p: Project) {
+  const caps = p.settings.captions;
+  if (!caps.enabled || !p.transcript?.length) return () => null;
+  const font = resolveFont(caps.font);
+  return (clip: Clip) => buildAss(p.transcript!, clip, p.video, caps, font);
+}
+
 export function defaultOutputPath(p: Project) {
   return join(dirname(p.videoPath), `${basename(p.videoPath, extname(p.videoPath))}_highlights.mp4`);
 }
@@ -193,7 +248,7 @@ export async function renderProject(p: Project, onProgress?: (f: number) => void
   }
   const outPath = p.outputPath ?? defaultOutputPath(p);
   await renderReel(
-    { videoPath: p.videoPath, info: p.video, clips, cards, outPath, workDir: join(DATA_DIR, 'work', p.id) },
+    { videoPath: p.videoPath, info: p.video, clips, cards, outPath, workDir: join(DATA_DIR, 'work', p.id), captions: clipCaptions(p) },
     onProgress,
     signal,
   );

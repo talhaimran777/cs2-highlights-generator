@@ -117,6 +117,38 @@ export interface Clip {
   speech?: { start: number; end: number };
 }
 
+/** A transcribed word, in recording seconds; `text` is what's shown (English or Roman Urdu). */
+export interface CaptionWord {
+  start: number;
+  end: number;
+  text: string;
+}
+
+/** One utterance's caption: Whisper's words, romanized; editable in the app. */
+export interface CaptionLine {
+  id: string;
+  start: number;
+  end: number;
+  lang: 'en' | 'ur';
+  /** Whisper's original text (Devanagari / Urdu / English) */
+  source: string;
+  words: CaptionWord[];
+  edited?: boolean;
+}
+
+export type CaptionStyle = 'pop' | 'clean' | 'karaoke';
+
+export interface CaptionSettings {
+  enabled: boolean;
+  style: CaptionStyle;
+  font: string; // font family name, see server/captions/fonts.ts
+  /** text height as % of frame height */
+  sizePct: number;
+  /** vertical center of the caption as % of frame height */
+  positionPct: number;
+  uppercase: boolean;
+}
+
 export interface Settings {
   steamId: string;
   preRoll: number;
@@ -130,6 +162,7 @@ export interface Settings {
   speechMaxWait: number;
   /** audio tracks that carry voice (mic / Discord); null = all tracks */
   voiceTracks: number[] | null;
+  captions: CaptionSettings;
   /** kill-feed region as fractions of frame size */
   killfeed: { x: number; y: number; w: number; h: number };
 }
@@ -144,5 +177,6 @@ export const DEFAULT_SETTINGS: Settings = {
   protectSpeech: true,
   speechMaxWait: 8,
   voiceTracks: null,
+  captions: { enabled: true, style: 'pop', font: 'Montserrat Black', sizePct: 7, positionPct: 70, uppercase: true },
   killfeed: { x: 0.7, y: 0.04, w: 0.3, h: 0.3 },
 };

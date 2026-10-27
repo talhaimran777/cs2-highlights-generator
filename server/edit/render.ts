@@ -2,6 +2,7 @@ import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { filterPath, hasEncoder, runFfmpeg, type VideoInfo } from '../util/ffmpeg.ts';
 import type { Clip } from '../types.ts';
+import { FONTS_DIR } from '../captions/fonts.ts';
 
 const CARD_SECONDS = 1.5;
 const FONT = 'C:/Windows/Fonts/arialbd.ttf';
@@ -14,6 +15,8 @@ export interface RenderInput {
   cards: Map<number, { title: string; subtitle: string }>;
   outPath: string;
   workDir: string;
+  /** ASS subtitles to burn into a clip (times relative to the clip), or null */
+  captions?: (clip: Clip) => string | null;
 }
 
 /** Per source codec: GPU encoder first, then the CPU one. */
@@ -143,20 +146,30 @@ export async function renderReel(
     }
     const dur = clip.end - clip.start;
     const fade = Math.min(0.1, dur / 4);
+    const ass = input.captions?.(clip) ?? null;
     plan.push({
       kind: 'clip',
       dur,
-      run: (out, prog) =>
-        runFfmpeg(
+      run: (out, prog) => {
+        // captions are burned in while the clip is encoded anyway
+        let vf: string[] = [];
+        if (ass) {
+          const assFile = out.replace(/\.mp4$/, '.ass');
+          writeFileSync(assFile, ass);
+          vf = ['-vf', `ass='${filterPath(assFile)}':fontsdir='${filterPath(FONTS_DIR)}'`];
+        }
+        return runFfmpeg(
           [
             '-ss', clip.start.toFixed(3), '-i', input.videoPath, '-t', dur.toFixed(3),
             '-map', '0:v:0', '-map', '0:a?',
+            ...vf,
             '-af', `afade=t=in:d=${fade},afade=t=out:st=${(dur - fade).toFixed(3)}:d=${fade}`,
             ...common, out,
           ],
           prog,
           signal,
-        ),
+        );
+      },
     });
   }
 

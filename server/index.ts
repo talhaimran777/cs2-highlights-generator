@@ -4,9 +4,11 @@ import { createReadStream, existsSync, readdirSync, statSync } from 'node:fs';
 import { extname, join, resolve } from 'node:path';
 import { cancelJob, getJob, latestJob, startJob } from './jobs.ts';
 import {
-  analyzeSpeech, autoSync, clipsFor, createProject, defaultOutputPath, getProject, hasPlayer, listProjects, loadSettings, renderProject,
-  saveProject, saveSettings, setPlayer, syncAnchors, type Project,
+  analyzeSpeech, autoSync, clipsFor, createProject, defaultOutputPath, editCaption, getProject, hasPlayer, listProjects, loadSettings,
+  reelCaptions, renderProject, saveProject, saveSettings, setPlayer, syncAnchors, transcribeProject, type Project,
 } from './project.ts';
+import { captionsReady } from './captions/transcribe.ts';
+import { availableFonts, fontFile } from './captions/fonts.ts';
 import { manualSync } from './sync/align.ts';
 import { totalDuration } from './edit/plan.ts';
 import { exportSettings } from './edit/render.ts';
@@ -42,11 +44,36 @@ function view(p: Project) {
     hasPlayer: hasPlayer(p),
     exportSettings: exportSettings(p.video),
     speechJob: latestJob(p.id, 'speech'),
+    transcriptJob: latestJob(p.id, 'transcribe'),
+    reelCaptions: reelCaptions(p, clips),
     anchors: hasPlayer(p) ? syncAnchors(p) : [],
   };
 }
 
 app.get('/api/health', async () => ({ ffmpeg: checkFfmpeg(), nvenc: hasNvenc(), settings: loadSettings() }));
+
+app.get('/api/captions/status', async () => ({ ...captionsReady(), fonts: availableFonts() }));
+
+/** Caption fonts for the in-app preview (same files libass burns in). */
+app.get<{ Params: { name: string } }>('/api/fonts/:name', (req, reply) => {
+  const file = fontFile(req.params.name);
+  if (!file || !existsSync(file)) return reply.code(404).send({ error: 'Font not installed' });
+  reply.type('font/ttf').header('Cache-Control', 'max-age=86400');
+  return reply.send(createReadStream(file));
+});
+
+app.post<{ Params: { id: string } }>('/api/projects/:id/transcribe', async (req) => {
+  const id = load(req.params.id).id;
+  return startJob('transcribe', id, async (progress, signal) => {
+    const working = load(id);
+    await transcribeProject(working, progress, signal);
+    const p = load(id); // keep edits made meanwhile
+    const edited = new Map((p.transcript ?? []).filter((l) => l.edited).map((l) => [l.id, l]));
+    p.transcript = working.transcript!.map((l) => edited.get(l.id) ?? l);
+    saveProject(p);
+    return p.transcript.length;
+  });
+});
 
 /** Minimal local file browser: the browser can't hand us real paths. */
 app.get<{ Querystring: { path?: string } }>('/api/fs', async (req) => {
@@ -105,11 +132,14 @@ app.patch<{
     steamId?: string;
     settings?: Partial<Settings>;
     moments?: Record<string, { enabled?: boolean; trimStart?: number; trimEnd?: number }>;
+    /** caption line id -> new text */
+    captions?: Record<string, string>;
     outputPath?: string;
   };
 }>('/api/projects/:id', async (req) => {
   const p = load(req.params.id);
-  const { steamId, settings, moments, outputPath } = req.body;
+  const { steamId, settings, moments, outputPath, captions } = req.body;
+  for (const [id, text] of Object.entries(captions ?? {})) editCaption(p, id, text);
   if (steamId && steamId !== p.settings.steamId) setPlayer(p, steamId);
   let redetectSpeech = false;
   if (settings) {

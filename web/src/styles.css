@@ -147,6 +147,22 @@ select.input { width: auto; max-width: 100%; flex: 1; }
 .quality td { padding: 3px 8px 3px 0; border-top: 1px solid var(--line); }
 .quality td.match { color: var(--ok); }
 .input.narrow { width: 64px; padding: 4px 8px; }
+
+/* caption preview: mimics the burned-in ASS styles */
+.caption-preview {
+  position: relative; aspect-ratio: 16 / 9; border-radius: 10px; overflow: hidden; container-type: inline-size;
+  background: linear-gradient(160deg, #6b5a3e 0%, #3b3428 45%, #1d1f22 100%);
+}
+.caption-sample {
+  position: absolute; left: 0; right: 0; top: var(--pos); transform: translateY(-50%);
+  text-align: center; font-size: var(--size); line-height: 1.1; color: #fff; display: flex; justify-content: center; gap: 0.4em;
+  -webkit-text-stroke: 0.16em #000; paint-order: stroke fill; text-shadow: 0.05em 0.05em 0.04em rgba(0, 0, 0, 0.5);
+}
+.caption-sample.style-pop .active { color: #ffd400; transform: scale(1.15); display: inline-block; }
+.caption-sample.style-karaoke span:first-child, .caption-sample.style-karaoke .active { color: #ffd400; }
+.caption-lines { display: grid; gap: 6px; max-height: 520px; overflow: auto; }
+.caption-line { display: flex; align-items: center; gap: 8px; }
+.caption-line .input { flex: 1; padding: 5px 8px; }
 .tag.speech { color: var(--intro); border-color: color-mix(in srgb, var(--intro) 45%, transparent); }
 .quality td.mismatch { color: var(--warn); }
 
