@@ -19,6 +19,7 @@ const k = (sec: number, round: number, a: string, v: string, extra: Partial<Kill
   tick: sec * TR, round, attacker: a, victim: v,
   attackerName: a === ME ? 'You' : a, victimName: v === ME ? 'You' : v,
   attackerSide: roster[a], victimSide: roster[v],
+  assister: null, assisterName: '', flashAssist: false,
   weapon: 'ak47', headshot: false, wallbang: false, noscope: false, throughSmoke: false, attackerBlind: false,
   ...extra,
 });

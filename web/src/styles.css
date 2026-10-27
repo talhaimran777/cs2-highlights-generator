@@ -16,6 +16,8 @@
   --decider: #60a5fa;
   --funny: #34d399;
   --death: #94a3b8;
+  --intro: #2dd4bf;
+  --assist: #fbbf24;
   color-scheme: dark;
 }
 
@@ -133,6 +135,8 @@ select.input { width: auto; max-width: 100%; flex: 1; }
 .kind-decider { --c: var(--decider); }
 .kind-funny { --c: var(--funny); }
 .kind-death { --c: var(--death); }
+.kind-intro { --c: var(--intro); }
+.kind-assist { --c: var(--assist); }
 
 .round { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; display: grid; gap: 6px; }
 .round.empty { opacity: 0.55; padding: 8px 12px; }

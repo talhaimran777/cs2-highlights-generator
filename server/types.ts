@@ -17,6 +17,9 @@ export interface Kill {
   victim: string;
   victimName: string;
   victimSide: Side | null;
+  assister: string | null;
+  assisterName: string;
+  flashAssist: boolean;
   weapon: string;
   headshot: boolean;
   wallbang: boolean;
@@ -55,7 +58,14 @@ export interface MatchData {
   bombs: BombEvent[];
 }
 
-export type MomentKind = 'kills' | 'clutch' | 'bomb' | 'decider' | 'death' | 'funny';
+/** Where I ended up after leaving spawn, per round. */
+export interface RoundIntro {
+  /** tick I settled at my spot (or the search window ran out) */
+  arriveTick: number;
+  place: string;
+}
+
+export type MomentKind = 'intro' | 'kills' | 'clutch' | 'bomb' | 'assist' | 'decider' | 'death' | 'funny';
 
 export interface Moment {
   id: string;

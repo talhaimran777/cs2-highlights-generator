@@ -2,7 +2,7 @@ import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
 import { gunzipSync } from 'node:zlib';
 import { decompress as zstdDecompress } from 'fzstd';
-import type { BombEvent, Kill, MatchData, Player, Round, Side } from '../types.ts';
+import type { BombEvent, Kill, MatchData, Player, Round, RoundIntro, Side } from '../types.ts';
 
 const require = createRequire(import.meta.url);
 const dp = require('@laihoe/demoparser2') as typeof import('@laihoe/demoparser2');
@@ -73,6 +73,9 @@ export function parseDemo(demoPath: string, mySteamId?: string): MatchData {
         victim,
         victimName: String(e.user_name ?? ''),
         victimSide: sideOf(e.user_team_num),
+        assister: sid(e.assister_steamid),
+        assisterName: String(e.assister_name ?? ''),
+        flashAssist: !!e.assistedflash,
         weapon: String(e.weapon ?? ''),
         headshot: !!e.headshot,
         wallbang: Number(e.penetrated ?? 0) > 0,
@@ -180,6 +183,68 @@ export function scoreRounds(rounds: Round[], me: string) {
     else them++;
     r.score = { us, them };
   }
+}
+
+const SAMPLE_STEP = 8; // ticks between position samples (0.125 s)
+const SEARCH_S = 30; // how long after freeze end to look for my spot
+// Holding a spot still means jiggling, shoulder-peeking and crouch-shifting,
+// so "arrived" = staying inside a small circle, not standing dead still.
+// Tuned on a real FACEIT match: lands ~8-10 s for normal rotations.
+const SETTLE_S = 2;
+const SETTLE_RADIUS = 150; // units; running is ~250 u/s
+const MIN_TRAVEL = 300; // units moved from spawn before settling counts
+
+/**
+ * For each round, when I reached my spot: the first time after leaving spawn
+ * that I stay within SETTLE_RADIUS for SETTLE_S. Uses positions from the demo.
+ */
+export function findArrivals(demoPath: string, me: string, rounds: Round[], tickrate = CS2_TICKRATE): Record<number, RoundIntro> {
+  if (rounds.length === 0) return {};
+  const wanted: number[] = [];
+  for (const r of rounds) {
+    const end = Math.min(r.endTick, r.startTick + SEARCH_S * tickrate);
+    for (let t = r.startTick; t <= end; t += SAMPLE_STEP) wanted.push(t);
+  }
+  const rows = (dp.parseTicks(loadDemo(demoPath), ['X', 'Y', 'last_place_name', 'is_alive'], wanted, [me]) as Row[])
+    .filter((row) => String(row.steamid) === me)
+    .sort((a, b) => a.tick - b.tick);
+
+  const out: Record<number, RoundIntro> = {};
+  for (const r of rounds) {
+    const pts = rows.filter((row) => row.tick >= r.startTick && row.tick <= r.startTick + SEARCH_S * tickrate && row.is_alive !== false);
+    if (pts.length < 2) continue;
+    out[r.num] = arrival(pts as PositionRow[], tickrate) ?? {
+      arriveTick: pts.at(-1)!.tick,
+      place: humanizePlace(pts.at(-1)!.last_place_name),
+    };
+  }
+  return out;
+}
+
+type PositionRow = { tick: number; X: number; Y: number; last_place_name?: string };
+
+export function arrival(pts: PositionRow[], tickrate: number): RoundIntro | null {
+  const dist = (a: PositionRow, b: PositionRow) => Math.hypot(a.X - b.X, a.Y - b.Y);
+  const settleSamples = Math.ceil((SETTLE_S * tickrate) / SAMPLE_STEP);
+  let travelled = 0;
+  for (let i = 1; i < pts.length; i++) {
+    travelled += dist(pts[i], pts[i - 1]);
+    if (travelled < MIN_TRAVEL || i + settleSamples >= pts.length) continue;
+    let settled = true;
+    for (let j = i + 1; j <= i + settleSamples && settled; j++) settled = dist(pts[j], pts[i]) < SETTLE_RADIUS;
+    // the place is read where I end up, not where settling began
+    if (settled) return { arriveTick: pts[i].tick, place: humanizePlace(pts[i + settleSamples].last_place_name) };
+  }
+  return null;
+}
+
+/** "BombsiteB" -> "Bombsite B", "CTSpawn" -> "CT Spawn" */
+export function humanizePlace(p: unknown): string {
+  return String(p ?? '')
+    .replace(/([a-z])of([A-Z])/g, '$1 of $2')
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .replace(/([A-Z])([A-Z][a-z])/g, '$1 $2')
+    .trim();
 }
 
 /** Dumps event names + sample fields, to check field names against a real demo. */

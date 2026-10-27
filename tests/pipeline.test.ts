@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { buildRounds } from '../server/demo/parse.ts';
+import { arrival, buildRounds, humanizePlace } from '../server/demo/parse.ts';
 import { buildMoments, findClutch } from '../server/demo/moments.ts';
 import { fitSync, manualSync, videoTime } from '../server/sync/align.ts';
 import { countHighlightedEntries, countsToEvents } from '../server/sync/killfeed.ts';
 import { planClips } from '../server/edit/plan.ts';
-import { DEFAULT_SETTINGS, type Kill, type MatchData, type Round } from '../server/types.ts';
+import { DEFAULT_SETTINGS, type Kill, type MatchData, type Moment, type Round } from '../server/types.ts';
 
 const TR = 64;
 const ME = 'me';
@@ -16,6 +16,7 @@ function kill(tick: number, round: number, attacker: string, victim: string, ext
     tick, round, attacker, victim,
     attackerName: attacker, victimName: victim,
     attackerSide: side(attacker), victimSide: side(victim),
+    assister: null, assisterName: '', flashAssist: false,
     weapon: 'ak47', headshot: false, wallbang: false, noscope: false, throughSmoke: false, attackerBlind: false,
     ...extra,
   };
@@ -73,8 +74,8 @@ describe('moments', () => {
     ];
     expect(findClutch(r, kills, ME)).toEqual({ startTick: s(20), vs: 3 });
     const m = buildMoments({ demoPath: '', map: '', tickrate: TR, players: [], bombs: [], rounds: [r], kills }, ME);
-    expect(m.map((x) => x.kind)).toEqual(['clutch']);
-    expect(m[0].label).toBe('1v3 clutch · 3K');
+    expect(m.map((x) => x.kind)).toEqual(['intro', 'clutch']);
+    expect(m[1].label).toBe('1v3 clutch · 3K');
   });
 
   it('no clutch when my side loses', () => {
@@ -90,9 +91,76 @@ describe('moments', () => {
     };
     const m = buildMoments(match, ME);
     expect(m.map((x) => [x.kind, x.label])).toEqual([
+      ['intro', 'Round start'],
       ['funny', 'Knifed by e1'],
       ['decider', 'Round-ending kill · m2 (ak47)'],
     ]);
+  });
+});
+
+describe('round intro', () => {
+  // run 250 u/s along X for 6 s, then hold still
+  const pts = Array.from({ length: 120 }, (_, i) => {
+    const t = i * 0.125;
+    return { tick: Math.round(s(t)), X: Math.min(t, 6) * 250, Y: 0, last_place_name: t < 6 ? 'CTSpawn' : 'BombsiteB' };
+  });
+
+  it('finds when I stop at my spot', () => {
+    const a = arrival(pts, TR)!;
+    // settles up to SETTLE_RADIUS / run speed (~0.6 s) before the full stop
+    expect(Math.abs(a.arriveTick / TR - 6)).toBeLessThan(0.75);
+    expect(a.place).toBe('Bombsite B');
+  });
+
+  it('jiggle-peeking at the spot still counts as arrived', () => {
+    const jiggle = pts.map((p, i) => (p.tick / TR >= 6 ? { ...p, X: 1500 + (i % 8 < 4 ? 60 : -60) } : p));
+    expect(Math.abs(arrival(jiggle, TR)!.arriveTick / TR - 6)).toBeLessThan(0.75);
+  });
+
+  it('a quick pause right at spawn does not count', () => {
+    const fidget = pts.map((p) => ({ ...p, X: Math.min(p.tick / TR, 0.5) * 100 }));
+    expect(arrival(fidget, TR)).toBeNull();
+  });
+
+  it('humanizes place names', () => {
+    expect(humanizePlace('CTSpawn')).toBe('CT Spawn');
+    expect(humanizePlace('TopofMid')).toBe('Top of Mid');
+    expect(humanizePlace('BombsiteB')).toBe('Bombsite B');
+    expect(humanizePlace('Banana')).toBe('Banana');
+  });
+
+  const match = (kills: Kill[]): MatchData => ({
+    demoPath: '', map: '', tickrate: TR, players: [], bombs: [], rounds: [round(1, 100, 200, 'CT')], kills,
+  });
+
+  it('runs from spawn to my first action, however long the hold', () => {
+    const m = buildMoments(match([kill(s(180), 1, ME, 'e1')]), ME, { 1: { arriveTick: s(110), place: 'Banana' } });
+    expect(m[0]).toMatchObject({ kind: 'intro', label: 'Spawn → Banana', startTick: s(100), endTick: s(180) });
+  });
+
+  it('an assist or my death also ends the opening', () => {
+    const assist = buildMoments(match([kill(s(130), 1, 'm2', 'e1', { assister: ME }), kill(s(150), 1, ME, 'e2')]), ME);
+    expect(assist[0]).toMatchObject({ kind: 'intro', endTick: s(130) });
+    const death = buildMoments(match([kill(s(125), 1, 'e1', ME)]), ME);
+    expect(death[0]).toMatchObject({ kind: 'intro', endTick: s(125) });
+  });
+
+  it('a plant ends the opening', () => {
+    const m = buildMoments(
+      { ...match([]), bombs: [{ tick: s(140), round: 1, kind: 'planted', player: ME, site: 'B' }] },
+      ME,
+    );
+    expect(m[0]).toMatchObject({ kind: 'intro', endTick: s(140) });
+  });
+
+  it('quiet rounds (nothing from me) get no opening', () => {
+    const m = buildMoments(match([kill(s(195), 1, 'm2', 'e1')]), ME, { 1: { arriveTick: s(110), place: '' } });
+    expect(m.map((x) => x.kind)).toEqual(['decider']);
+  });
+
+  it('adds assists as their own moments', () => {
+    const m = buildMoments(match([kill(s(150), 1, 'm2', 'e1', { assister: ME, flashAssist: true })]), ME);
+    expect(m.map((x) => [x.kind, x.label])).toContainEqual(['assist', 'Flash assist · m2 → e1']);
   });
 });
 
@@ -176,6 +244,33 @@ describe('clip planning', () => {
     expect(clips.map((c) => [c.round, c.start, c.end, c.momentIds])).toEqual([
       [1, 7, 17, ['a', 'b']],
       [2, 16, 21, ['c']],
+    ]);
+  });
+
+  const base = { enabled: true, trimStart: 0, trimEnd: 0, tags: [], score: 1 };
+  const fullRound = (introOn: boolean): Moment[] => [
+    { ...base, id: 'i', round: 3, kind: 'intro', label: 'Spawn → B', startTick: s(100), endTick: s(140), enabled: introOn },
+    { ...base, id: 'k', round: 3, kind: 'kills', label: 'Kill', startTick: s(140), endTick: s(140) },
+    { ...base, id: 'k2', round: 3, kind: 'kills', label: 'Kill', startTick: s(170), endTick: s(170) },
+    { ...base, id: 'd', round: 3, kind: 'decider', label: 'Round end', startTick: s(188), endTick: s(190) },
+    { ...base, id: 'n', round: 4, kind: 'kills', label: 'Kill', startTick: s(240), endTick: s(240) },
+  ];
+
+  it('plays a round with its intro on unbroken, from spawn to the last highlight', () => {
+    const clips = planClips(fullRound(true), manualSync(0, 0, TR), DEFAULT_SETTINGS, 1000);
+    expect(clips.map((c) => [c.round, c.start, c.end, c.momentIds])).toEqual([
+      [3, 99, 192, ['i', 'k', 'k2', 'd']],
+      [4, 237, 242, ['n']],
+    ]);
+  });
+
+  it('with the intro off the round is cut between highlights again', () => {
+    const clips = planClips(fullRound(false), manualSync(0, 0, TR), DEFAULT_SETTINGS, 1000);
+    expect(clips.map((c) => [c.round, c.start, c.end])).toEqual([
+      [3, 137, 142],
+      [3, 167, 172],
+      [3, 185, 192],
+      [4, 237, 242],
     ]);
   });
 });

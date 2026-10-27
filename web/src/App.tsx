@@ -11,8 +11,9 @@ const STEPS: { id: Step; label: string }[] = [
 ];
 
 const KIND_LABEL: Record<Moment['kind'], string> = {
-  clutch: 'Clutch', kills: 'Kills', bomb: 'Bomb', decider: 'Round end', funny: 'Funny', death: 'Death',
+  intro: 'Full round', clutch: 'Clutch', kills: 'Kills', bomb: 'Bomb', assist: 'Assist', decider: 'Round end', funny: 'Funny', death: 'Death',
 };
+const FULL_ROUND_HINT = 'Plays the round unbroken from spawn to its last highlight. Untick to cut straight to the action.';
 
 export function App() {
   const [projectId, setProjectId] = useState(() => location.hash.slice(1));
@@ -227,9 +228,11 @@ function PlayerStep({ p, onPick }: { p: ProjectView; onPick: (steamId: string) =
 
 function anchorLabel(p: ProjectView, a: { tick: number; round: number }) {
   const me = p.settings.steamId;
-  const k = p.match.kills.find((x) => x.tick === a.tick && (x.attacker === me || x.victim === me));
+  const k = p.match.kills.find((x) => x.tick === a.tick && (x.attacker === me || x.victim === me || x.assister === me));
   if (!k) return `Round ${a.round}`;
-  return k.victim === me ? `R${a.round} · died to ${k.attackerName || 'world'} (${k.weapon})` : `R${a.round} · killed ${k.victimName} (${k.weapon})`;
+  if (k.victim === me) return `R${a.round} · died to ${k.attackerName || 'world'} (${k.weapon})`;
+  if (k.attacker === me) return `R${a.round} · killed ${k.victimName} (${k.weapon})`;
+  return `R${a.round} · ${k.flashAssist ? 'flash-assisted' : 'assisted'} ${k.attackerName} on ${k.victimName}`;
 }
 
 type Preview = ReturnType<typeof usePreview>;
@@ -253,7 +256,7 @@ function SyncStep({ p, setP, update, preview, onNext }: { p: ProjectView; setP: 
       <section className="card">
         <h2>Line up the demo with your recording</h2>
         <p className="muted">
-          Auto-sync scans the kill feed in your recording for the red-outlined entries (your kills and deaths) and matches them to the demo. A
+          Auto-sync scans the kill feed in your recording for the red-outlined entries (your kills, deaths and assists) and matches them to the demo. A
           full match takes a few minutes.
         </p>
         <div className="row">
@@ -291,7 +294,7 @@ function SyncStep({ p, setP, update, preview, onNext }: { p: ProjectView; setP: 
       <section className="card">
         <h2>Manual sync (one click)</h2>
         <ol className="muted steps-help">
-          <li>Pick one of your kills below.</li>
+          <li>Pick one of your kills, deaths or assists below.</li>
           <li>In the preview, pause on the frame where it pops into the kill feed.</li>
           <li>Click <em>Set sync here</em>.</li>
         </ol>
@@ -376,7 +379,12 @@ function HighlightsStep({ p, update, preview, onNext }: { p: ProjectView; update
             const all = p.moments.filter((m) => m.kind === k);
             const on = all.filter((m) => m.enabled).length;
             return (
-              <button key={k} className={`chip kind-${k} ${on ? 'on' : ''}`} onClick={() => setKind(k, on < all.length)}>
+              <button
+                key={k}
+                className={`chip kind-${k} ${on ? 'on' : ''}`}
+                title={k === 'intro' ? FULL_ROUND_HINT : undefined}
+                onClick={() => setKind(k, on < all.length)}
+              >
                 {KIND_LABEL[k]} {on}/{all.length}
               </button>
             );
@@ -417,7 +425,9 @@ function HighlightsStep({ p, update, preview, onNext }: { p: ProjectView; update
               return (
                 <div key={m.id} className={`moment ${m.enabled ? '' : 'off'}`}>
                   <input type="checkbox" checked={m.enabled} onChange={(e) => patchMoments({ [m.id]: { enabled: e.target.checked } })} />
-                  <span className={`chip kind-${m.kind} on`}>{KIND_LABEL[m.kind]}</span>
+                  <span className={`chip kind-${m.kind} on`} title={m.kind === 'intro' ? FULL_ROUND_HINT : undefined}>
+                    {KIND_LABEL[m.kind]}
+                  </span>
                   <span className="label">{m.label}</span>
                   <span className="tags">
                     {m.tags.map((t) => (

@@ -1,14 +1,17 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, dirname, extname, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { parseDemo, scoreRounds } from './demo/parse.ts';
+import { findArrivals, parseDemo, scoreRounds } from './demo/parse.ts';
 import { buildMoments } from './demo/moments.ts';
 import { detectKillfeed } from './sync/killfeed.ts';
 import { fitSync, type Anchor } from './sync/align.ts';
 import { planClips, roundCardText } from './edit/plan.ts';
 import { renderReel } from './edit/render.ts';
 import { probe, type VideoInfo } from './util/ffmpeg.ts';
-import { DEFAULT_SETTINGS, type MatchData, type Moment, type Settings, type SyncModel } from './types.ts';
+import { DEFAULT_SETTINGS, type MatchData, type Moment, type RoundIntro, type Settings, type SyncModel } from './types.ts';
+
+/** Bump when parsing/moments change in a way saved projects should pick up. */
+const PROJECT_VERSION = 5;
 
 export const DATA_DIR = resolve(process.env.CS2H_DATA ?? 'data');
 const PROJECTS_DIR = join(DATA_DIR, 'projects');
@@ -16,6 +19,7 @@ const SETTINGS_FILE = join(DATA_DIR, 'settings.json');
 
 export interface Project {
   id: string;
+  version?: number;
   name: string;
   createdAt: string;
   videoPath: string;
@@ -23,6 +27,7 @@ export interface Project {
   video: VideoInfo;
   settings: Settings;
   match: MatchData;
+  intros?: Record<number, RoundIntro>;
   moments: Moment[];
   sync: SyncModel | null;
   killfeedEvents: number[] | null;
@@ -46,7 +51,43 @@ export function saveProject(p: Project) {
 
 export function getProject(id: string): Project | null {
   const f = join(PROJECTS_DIR, `${basename(id)}.json`);
-  return existsSync(f) ? JSON.parse(readFileSync(f, 'utf8')) : null;
+  if (!existsSync(f)) return null;
+  const p: Project = JSON.parse(readFileSync(f, 'utf8'));
+  if (p.version !== PROJECT_VERSION) {
+    upgradeProject(p);
+    saveProject(p);
+  }
+  return p;
+}
+
+/**
+ * Re-reads the demo for projects saved by an older version (e.g. before
+ * assists and round intros), keeping the sync, kill-feed scan and toggles.
+ */
+function upgradeProject(p: Project) {
+  p.settings = { ...DEFAULT_SETTINGS, ...p.settings };
+  if (existsSync(p.demoPath)) {
+    p.match = parseDemo(p.demoPath);
+    if (hasPlayer(p)) analyzePlayer(p);
+    if (p.sync?.method === 'auto' && p.killfeedEvents) refitSync(p);
+  }
+  p.version = PROJECT_VERSION;
+}
+
+/** Scores, round intros and moments for the selected player. Keeps toggles/trims of moments that still exist. */
+function analyzePlayer(p: Project) {
+  const me = p.settings.steamId;
+  scoreRounds(p.match.rounds, me);
+  p.intros = existsSync(p.demoPath) ? findArrivals(p.demoPath, me, p.match.rounds, p.match.tickrate) : (p.intros ?? {});
+  const old = new Map(p.moments.map((m) => [m.id, m]));
+  p.moments = buildMoments(p.match, me, p.intros).map((m) => {
+    const prev = old.get(m.id);
+    return prev ? { ...m, enabled: prev.enabled, trimStart: prev.trimStart, trimEnd: prev.trimEnd } : m;
+  });
+}
+
+function refitSync(p: Project) {
+  p.sync = fitSync(syncAnchors(p), p.killfeedEvents!, p.match.tickrate, p.match.rounds.map((r) => r.num));
 }
 
 export function listProjects(): Pick<Project, 'id' | 'name' | 'createdAt'>[] {
@@ -68,6 +109,7 @@ export function createProject(videoPath: string, demoPath: string): Project {
   if (!match.players.some((pl) => pl.steamId === settings.steamId)) settings.steamId = '';
   const p: Project = {
     id: randomUUID().slice(0, 8),
+    version: PROJECT_VERSION,
     name: `${match.map} · ${basename(videoPath, extname(videoPath))}`,
     createdAt: new Date().toISOString(),
     videoPath,
@@ -80,10 +122,7 @@ export function createProject(videoPath: string, demoPath: string): Project {
     killfeedEvents: null,
     outputPath: null,
   };
-  if (settings.steamId) {
-    scoreRounds(match.rounds, settings.steamId);
-    p.moments = buildMoments(match, settings.steamId);
-  }
+  if (settings.steamId) analyzePlayer(p);
   saveProject(p);
   return p;
 }
@@ -91,27 +130,25 @@ export function createProject(videoPath: string, demoPath: string): Project {
 export const hasPlayer = (p: Project) => p.match.players.some((pl) => pl.steamId === p.settings.steamId);
 
 /**
- * Changing who "me" is rebuilds scores and moments (and drops manual toggles).
- * An auto sync is re-fitted from the cached kill-feed scan, since its anchors
- * were the old player's kills; a manual sync doesn't depend on the player.
+ * Changing who "me" rebuilds scores, intros and moments. An auto sync is
+ * re-fitted from the cached kill-feed scan, since its anchors were the old
+ * player's kills; a manual sync doesn't depend on the player.
  */
 export function setPlayer(p: Project, steamId: string) {
   p.settings.steamId = steamId;
-  scoreRounds(p.match.rounds, steamId);
-  p.moments = buildMoments(p.match, steamId);
+  analyzePlayer(p);
   if (p.sync?.method === 'auto') {
-    p.sync = p.killfeedEvents
-      ? fitSync(syncAnchors(p), p.killfeedEvents, p.match.tickrate, p.match.rounds.map((r) => r.num))
-      : null;
+    if (p.killfeedEvents) refitSync(p);
+    else p.sync = null;
   }
   saveSettings({ ...loadSettings(), steamId });
 }
 
-/** My kills and deaths: exactly the kill-feed entries that get the red outline. */
+/** My kills, deaths and assists: exactly the kill-feed entries that get the red outline. */
 export function syncAnchors(p: Project): Anchor[] {
   const me = p.settings.steamId;
   return p.match.kills
-    .filter((k) => k.attacker === me || k.victim === me)
+    .filter((k) => k.attacker === me || k.victim === me || k.assister === me)
     .map((k) => ({ tick: k.tick, round: k.round }));
 }
 

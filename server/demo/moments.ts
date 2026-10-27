@@ -1,6 +1,7 @@
-import type { Kill, MatchData, Moment, MomentKind, Round } from '../types.ts';
+import type { Kill, MatchData, Moment, MomentKind, Round, RoundIntro } from '../types.ts';
 
 const CHAIN_GAP_S = 10; // own kills closer than this become one multi-kill clip
+const INTRO_MIN_S = 2;
 const MULTI_BONUS: Record<number, number> = { 2: 5, 3: 15, 4: 30, 5: 60 };
 const MULTI_LABEL: Record<number, string> = { 1: 'Kill', 2: '2K', 3: '3K', 4: '4K', 5: 'ACE' };
 
@@ -10,7 +11,7 @@ const isWorld = (k: Kill) => !k.attacker || k.attacker === k.victim || k.weapon 
 const isTeamkill = (k: Kill) =>
   !!k.attacker && k.attacker !== k.victim && !!k.attackerSide && k.attackerSide === k.victimSide;
 
-export function buildMoments(match: MatchData, me: string): Moment[] {
+export function buildMoments(match: MatchData, me: string, intros: Record<number, RoundIntro> = {}): Moment[] {
   const out: Moment[] = [];
   for (const round of match.rounds) {
     const kills = match.kills.filter((k) => k.round === round.num);
@@ -87,6 +88,16 @@ export function buildMoments(match: MatchData, me: string): Moment[] {
     }
 
     for (const k of kills) {
+      if (k.assister === me && k.attacker !== me && k.victim !== me && !isTeamkill(k)) {
+        add({
+          kind: 'assist',
+          label: `${k.flashAssist ? 'Flash assist' : 'Assist'} · ${k.attackerName} → ${k.victimName}`,
+          tags: [k.flashAssist ? 'flash' : 'assist'],
+          score: k.flashAssist ? 5 : 4,
+          startTick: k.tick,
+          endTick: k.tick,
+        });
+      }
       if (k.attacker === me && isTeamkill(k)) {
         add({
           kind: 'funny',
@@ -109,6 +120,28 @@ export function buildMoments(match: MatchData, me: string): Moment[] {
         startTick: decider.tick - 2 * match.tickrate,
         endTick: decider.tick,
       });
+    }
+
+    // Rounds where I do something open on me leaving spawn and run, in real
+    // time, up to my first action. While this moment is enabled the planner
+    // plays the whole round unbroken up to its last highlight.
+    const ownTicks = [
+      ...kills.filter((k) => k.attacker === me || k.victim === me || k.assister === me).map((k) => k.tick),
+      ...bombs.filter((b) => b.player === me && b.kind !== 'exploded').map((b) => b.tick),
+    ].filter((t) => t <= round.endTick);
+    if (ownTicks.length > 0) {
+      const firstAction = Math.min(...ownTicks);
+      const place = intros[round.num]?.place;
+      if (firstAction - round.startTick >= INTRO_MIN_S * match.tickrate) {
+        add({
+          kind: 'intro',
+          label: place ? `Spawn → ${place}` : 'Round start',
+          tags: ['full round'],
+          score: 0,
+          startTick: round.startTick,
+          endTick: firstAction,
+        });
+      }
     }
 
     out.push(...roundMoments.sort((a, b) => a.startTick - b.startTick));
@@ -207,4 +240,4 @@ function findDecider(
 
 const covers = (m: Moment, tick: number) => tick >= m.startTick && tick <= m.endTick;
 
-export const KIND_ORDER: MomentKind[] = ['clutch', 'kills', 'bomb', 'decider', 'funny', 'death'];
+export const KIND_ORDER: MomentKind[] = ['intro', 'clutch', 'kills', 'bomb', 'assist', 'decider', 'funny', 'death'];
