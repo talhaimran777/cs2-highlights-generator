@@ -69,6 +69,7 @@ export function useReelPlayer(segments: Segment[], fps: number) {
   const [playing, setPlaying] = useState(false);
   const playingRef = useRef(false);
   const stopAt = useRef<number | null>(null); // reel time to pause at (playing one caption line)
+  const peeking = useRef(false); // showing a frame outside the reel (dragging a piece's edge)
   const [videoError, setVideoError] = useState(false);
 
   // preview volume only (the export keeps the original audio); remembered per browser
@@ -168,7 +169,7 @@ export function useReelPlayer(segments: Segment[], fps: number) {
       const segs = segsRef.current;
       const v = vid(active.current);
       const seg = segs[segIdx.current];
-      if (!v || !seg) return;
+      if (!v || !seg || peeking.current) return;
       if (playingRef.current && stopAt.current !== null && timeRef.current >= stopAt.current) {
         stopAt.current = null;
         v.pause();
@@ -209,9 +210,23 @@ export function useReelPlayer(segments: Segment[], fps: number) {
     return s ? s.recStart + (timeRef.current - s.reelStart) : 0;
   };
 
+  /** Shows the recording at `rec` (even footage that isn't in the reel); null goes back to the reel. */
+  const peek = (rec: number | null) => {
+    if (rec === null) {
+      if (!peeking.current) return;
+      peeking.current = false;
+      seekTo(timeRef.current);
+      return;
+    }
+    if (playingRef.current) pause();
+    peeking.current = true;
+    const v = vid(active.current);
+    if (v) v.currentTime = rec;
+  };
+
   return {
     vidA, vidB, active, activeVid, segIdx, total, time, timeRef, playing, videoError, setVideoError,
-    volume, setVolume, silent, setSilent, prepare, seekTo, play, pause, togglePlay, playRange, recNow,
+    volume, setVolume, silent, setSilent, prepare, seekTo, play, pause, togglePlay, playRange, recNow, peek,
   };
 }
 

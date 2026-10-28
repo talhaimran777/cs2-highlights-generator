@@ -263,6 +263,7 @@ app.patch<{
     p.edits = {
       cuts: normalizeCuts((edits.cuts ?? []).map(([a, b]) => [inside(a), inside(b)])),
       splits: [...new Set((edits.splits ?? []).map(inside))].sort((a, b) => a - b),
+      adds: normalizeCuts((edits.adds ?? []).map(([a, b]) => [inside(a), inside(b)])),
     };
   }
   if (outputPath !== undefined) p.outputPath = outputPath || null;

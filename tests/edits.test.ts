@@ -1,11 +1,28 @@
 import { describe, expect, it } from 'vitest';
-import { applyEdits, normalizeCuts } from '../server/edit/edits.ts';
+import { applyEdits, normalizeCuts, subtractRange } from '../server/edit/edits.ts';
 import type { Clip } from '../server/types.ts';
 
 const clip = (round: number, start: number, end: number, extra: Partial<Clip> = {}): Clip => ({
   round, start, end, momentIds: [`m${round}`], label: `R${round}`, ...extra,
 });
 const ranges = (clips: Clip[]) => clips.map((c) => [c.start, c.end]);
+
+describe('added footage', () => {
+  it('extends the clip it touches, before cuts are applied', () => {
+    const out = applyEdits([clip(1, 10, 20)], { cuts: [[6, 7]], splits: [], adds: [[5, 10], [20, 22]] });
+    expect(ranges(out)).toEqual([[5, 6], [7, 22]]);
+  });
+
+  it('never grows into the neighbouring clip, and ignores adds touching no clip', () => {
+    const out = applyEdits([clip(1, 10, 20), clip(2, 25, 30)], { cuts: [], splits: [], adds: [[18, 28], [40, 50]] });
+    expect(ranges(out)).toEqual([[10, 25], [25, 30]]);
+  });
+
+  it('subtractRange takes a range out of cuts', () => {
+    expect(subtractRange([[0, 5], [10, 20]], [3, 12])).toEqual([[0, 3], [12, 20]]);
+    expect(subtractRange([[10, 20]], [5, 25])).toEqual([]);
+  });
+});
 
 describe('applyEdits', () => {
   it('leaves clips alone without cuts', () => {

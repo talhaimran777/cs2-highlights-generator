@@ -123,9 +123,11 @@ export interface Edits {
   cuts: [number, number][];
   /** extra edit points (S / Ctrl+K) */
   splits: number[];
+  /** footage added back by dragging a piece's edge outward; extends the clip it touches */
+  adds?: [number, number][];
 }
 
-export const NO_EDITS: Edits = { cuts: [], splits: [] };
+export const NO_EDITS: Edits = { cuts: [], splits: [], adds: [] };
 
 /** A transcribed word, in recording seconds; `text` is what's shown (English or Roman Urdu). */
 export interface CaptionWord {

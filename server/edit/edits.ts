@@ -4,14 +4,17 @@ import type { Clip, Edits } from '../types.ts';
 const MIN_PIECE_S = 0.1;
 
 /**
- * Removes the editor's cuts from the clips. A cut inside a clip splits it in
- * two; pieces keep the clip's round, moments and label. Cuts are in recording
- * time, so ones that no longer touch any clip simply do nothing.
+ * Applies the editor's edits to the clips. Added footage first extends the clip
+ * it touches (never into a neighbouring clip); then cuts are removed. A cut
+ * inside a clip splits it in two; pieces keep the clip's round, moments and
+ * label. Edits are in recording time, so ones that no longer touch any clip
+ * simply do nothing.
  */
 export function applyEdits(clips: Clip[], edits: Edits | null | undefined): Clip[] {
   const cuts = normalizeCuts(edits?.cuts ?? []);
-  if (cuts.length === 0) return clips;
-  return clips.flatMap((c) => {
+  const extended = extendClips(clips, normalizeCuts(edits?.adds ?? []));
+  if (cuts.length === 0) return extended;
+  return extended.flatMap((c) => {
     const pieces: Clip[] = [];
     let from = c.start;
     for (const [a, b] of cuts) {
@@ -28,6 +31,32 @@ export function applyEdits(clips: Clip[], edits: Edits | null | undefined): Clip
         : x,
     );
   });
+}
+
+const TOUCH_S = 1e-3;
+
+/** Grows each clip over the added ranges touching its edges, up to the neighbouring clips. */
+function extendClips(clips: Clip[], adds: [number, number][]): Clip[] {
+  if (adds.length === 0) return clips;
+  const out: Clip[] = [];
+  clips.forEach((c, i) => {
+    const lo = out.at(-1)?.end ?? 0; // the previous clip, as extended
+    const hi = clips[i + 1]?.start ?? Infinity;
+    let { start, end } = c;
+    for (const [a, b] of adds) {
+      if (a < start && b >= start - TOUCH_S) start = Math.max(lo, a);
+      if (b > end && a <= end + TOUCH_S) end = Math.min(hi, b);
+    }
+    out.push(start === c.start && end === c.end ? c : { ...c, start, end });
+  });
+  return out;
+}
+
+/** The ranges with [a, b] taken out of them. */
+export function subtractRange(ranges: [number, number][], [a, b]: [number, number]): [number, number][] {
+  return ranges.flatMap(([x, y]): [number, number][] =>
+    y <= a || x >= b ? [[x, y]] : [...(x < a ? [[x, a] as [number, number]] : []), ...(y > b ? [[b, y] as [number, number]] : [])],
+  );
 }
 
 /** Sorted, non-overlapping cuts with start < end. */

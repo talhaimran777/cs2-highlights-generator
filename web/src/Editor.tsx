@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { api, fmtTime, type Clip, type Edits, type Moment, type ProjectView } from './api.ts';
-import { applyEdits } from '../../server/edit/edits.ts';
+import { applyEdits, subtractRange } from '../../server/edit/edits.ts';
 import { buildSegments, parseFps, PlayerControls, ReelStage, segIndexAt, useReelPlayer } from './reel.tsx';
 
 type Update = (fn: () => Promise<ProjectView>) => Promise<void>;
 
 const EDGE = 0.05; // splits and cuts this close to an edge are ignored
+const MIN_PIECE_S = 0.1; // dragging an edge in never shrinks a piece below this
 const MAX_PPS = 200; // most zoomed in, pixels per second
 const PEAKS_PER_SEC = 100;
 const TICK_STEPS = [0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800];
@@ -107,7 +108,46 @@ export function Editor({ p, update, onNext, nextLabel }: { p: ProjectView; updat
     setSelected(null);
     commit({ ...edits, cuts: [...edits.cuts, [s.recStart, s.recEnd]] }, s.reelStart);
   };
-  const reset = () => commit({ cuts: [], splits: [] });
+  const reset = () => commit({ cuts: [], splits: [], adds: [] });
+
+  // --- dragging a piece's edge: in to trim, out to bring back cut footage ---
+  const [drag, setDrag] = useState<{ i: number; side: 'start' | 'end'; x0: number; orig: number; rec: number } | null>(null);
+  const edgeLimits = (i: number, side: 'start' | 'end') => {
+    const s = segments[i];
+    return side === 'start'
+      ? { min: segments[i - 1]?.recEnd ?? 0, max: s.recEnd - MIN_PIECE_S }
+      : { min: s.recStart + MIN_PIECE_S, max: segments[i + 1]?.recStart ?? p.video.duration };
+  };
+  const onEdgeDown = (e: React.PointerEvent, i: number, side: 'start' | 'end') => {
+    if (e.button !== 0) return;
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    const orig = side === 'start' ? segments[i].recStart : segments[i].recEnd;
+    setSelected(null);
+    setDrag({ i, side, x0: e.clientX, orig, rec: orig });
+    player.peek(orig);
+  };
+  const onEdgeMove = (e: React.PointerEvent) => {
+    if (!drag) return;
+    const { min, max } = edgeLimits(drag.i, drag.side);
+    const rec = Math.min(max, Math.max(min, drag.orig + (e.clientX - drag.x0) / zoom));
+    setDrag({ ...drag, rec });
+    player.peek(rec);
+  };
+  const onEdgeUp = () => {
+    if (!drag) return;
+    const { i, side, orig, rec } = drag;
+    setDrag(null);
+    player.peek(null);
+    if (Math.abs(rec - orig) < 1 / fps / 2) return;
+    const range: [number, number] = [Math.min(rec, orig), Math.max(rec, orig)];
+    const outward = side === 'start' ? rec < orig : rec > orig;
+    const next = outward
+      ? { ...edits, cuts: subtractRange(edits.cuts, range), adds: [...(edits.adds ?? []), range] }
+      : { ...edits, cuts: [...edits.cuts, range], adds: subtractRange(edits.adds ?? [], range) };
+    // like Premiere, the playhead lands on the piece's new start after moving its start
+    commit(next, side === 'start' ? segments[i].reelStart : player.timeRef.current);
+  };
 
   /** Edit points on the reel: segment starts plus the end. */
   const jumpEdit = (dir: 1 | -1) => {
@@ -299,7 +339,14 @@ export function Editor({ p, update, onNext, nextLabel }: { p: ProjectView; updat
           <h2>Edit</h2>
           <div className="muted small">
             Reel <strong className="mono">{fmtTime(total)}</strong>
-            {Math.abs(baseTotal - total) > 0.05 && <> (was {fmtTime(baseTotal)}, −{fmtTime(baseTotal - total)})</>} · {segments.length} pieces ·{' '}
+            {Math.abs(baseTotal - total) > 0.05 && (
+              <>
+                {' '}
+                (was {fmtTime(baseTotal)}, {total > baseTotal ? '+' : '−'}
+                {fmtTime(Math.abs(baseTotal - total))})
+              </>
+            )}{' '}
+            · {segments.length} pieces ·{' '}
             {edits.cuts.length} cuts
           </div>
         </div>
@@ -310,7 +357,7 @@ export function Editor({ p, update, onNext, nextLabel }: { p: ProjectView; updat
           <button className="btn btn-sm" disabled={history.future.length === 0} onClick={redo} title="Ctrl+Shift+Z">
             ↷ Redo
           </button>
-          <button className="btn btn-sm" disabled={edits.cuts.length + edits.splits.length === 0} onClick={reset}>
+          <button className="btn btn-sm" disabled={edits.cuts.length + edits.splits.length + (edits.adds?.length ?? 0) === 0} onClick={reset}>
             Reset edits
           </button>
           <button
@@ -377,14 +424,36 @@ export function Editor({ p, update, onNext, nextLabel }: { p: ProjectView; updat
           <div className="tl-track" style={{ height: TRACK_H }}>
             {segments.map((s, i) => {
               const kind = s.clip.momentIds.map((id) => kindOf.get(id)).find(Boolean) ?? 'intro';
+              // while an edge is dragged, the piece stretches or shrinks under the mouse
+              const d = drag?.i === i ? drag : null;
+              const left = s.reelStart + (d?.side === 'start' ? d.rec - d.orig : 0);
+              const width = s.reelEnd - s.reelStart + (d ? (d.side === 'start' ? d.orig - d.rec : d.rec - d.orig) : 0);
+              const edge = (side: 'start' | 'end') => (
+                <i
+                  className={`tl-edge ${side}`}
+                  title={side === 'start' ? 'Drag to trim the start, or out to bring back cut footage' : 'Drag to trim the end, or out to bring back cut footage'}
+                  onPointerDown={(e) => onEdgeDown(e, i, side)}
+                  onPointerMove={onEdgeMove}
+                  onPointerUp={onEdgeUp}
+                  onPointerCancel={onEdgeUp}
+                />
+              );
               return (
                 <div
                   key={`${s.recStart}`}
-                  className={`tl-seg kind-${kind} ${i === selIdx ? 'selected' : ''}`}
-                  style={{ left: s.reelStart * zoom, width: Math.max(1, (s.reelEnd - s.reelStart) * zoom) }}
+                  className={`tl-seg kind-${kind} ${i === selIdx ? 'selected' : ''} ${d ? 'dragging' : ''}`}
+                  style={{ left: left * zoom, width: Math.max(1, width * zoom) }}
                   title={`${label(s.clip)} · ${fmtTime(s.reelEnd - s.reelStart)}`}
                 >
                   <span>{label(s.clip)}</span>
+                  {d && Math.abs(d.rec - d.orig) > 0.005 && (
+                    <b className={`tl-delta ${d.side}`}>
+                      {(d.side === 'start' ? d.orig - d.rec : d.rec - d.orig) > 0 ? '+' : '−'}
+                      {Math.abs(d.rec - d.orig).toFixed(2)} s
+                    </b>
+                  )}
+                  {edge('start')}
+                  {edge('end')}
                 </div>
               );
             })}
@@ -395,7 +464,7 @@ export function Editor({ p, update, onNext, nextLabel }: { p: ProjectView; updat
       </div>
 
       <div className="muted small shortcuts">
-        <kbd>Space</kbd> play · <kbd>M</kbd> mute ·<kbd>Q</kbd> cut left of playhead · <kbd>W</kbd> cut right · <kbd>S</kbd> split · <kbd>Del</kbd> delete selected piece
+        <kbd>Space</kbd> play · <kbd>M</kbd> mute ·<kbd>Q</kbd> cut left of playhead · <kbd>W</kbd> cut right · <kbd>S</kbd> split · <kbd>Del</kbd> delete selected piece · drag a piece's edge to trim it, or out to bring back cut footage
         · <kbd>Ctrl+Z</kbd> undo · <kbd>←</kbd>/<kbd>→</kbd> frame (Shift: 1 s) · <kbd>↑</kbd>/<kbd>↓</kbd> edit points · <kbd>Ctrl</kbd>+wheel zoom ·{' '}
         <kbd>\</kbd> fit
       </div>
