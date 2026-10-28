@@ -1,9 +1,9 @@
-import type { CaptionLine, CaptionSettings, Clip, Edits, Kill, MatchData, Moment, Settings, SyncModel } from '../../server/types.ts';
+import type { CaptionLine, CaptionSettings, CaptionWord, Clip, Edits, Kill, MatchData, Moment, Settings, SyncModel } from '../../server/types.ts';
 import type { VideoInfo } from '../../server/util/ffmpeg.ts';
 import type { Job } from '../../server/jobs.ts';
 import type { ExportSettings } from '../../server/edit/render.ts';
 
-export type { CaptionLine, CaptionSettings, Clip, Edits, Kill, Moment, Settings, SyncModel, Job, ExportSettings };
+export type { CaptionLine, CaptionSettings, CaptionWord, Clip, Edits, Kill, Moment, Settings, SyncModel, Job, ExportSettings };
 
 export interface ProjectView {
   id: string;
@@ -34,6 +34,7 @@ export interface ProjectView {
   transcript?: CaptionLine[] | null;
   transcriptJob: Job | null;
   cleanupJob: Job | null;
+  alignJob: Job | null;
   peaksJob: Job | null;
   /** caption lines for speech inside the current reel */
   reelCaptions: CaptionLine[];
@@ -83,6 +84,7 @@ export const api = {
     return r.ok ? new Uint8Array(await r.arrayBuffer()) : null;
   },
   captionsStatus: () => req<{ ok: boolean; missing: string[]; fonts: string[]; cleanup: boolean }>('GET', '/api/captions/status'),
+  alignCaptions: (id: string) => req<Job>('POST', `/api/projects/${id}/captions/align`),
   cleanupCaptions: (id: string) => req<Job>('POST', `/api/projects/${id}/captions/cleanup`),
   job: (id: string) => req<Job | null>('GET', `/api/jobs/${id}`),
   cancel: (id: string) => req('DELETE', `/api/jobs/${id}`),

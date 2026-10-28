@@ -12,8 +12,8 @@ import { bumperFile, bumperSeconds, reelTarget, type BumperKind } from './brandi
 import { probe, type VideoInfo } from './util/ffmpeg.ts';
 import { detectSpeech, type Speech } from './audio/speech.ts';
 import { DEFAULT_SETTINGS, NO_EDITS, type CaptionLine, type Edits, type Clip, type MatchData, type Moment, type RoundIntro, type Settings, type SyncModel } from './types.ts';
-import { transcribe } from './captions/transcribe.ts';
-import { cleanupCaptions, spreadWords } from './captions/cleanup.ts';
+import { alignLines, transcribe } from './captions/transcribe.ts';
+import { cleanupCaptions, retime } from './captions/cleanup.ts';
 import { buildAss } from './captions/ass.ts';
 import { resolveFont } from './captions/fonts.ts';
 
@@ -237,9 +237,9 @@ export async function analyzeSpeech(p: Project, onProgress?: (f: number) => void
 
 const overlaps = (a: [number, number], clips: Clip[]) => clips.some((c) => a[1] > c.start && a[0] < c.end);
 
-/** Caption lines for speech that's in the reel right now. */
+/** Caption lines for speech that's in the reel right now (removed lines left out). */
 export function reelCaptions(p: Project, clips = clipsFor(p)): CaptionLine[] {
-  return (p.transcript ?? []).filter((l) => overlaps([l.start, l.end], clips));
+  return (p.transcript ?? []).filter((l) => !l.removed && overlaps([l.start, l.end], clips));
 }
 
 /**
@@ -258,22 +258,29 @@ export async function transcribeProject(p: Project, onProgress?: (f: number) => 
   return p.transcript;
 }
 
+/** Snaps the word timing of the reel's caption lines that predate alignment to the voice audio. */
+export async function alignProject(p: Project, onProgress?: (f: number) => void, signal?: AbortSignal) {
+  const todo = reelCaptions(p).filter((l) => !l.aligned);
+  const aligned = new Map((await alignLines(p.videoPath, todo, voiceTracks(p), join(DATA_DIR, 'work', p.id, 'align'), onProgress, signal)).map((l) => [l.id, l]));
+  p.transcript = (p.transcript ?? []).map((l) => aligned.get(l.id) ?? l);
+  return aligned.size;
+}
+
 /** Rewrites the reel's caption lines with Claude (hand edits and already-cleaned lines are kept). */
 export async function cleanupProject(p: Project, onProgress?: (f: number) => void, signal?: AbortSignal) {
   const inReel = new Set(reelCaptions(p).map((l) => l.id));
   const cleaned = await cleanupCaptions((p.transcript ?? []).filter((l) => inReel.has(l.id)), onProgress, signal);
   const byId = new Map(cleaned.map((l) => [l.id, l]));
-  // lines cleanup dropped (filler sounds) disappear; lines outside the reel stay as they are
-  p.transcript = (p.transcript ?? []).flatMap((l) => (inReel.has(l.id) ? (byId.has(l.id) ? [byId.get(l.id)!] : []) : [l]));
+  p.transcript = (p.transcript ?? []).map((l) => byId.get(l.id) ?? l);
   return p.transcript;
 }
 
-/** Replaces a caption's text, spreading the line's time over the new words by length. */
+/** Replaces a caption's text; the new words keep the old words' timing (see retime). */
 export function editCaption(p: Project, id: string, text: string) {
   const line = p.transcript?.find((l) => l.id === id);
   if (!line) return;
   const tokens = text.trim().split(/\s+/).filter(Boolean);
-  line.words = spreadWords(tokens, line.words[0]?.start ?? line.start, line.words.at(-1)?.end ?? line.end);
+  line.words = retime(line.words, tokens, line);
   line.edited = true;
 }
 
@@ -282,7 +289,8 @@ export function clipCaptions(p: Project) {
   const caps = p.settings.captions;
   if (!caps.enabled || !p.transcript?.length) return () => null;
   const font = resolveFont(caps.font);
-  return (clip: Clip) => buildAss(p.transcript!, clip, p.video, caps, font);
+  const lines = p.transcript.filter((l) => !l.removed);
+  return (clip: Clip) => buildAss(lines, clip, p.video, caps, font);
 }
 
 export function defaultOutputPath(p: Project) {

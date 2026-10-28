@@ -144,8 +144,12 @@ export interface CaptionLine {
   source: string;
   words: CaptionWord[];
   edited?: boolean;
+  /** left out of the captions (removed by you, or filler cleanup dropped); kept so the speech isn't transcribed again */
+  removed?: boolean;
   /** rewritten into natural Roman Urdu / English by Claude */
   cleaned?: boolean;
+  /** word times snapped to the pauses in the voice audio (align.ts) */
+  aligned?: boolean;
 }
 
 export type CaptionStyle = 'pop' | 'clean' | 'karaoke';

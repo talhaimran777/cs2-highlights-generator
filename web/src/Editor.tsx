@@ -1,45 +1,14 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { api, fmtTime, type Clip, type Edits, type Moment, type ProjectView } from './api.ts';
 import { applyEdits } from '../../server/edit/edits.ts';
+import { buildSegments, parseFps, PlayerControls, ReelStage, segIndexAt, useReelPlayer } from './reel.tsx';
 
 type Update = (fn: () => Promise<ProjectView>) => Promise<void>;
-
-/** A piece of the reel between two edit points (clip edges, cuts, splits). */
-interface Segment {
-  clip: Clip;
-  recStart: number; // recording seconds
-  recEnd: number;
-  reelStart: number; // seconds into the edited reel
-  reelEnd: number;
-}
 
 const EDGE = 0.05; // splits and cuts this close to an edge are ignored
 const MAX_PPS = 200; // most zoomed in, pixels per second
 const PEAKS_PER_SEC = 100;
 const TICK_STEPS = [0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800];
-
-function buildSegments(clips: Clip[], splits: number[]): Segment[] {
-  const out: Segment[] = [];
-  let reel = 0;
-  for (const clip of clips) {
-    const points = [clip.start, ...splits.filter((s) => s > clip.start + EDGE && s < clip.end - EDGE), clip.end];
-    for (let i = 0; i < points.length - 1; i++) {
-      const d = points[i + 1] - points[i];
-      out.push({ clip, recStart: points[i], recEnd: points[i + 1], reelStart: reel, reelEnd: reel + d });
-      reel += d;
-    }
-  }
-  return out;
-}
-
-const segIndexAt = (segs: Segment[], t: number) => {
-  let i = 0;
-  while (i < segs.length - 1 && segs[i].reelEnd <= t) i++;
-  return i;
-};
-
-/** Playing on from a into b needs no seek (split inside a clip, or clips that touch). */
-const continuous = (a: Segment | undefined, b: Segment | undefined) => !!a && !!b && Math.abs(b.recStart - a.recEnd) < 0.02;
 
 /** Focus is in a text field (a focused slider, like the volume, still lets the shortcuts work). */
 const isTyping = (e: KeyboardEvent) =>
@@ -72,10 +41,9 @@ export function Editor({ p, update, onNext, nextLabel }: { p: ProjectView; updat
   };
   useEffect(() => flush, [flush]); // save what's pending when leaving the step
 
-  const timeRef = useRef(0);
-  const commit = (next: Edits, newTime = timeRef.current) => {
+  const commit = (next: Edits, newTime = player.timeRef.current) => {
     setHistory((h) => ({ past: [...h.past, edits].slice(-200), future: [] }));
-    timeRef.current = newTime;
+    player.timeRef.current = newTime;
     setEdits(next);
     save(next);
   };
@@ -98,152 +66,22 @@ export function Editor({ p, update, onNext, nextLabel }: { p: ProjectView; updat
   // keyed on the content, so a server refresh with the same clips doesn't re-seek playback
   const sig = JSON.stringify([p.baseClips.map((c) => [c.start, c.end, c.round]), edits]);
   const segments = useMemo(() => buildSegments(applyEdits(p.baseClips, edits), edits.splits), [sig]); // eslint-disable-line react-hooks/exhaustive-deps
-  const total = segments.at(-1)?.reelEnd ?? 0;
   const baseTotal = useMemo(() => p.baseClips.reduce((s, c) => s + c.end - c.start, 0), [p.baseClips]);
-  const fps = useMemo(() => {
-    const [n, d] = p.video.fps.split('/').map(Number);
-    return d ? n / d : n || 60;
-  }, [p.video.fps]);
+  const fps = parseFps(p.video.fps);
   const kindOf = useMemo(() => new Map<string, Moment['kind']>(p.moments.map((m) => [m.id, m.kind])), [p.moments]);
 
   // --- player -------------------------------------------------------------
-  const vidA = useRef<HTMLVideoElement>(null);
-  const vidB = useRef<HTMLVideoElement>(null);
-  const vid = (i: number) => (i === 0 ? vidA.current : vidB.current);
-  const active = useRef(0);
-  const [activeVid, setActiveVid] = useState(0);
-  const segIdx = useRef(0);
-  const segsRef = useRef(segments);
-  segsRef.current = segments;
-  const [time, setTime] = useState(0);
-  const [playing, setPlaying] = useState(false);
-  const playingRef = useRef(false);
-  const [videoError, setVideoError] = useState(false);
-
-  // preview volume only (the export keeps the original audio); remembered per browser
-  const [volume, setVolume] = useState(() => {
-    try {
-      const v = Number(localStorage.getItem('editor.volume'));
-      return localStorage.getItem('editor.volume') !== null && v >= 0 && v <= 1 ? v : 1;
-    } catch {
-      return 1;
-    }
-  });
-  const [silent, setSilent] = useState(false);
-  useEffect(() => {
-    // .muted belongs to the A/B swap (only the visible video is heard), so the user's level goes on .volume
-    for (const v of [vidA.current, vidB.current]) if (v) v.volume = silent ? 0 : volume;
-    try {
-      localStorage.setItem('editor.volume', String(volume));
-    } catch {}
-  }, [volume, silent]);
-
-  const setPlay = (on: boolean) => {
-    playingRef.current = on;
-    setPlaying(on);
-  };
-
-  /** Parks the hidden video at the start of the next jump, so the swap is instant. */
-  const prepare = (from: number) => {
-    const segs = segsRef.current;
-    let j = from + 1;
-    while (j < segs.length && continuous(segs[j - 1], segs[j])) j++;
-    const hidden = vid(1 - active.current);
-    if (hidden && segs[j] && Math.abs(hidden.currentTime - segs[j].recStart) > 0.02) hidden.currentTime = segs[j].recStart;
-  };
-
-  const seekTo = (t: number) => {
-    const segs = segsRef.current;
-    const v = vid(active.current);
-    if (!v || segs.length === 0) return;
-    const end = segs.at(-1)!.reelEnd;
-    t = Math.min(end, Math.max(0, t));
-    const i = segIndexAt(segs, t);
-    v.currentTime = segs[i].recStart + (t - segs[i].reelStart);
-    segIdx.current = i;
-    timeRef.current = t;
-    setTime(t);
-    prepare(i);
-  };
-
-  /** Moves playback on to segment i: same video if it's contiguous, otherwise swap to the parked one. */
-  const advance = (i: number) => {
-    const segs = segsRef.current;
-    if (continuous(segs[segIdx.current], segs[i])) {
-      segIdx.current = i;
-      return;
-    }
-    const cur = vid(active.current)!;
-    const next = vid(1 - active.current)!;
-    if (Math.abs(next.currentTime - segs[i].recStart) > 0.02) next.currentTime = segs[i].recStart;
-    next.muted = false;
-    cur.muted = true;
-    void next.play();
-    cur.pause();
-    active.current = 1 - active.current;
-    setActiveVid(active.current);
-    segIdx.current = i;
-    prepare(i);
-  };
-
-  const togglePlay = () => {
-    const v = vid(active.current);
-    if (!v || segsRef.current.length === 0) return;
-    if (playingRef.current) {
-      v.pause();
-      setPlay(false);
-    } else {
-      if (timeRef.current >= total - 0.05) seekTo(0);
-      void vid(active.current)!.play();
-      setPlay(true);
-    }
-  };
-
-  // the playback clock: follows the active video and jumps over cuts
-  useEffect(() => {
-    let raf = 0;
-    const tick = () => {
-      raf = requestAnimationFrame(tick);
-      const segs = segsRef.current;
-      const v = vid(active.current);
-      const seg = segs[segIdx.current];
-      if (!v || !seg) return;
-      if (playingRef.current) {
-        // a frame early: the next check is one animation frame (~16 ms) away
-        if (v.currentTime >= seg.recEnd - Math.max(0.5 / fps, 0.017)) {
-          if (segIdx.current + 1 >= segs.length) {
-            v.pause();
-            setPlay(false);
-            timeRef.current = seg.reelEnd;
-            setTime(seg.reelEnd);
-            return;
-          }
-          advance(segIdx.current + 1);
-          return;
-        }
-        if (v.currentTime < seg.recStart - 0.25) return; // still seeking
-      }
-      const t = seg.reelStart + Math.min(seg.recEnd, Math.max(seg.recStart, v.currentTime)) - seg.recStart;
-      if (Math.abs(t - timeRef.current) > 1e-4 && (playingRef.current || !v.seeking)) {
-        timeRef.current = t;
-        setTime(t);
-      }
-    };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, [fps]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // edits changed: stay at the same reel time (or where the edit put the playhead)
-  useEffect(() => seekTo(timeRef.current), [segments]); // eslint-disable-line react-hooks/exhaustive-deps
+  const player = useReelPlayer(segments, fps);
+  const { time, playing, total, seekTo, togglePlay } = player;
 
   // --- edit operations (all in recording time) ----------------------------
   const [selected, setSelected] = useState<number | null>(null); // recStart of the selected segment
   const selIdx = selected === null ? -1 : segments.findIndex((s) => Math.abs(s.recStart - selected) < 1e-3);
   const at = () => {
-    const segs = segsRef.current;
-    const i = segIndexAt(segs, timeRef.current);
+    const segs = segments;
+    const i = segIndexAt(segs, player.timeRef.current);
     const s = segs[i];
-    return s ? { i, s, rec: s.recStart + (timeRef.current - s.reelStart) } : null;
+    return s ? { i, s, rec: s.recStart + (player.timeRef.current - s.reelStart) } : null;
   };
 
   const split = () => {
@@ -274,7 +112,7 @@ export function Editor({ p, update, onNext, nextLabel }: { p: ProjectView; updat
   /** Edit points on the reel: segment starts plus the end. */
   const jumpEdit = (dir: 1 | -1) => {
     const points = [...segments.map((s) => s.reelStart), total];
-    const t = timeRef.current;
+    const t = player.timeRef.current;
     const target = dir > 0 ? points.find((x) => x > t + 1e-3) : [...points].reverse().find((x) => x < t - 1e-3);
     if (target !== undefined) seekTo(target);
   };
@@ -422,12 +260,12 @@ export function Editor({ p, update, onNext, nextLabel }: { p: ProjectView; updat
     if (ctrl || e.altKey) return;
     if (k === ' ') return run(togglePlay);
     if (k === 's') return run(split);
-    if (k === 'm') return run(() => setSilent((s) => !s));
+    if (k === 'm') return run(() => player.setSilent((s) => !s));
     if (k === 'q') return run(trimLeft);
     if (k === 'w') return run(trimRight);
     if (k === 'delete' || k === 'backspace') return run(deleteSelected);
-    if (k === 'arrowleft') return run(() => seekTo(timeRef.current - (e.shiftKey ? 1 : 1 / fps)));
-    if (k === 'arrowright') return run(() => seekTo(timeRef.current + (e.shiftKey ? 1 : 1 / fps)));
+    if (k === 'arrowleft') return run(() => seekTo(player.timeRef.current - (e.shiftKey ? 1 : 1 / fps)));
+    if (k === 'arrowright') return run(() => seekTo(player.timeRef.current + (e.shiftKey ? 1 : 1 / fps)));
     if (k === 'arrowup') return run(() => jumpEdit(-1));
     if (k === 'arrowdown') return run(() => jumpEdit(1));
     if (k === 'home') return run(() => seekTo(0));
@@ -487,53 +325,15 @@ export function Editor({ p, update, onNext, nextLabel }: { p: ProjectView; updat
         </div>
       </div>
 
-      <div className="editor-stage">
-        {[vidA, vidB].map((ref, i) => (
-          <video
-            key={i}
-            ref={ref}
-            className={activeVid === i ? 'on' : ''}
-            src={`/api/projects/${p.id}/media`}
-            preload="auto"
-            muted={i !== 0}
-            playsInline
-            onLoadedMetadata={() => (i === active.current ? seekTo(timeRef.current) : prepare(segIdx.current))}
-            onError={() => setVideoError(true)}
-            onClick={togglePlay}
-          />
-        ))}
+      <ReelStage player={player} src={`/api/projects/${p.id}/media`}>
         {cur && <div className="editor-badge">{label(cur.clip)}</div>}
-      </div>
-      {videoError && (
+      </ReelStage>
+      {player.videoError && (
         <div className="muted small">The browser can't play this recording (e.g. HEVC). Cuts still work and the export is unaffected.</div>
       )}
 
       <div className="row wrap editor-controls">
-        <button className="btn btn-sm" onClick={togglePlay} title="Space">
-          {playing ? '❚❚ Pause' : '▶ Play'}
-        </button>
-        <span className="mono small">
-          {fmtTime(time)} / {fmtTime(total)}
-        </span>
-        <span className="volume">
-          <button className="btn btn-xs" onClick={() => setSilent((s) => !s)} title={silent ? 'Unmute (M)' : 'Mute (M)'}>
-            {silent || volume === 0 ? '🔇' : volume < 0.5 ? '🔉' : '🔊'}
-          </button>
-          <input
-            type="range"
-            min={0}
-            max={1}
-            step={0.05}
-            value={silent ? 0 : volume}
-            title={`Preview volume ${Math.round((silent ? 0 : volume) * 100)}%`}
-            onChange={(e) => {
-              setVolume(Number(e.target.value));
-              setSilent(false);
-            }}
-            onKeyDown={(e) => e.key === ' ' && e.preventDefault()}
-          />
-          <span className="mono small muted">{Math.round((silent ? 0 : volume) * 100)}%</span>
-        </span>
+        <PlayerControls player={player} />
         <span className="grow" />
         <button className="btn btn-sm" onClick={split} title="S or Ctrl+K">
           Split

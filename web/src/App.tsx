@@ -3,6 +3,7 @@ import { api, fmtTime, videoTime, waitJob, type CaptionSettings, type Job, type 
 import { FilePicker } from './FilePicker.tsx';
 import { Editor } from './Editor.tsx';
 import { BrandingSection } from './Branding.tsx';
+import { CaptionPreview, type CaptionPreviewControl } from './CaptionPreview.tsx';
 
 type Step = 'player' | 'sync' | 'highlights' | 'edit' | 'captions' | 'export';
 const STEPS: { id: Step; label: string }[] = [
@@ -178,6 +179,7 @@ function ProjectScreen({ id }: { id: string }) {
   const [error, setError] = useState('');
   const [step, setStep] = useState<Step>('player');
   const preview = usePreview();
+  const captionPreview = useRef<CaptionPreviewControl | null>(null);
 
   useEffect(() => {
     api
@@ -204,7 +206,7 @@ function ProjectScreen({ id }: { id: string }) {
   // Speech detection runs in the background; refresh until it's done so clips pick it up.
   // (transcription too)
   const backgroundRunning =
-    p?.speechJob?.status === 'running' || p?.transcriptJob?.status === 'running' || p?.cleanupJob?.status === 'running';
+    p?.speechJob?.status === 'running' || p?.transcriptJob?.status === 'running' || p?.cleanupJob?.status === 'running' || p?.alignJob?.status === 'running';
   useEffect(() => {
     if (!backgroundRunning) return;
     const t = setInterval(() => api.get(id).then(setP).catch(() => {}), 2000);
@@ -252,10 +254,16 @@ function ProjectScreen({ id }: { id: string }) {
           )}
           {step === 'sync' && <SyncStep p={p} setP={setP} update={update} preview={preview} onNext={() => setStep('highlights')} />}
           {step === 'highlights' && <HighlightsStep p={p} update={update} preview={preview} onNext={() => setStep('edit')} />}
-          {step === 'captions' && <CaptionsStep p={p} update={update} preview={preview} onNext={() => setStep('export')} />}
+          {step === 'captions' && (
+            <CaptionsStep p={p} update={update} playLine={(a, b) => captionPreview.current?.playLine(a, b)} onNext={() => setStep('export')} />
+          )}
           {step === 'export' && <ExportStep p={p} setP={setP} update={update} />}
         </div>
         <aside className="preview">
+          {step === 'captions' ? (
+            <CaptionPreview p={p} control={captionPreview} />
+          ) : (
+          <>
           <video
             ref={preview.ref}
             src={`/api/projects/${p.id}/media`}
@@ -266,6 +274,8 @@ function ProjectScreen({ id }: { id: string }) {
           <div className="muted small">
             Preview of your recording. Browsers can't play every OBS format (e.g. HEVC); if it stays black, the export still works.
           </div>
+          </>
+          )}
         </aside>
       </div>
       )}
@@ -496,7 +506,7 @@ function HighlightsStep({ p, update, preview, onNext }: { p: ProjectView; update
                   <span className={`chip kind-${m.kind} on`} title={m.kind === 'intro' ? FULL_ROUND_HINT : undefined}>
                     {KIND_LABEL[m.kind]}
                   </span>
-                  <span className="label">{m.label}</span>
+                  <span className="label" title={m.label}>{m.label}</span>
                   <span className="tags">
                     {m.tags.map((t) => (
                       <span key={t} className="tag">
@@ -631,7 +641,18 @@ const CAPTION_STYLES: { id: CaptionSettings['style']; label: string; hint: strin
 ];
 
 /** Animated captions: transcription status, style controls, live preview, editable lines. */
-function CaptionsStep({ p, update, preview, onNext }: { p: ProjectView; update: Update; preview: Preview; onNext: () => void }) {
+function CaptionsStep({
+  p,
+  update,
+  playLine,
+  onNext,
+}: {
+  p: ProjectView;
+  update: Update;
+  /** plays one line (recording seconds) in the reel preview */
+  playLine: (start: number, end: number) => void;
+  onNext: () => void;
+}) {
   const [status, setStatus] = useState<{ ok: boolean; missing: string[]; fonts: string[]; cleanup: boolean } | null>(null);
   useEffect(() => void api.captionsStatus().then(setStatus).catch(() => {}), []);
   const caps = p.settings.captions;
@@ -639,6 +660,10 @@ function CaptionsStep({ p, update, preview, onNext }: { p: ProjectView; update: 
   const job = p.transcriptJob;
   const running = job?.status === 'running';
   const lines = p.reelCaptions;
+  // removed lines of this reel, so they can be brought back
+  const removed = (p.transcript ?? []).filter((l) => l.removed && p.clips.some((c) => l.end > c.start && l.start < c.end));
+  const [showRemoved, setShowRemoved] = useState(false);
+  const setRemoved = (id: string, on: boolean) => update(() => api.patch(p.id, { removeCaptions: { [id]: on } }));
   const urdu = lines.filter((l) => l.lang === 'ur').length;
   const fonts = status?.fonts ?? [];
   const sample = (lines.find((l) => l.words.length >= 3)?.words.slice(0, 3).map((w) => w.text) ?? ['bhai', 'peeche', 'dekho']).map((t) =>
@@ -717,6 +742,7 @@ function CaptionsStep({ p, update, preview, onNext }: { p: ProjectView; update: 
           )}
           {job?.status === 'error' && <span className="error">{job.error}</span>}
         </div>
+        <WordTiming p={p} lines={lines} update={update} />
         <CaptionCleanup p={p} available={!!status?.cleanup} lines={lines} update={update} setCaps={setCaps} />
       </section>
 
@@ -771,12 +797,19 @@ function CaptionsStep({ p, update, preview, onNext }: { p: ProjectView; update: 
         </div>
       </section>
 
-      {lines.length > 0 && (
+      {lines.length + removed.length > 0 && (
         <section className="card">
-          <h2>Lines</h2>
+          <div className="row spread">
+            <h2>Lines</h2>
+            {removed.length > 0 && (
+              <button className="btn btn-xs" onClick={() => setShowRemoved(!showRemoved)}>
+                {showRemoved ? 'Hide' : 'Show'} {removed.length} removed
+              </button>
+            )}
+          </div>
           <p className="muted small">
             Only speech inside your {fmtTime(p.reelDuration)} reel is captioned; times are where each line plays in it. Fix any word: click a line,
-            type, and click outside it. Timing is kept.
+            type, and click outside it. Timing is kept. ✕ leaves a line out of the captions.
           </p>
           <div className="caption-lines">
             {lines.map((l) => (
@@ -796,11 +829,27 @@ function CaptionsStep({ p, update, preview, onNext }: { p: ProjectView; update: 
                   }}
                 />
                 {l.edited ? <span className="muted small">edited</span> : l.cleaned && <span className="muted small" title="Spelling cleaned up by Claude">✨</span>}
-                <button className="btn btn-sm" onClick={() => preview.play(l.start - 0.5, l.end + 0.5)}>
+                <button className="btn btn-sm" onClick={() => playLine(l.start, l.end)}>
                   ▶
+                </button>
+                <button className="btn btn-sm remove" title="Leave this line out of the captions" onClick={() => setRemoved(l.id, true)}>
+                  ✕
                 </button>
               </div>
             ))}
+            {showRemoved &&
+              removed.map((l) => (
+                <div key={l.id} className="caption-line removed">
+                  <span className="muted small mono">{fmtTime(reelTime(p.clips, l.start))}</span>
+                  <span className="grow">{l.words.map((w) => w.text).join(' ')}</span>
+                  <button className="btn btn-sm" onClick={() => playLine(l.start, l.end)}>
+                    ▶
+                  </button>
+                  <button className="btn btn-sm" onClick={() => setRemoved(l.id, false)}>
+                    Restore
+                  </button>
+                </div>
+              ))}
           </div>
         </section>
       )}
@@ -819,6 +868,34 @@ function reelTime(clips: ProjectView['clips'], t: number) {
 }
 
 /** Claude rewrites the transcribed lines into natural Roman Urdu / English, keeping the timing. */
+/** Lines transcribed before word alignment existed: their highlight trails the voice until synced. */
+function WordTiming({ p, lines, update }: { p: ProjectView; lines: ProjectView['reelCaptions']; update: Update }) {
+  const job = p.alignJob;
+  const todo = lines.filter((l) => !l.aligned).length;
+  if (job?.status === 'running') {
+    return (
+      <div className="row wrap small">
+        <span className="muted">Syncing word timing to your voice…</span>
+        <Progress value={job.progress} />
+      </div>
+    );
+  }
+  if (todo === 0 && job?.status !== 'error') return null;
+  return (
+    <div className="row wrap small">
+      {todo > 0 && (
+        <>
+          <span className="muted">{todo} lines were transcribed before word timing was synced to your voice, so their highlight can lag.</span>
+          <button className="btn btn-sm" onClick={() => update(async () => (await api.alignCaptions(p.id), api.get(p.id)))}>
+            Sync word timing
+          </button>
+        </>
+      )}
+      {job?.status === 'error' && <span className="error">{job.error}</span>}
+    </div>
+  );
+}
+
 function CaptionCleanup({
   p,
   available,

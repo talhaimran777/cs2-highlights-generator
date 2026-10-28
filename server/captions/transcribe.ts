@@ -4,6 +4,7 @@ import { join, resolve } from 'node:path';
 import { FFMPEG, runFfmpeg } from '../util/ffmpeg.ts';
 import { romanize } from './romanize.ts';
 import { mergeEnglish } from './merge.ts';
+import { alignWords, envelope, lineRange } from './align.ts';
 import type { CaptionLine, CaptionWord } from '../types.ts';
 
 const TOOLS = resolve(process.env.CS2H_TOOLS ?? 'tools');
@@ -107,6 +108,54 @@ export function audioSpans(utterances: [number, number][]): [number, number][] {
   return spans;
 }
 
+/** The voice track(s) as 16 kHz mono, decoded only around the given ranges (not the whole recording). */
+async function decodeVoice(videoPath: string, ranges: [number, number][], tracks: number[], workDir: string, onProgress?: (f: number) => void, signal?: AbortSignal) {
+  const audio = tracks.length <= 1
+    ? ['-map', `0:a:${tracks[0] ?? 0}`]
+    : ['-filter_complex', `${tracks.map((t) => `[0:a:${t}]`).join('')}amix=inputs=${tracks.length}:normalize=0[v]`, '-map', '[v]'];
+  // nearby ranges share one seek-and-decode
+  const spans = audioSpans(ranges);
+  const pcmPath = join(workDir, 'voice.s16');
+  const decoded: { from: number; to: number; samples: Int16Array }[] = [];
+  for (const [i, [from, to]] of spans.entries()) {
+    await runFfmpeg(
+      ['-ss', from.toFixed(3), '-i', videoPath, '-t', (to - from).toFixed(3), '-vn', ...audio, '-ac', '1', '-ar', String(SAMPLE_RATE), '-f', 's16le', pcmPath],
+      undefined,
+      signal,
+    );
+    const pcm = readFileSync(pcmPath);
+    decoded.push({ from, to, samples: new Int16Array(pcm.buffer, pcm.byteOffset, pcm.length >> 1) });
+    onProgress?.((i + 1) / spans.length);
+  }
+  rmSync(pcmPath, { force: true });
+  /** Samples for [from, to] (recording seconds), which must lie inside one of the ranges. */
+  return (from: number, to: number) => {
+    const span = decoded.find((d) => from >= d.from - 1e-6 && to <= d.to + 1e-6)!;
+    return span.samples.subarray(Math.max(0, Math.floor((from - span.from) * SAMPLE_RATE)), Math.ceil((to - span.from) * SAMPLE_RATE));
+  };
+}
+
+/** Snaps the words of already transcribed lines to the voice audio (see align.ts). */
+export async function alignLines(
+  videoPath: string,
+  lines: CaptionLine[],
+  tracks: number[],
+  workDir: string,
+  onProgress?: (f: number) => void,
+  signal?: AbortSignal,
+): Promise<CaptionLine[]> {
+  if (lines.length === 0) return [];
+  rmSync(workDir, { recursive: true, force: true });
+  mkdirSync(workDir, { recursive: true });
+  const ranges = lines.map(lineRange).map(([a, b]): [number, number] => [Math.max(0, a), b]);
+  const voice = await decodeVoice(videoPath, ranges, tracks, workDir, onProgress, signal);
+  rmSync(workDir, { recursive: true, force: true });
+  return lines.map((l, i) => {
+    const [from, to] = ranges[i];
+    return { ...l, words: alignWords(l.words, envelope(voice(from, to), SAMPLE_RATE), from), aligned: true };
+  });
+}
+
 /**
  * Transcribes the given utterances (recording seconds) from the voice track(s).
  * English words stay English; Urdu is written in Roman Urdu.
@@ -125,34 +174,15 @@ export async function transcribe(
   rmSync(workDir, { recursive: true, force: true });
   mkdirSync(workDir, { recursive: true });
 
-  // 1. the voice audio as 16 kHz mono, only around the utterances (not the whole recording):
-  //    nearby utterances share one seek-and-decode
-  const audio = tracks.length <= 1
-    ? ['-map', `0:a:${tracks[0] ?? 0}`]
-    : ['-filter_complex', `${tracks.map((t) => `[0:a:${t}]`).join('')}amix=inputs=${tracks.length}:normalize=0[v]`, '-map', '[v]'];
-  const spans = audioSpans(utterances);
-  const pcmPath = join(workDir, 'voice.s16');
-  const decoded: { from: number; samples: Int16Array }[] = [];
-  for (const [i, [from, to]] of spans.entries()) {
-    await runFfmpeg(
-      ['-ss', from.toFixed(3), '-i', videoPath, '-t', (to - from).toFixed(3), '-vn', ...audio, '-ac', '1', '-ar', String(SAMPLE_RATE), '-f', 's16le', pcmPath],
-      undefined,
-      signal,
-    );
-    const pcm = readFileSync(pcmPath);
-    decoded.push({ from, samples: new Int16Array(pcm.buffer, pcm.byteOffset, pcm.length >> 1) });
-    onProgress?.((0.1 * (i + 1)) / spans.length);
-  }
-  rmSync(pcmPath, { force: true });
-
-  // 2. one WAV per utterance
+  // 1. the voice audio, only around the utterances; 2. one WAV per utterance
+  const ranges = utterances.map(([a, b]): [number, number] => [Math.max(0, a - PAD_S), b + PAD_S]);
+  const voice = await decodeVoice(videoPath, ranges, tracks, workDir, (f) => onProgress?.(0.1 * f), signal);
   const items = utterances.map(([a, b], i) => {
-    const from = Math.max(0, a - PAD_S);
-    const to = b + PAD_S;
-    const span = decoded.find((d, j) => from >= d.from - 1e-6 && to <= spans[j][1] + 1e-6)!;
+    const [from, to] = ranges[i];
+    const samples = voice(from, to);
     const file = join(workDir, `u${String(i).padStart(4, '0')}.wav`);
-    writeFileSync(file, wavFile(span.samples.subarray(Math.floor((from - span.from) * SAMPLE_RATE), Math.ceil((to - span.from) * SAMPLE_RATE))));
-    return { from, start: a, end: b, file };
+    writeFileSync(file, wavFile(samples));
+    return { from, start: a, end: b, file, env: envelope(samples, SAMPLE_RATE) };
   });
 
   // 3. two passes over every utterance (see merge.ts for why language detection isn't used):
@@ -185,9 +215,10 @@ export async function transcribe(
     const merged = { ...both, words: collapseRepeats(both.words) };
     const text = merged.words.map((w) => w.text).join(' ');
     if (!text.trim() || HALLUCINATIONS.some((h) => h.test(text.trim()))) return;
-    const words: CaptionWord[] = merged.words.map((w) => ({ start: x.from + w.start, end: x.from + w.end, text: w.text }));
+    const timed: CaptionWord[] = merged.words.map((w) => ({ start: x.from + w.start, end: x.from + w.end, text: w.text }));
+    const words = alignWords(timed, x.env, x.from);
     const lang = merged.englishCount >= 0.8 * merged.words.length ? 'en' : 'ur';
-    lines.push({ id: `u${x.start.toFixed(2)}`, start: x.start, end: x.end, lang, source: source || text, words });
+    lines.push({ id: `u${x.start.toFixed(2)}`, start: x.start, end: x.end, lang, source: source || text, words, aligned: true });
   });
   rmSync(workDir, { recursive: true, force: true });
   onProgress?.(1);

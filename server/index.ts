@@ -4,7 +4,7 @@ import { createReadStream, existsSync, readdirSync, statSync } from 'node:fs';
 import { extname, join, resolve } from 'node:path';
 import { cancelJob, getJob, latestJob, startJob } from './jobs.ts';
 import {
-  analyzeSpeech, autoSync, cleanupProject, baseClipsFor, clipsFor, createProject, createRecordingTest, defaultOutputPath, editCaption, editsOf, getProject, hasPlayer, listProjects,
+  alignProject, analyzeSpeech, autoSync, cleanupProject, baseClipsFor, clipsFor, createProject, createRecordingTest, defaultOutputPath, editCaption, editsOf, getProject, hasPlayer, listProjects,
   BUMPER_CACHE, loadSettings, peaksFile, reelCaptions, renderProject, saveProject, saveSettings, setPlayer, syncAnchors, transcribeProject, type Project,
 } from './project.ts';
 import { captionsReady } from './captions/transcribe.ts';
@@ -17,7 +17,7 @@ import { computePeaks, PEAKS_PER_SEC, readPeaks } from './audio/peaks.ts';
 import { exportSettings } from './edit/render.ts';
 import { checkFfmpeg, hasNvenc } from './util/ffmpeg.ts';
 import { bumperFile, PREVIEW_TARGET } from './branding/bumper.ts';
-import type { Edits, Settings } from './types.ts';
+import type { CaptionLine, Edits, Settings } from './types.ts';
 
 // ANTHROPIC_API_KEY (caption cleanup) can live in .env, so it works without a system-wide variable
 if (existsSync('.env')) process.loadEnvFile('.env');
@@ -56,6 +56,7 @@ function view(p: Project) {
     speechJob: latestJob(p.id, 'speech'),
     transcriptJob: latestJob(p.id, 'transcribe'),
     cleanupJob: latestJob(p.id, 'cleanup'),
+    alignJob: latestJob(p.id, 'align'),
     peaksJob: latestJob(p.id, 'peaks'),
     reelCaptions: reelCaptions(p, clips),
     anchors: hasPlayer(p) ? syncAnchors(p) : [],
@@ -79,14 +80,24 @@ app.post<{ Params: { id: string } }>('/api/projects/:id/transcribe', async (req)
   return startJob('transcribe', id, async (progress, signal) => {
     const working = load(id);
     await transcribeProject(working, progress, signal);
+    await alignProject(working, undefined, signal); // lines transcribed before word alignment existed
     const p = load(id); // keep edits made meanwhile
-    const edited = new Map((p.transcript ?? []).filter((l) => l.edited).map((l) => [l.id, l]));
-    p.transcript = working.transcript!.map((l) => edited.get(l.id) ?? l);
+    p.transcript = keepUserChanges(working.transcript!, p.transcript);
     saveProject(p);
     if (cleanupAvailable() && p.settings.captions.cleanup) startCleanupJob(id);
     return p.transcript.length;
   });
 });
+
+/** A background job's caption lines, with hand edits and removals made while it ran kept. */
+function keepUserChanges(fromJob: CaptionLine[], now: CaptionLine[] | null = []): CaptionLine[] {
+  const edited = new Map((now ?? []).filter((l) => l.edited).map((l) => [l.id, l]));
+  const removed = new Set((now ?? []).filter((l) => l.removed).map((l) => l.id));
+  return fromJob.map((l) => {
+    const line = edited.get(l.id) ?? l;
+    return removed.has(l.id) ? { ...line, removed: true } : line;
+  });
+}
 
 /** Claude rewrites the caption lines into natural Roman Urdu / English. */
 function startCleanupJob(id: string) {
@@ -94,12 +105,30 @@ function startCleanupJob(id: string) {
     const working = load(id);
     await cleanupProject(working, progress, signal);
     const p = load(id); // keep edits made meanwhile
-    const edited = new Map((p.transcript ?? []).filter((l) => l.edited).map((l) => [l.id, l]));
-    p.transcript = working.transcript!.map((l) => edited.get(l.id) ?? l);
+    p.transcript = keepUserChanges(working.transcript!, p.transcript);
     saveProject(p);
     return p.transcript.filter((l) => l.cleaned).length;
   });
 }
+
+/** Snaps older caption lines' word timing to the voice audio. */
+app.post<{ Params: { id: string } }>('/api/projects/:id/captions/align', async (req) => {
+  const id = load(req.params.id).id;
+  return startJob('align', id, async (progress, signal) => {
+    const working = load(id);
+    const n = await alignProject(working, progress, signal);
+    const byId = new Map(working.transcript!.map((l) => [l.id, l]));
+    const p = load(id);
+    // a line edited or removed meanwhile keeps that change; its new timing is used if the text is the same
+    const text = (l: CaptionLine) => l.words.map((w) => w.text).join(' ');
+    p.transcript = (p.transcript ?? []).map((l) => {
+      const a = byId.get(l.id);
+      return a?.aligned && text(a) === text(l) ? { ...l, words: a.words, aligned: true } : l;
+    });
+    saveProject(p);
+    return n;
+  });
+});
 
 app.post<{ Params: { id: string } }>('/api/projects/:id/captions/cleanup', async (req) => {
   if (!cleanupAvailable()) throw Object.assign(new Error('Set ANTHROPIC_API_KEY and restart the app to use caption cleanup'), { statusCode: 400 });
@@ -199,13 +228,19 @@ app.patch<{
     moments?: Record<string, { enabled?: boolean; trimStart?: number; trimEnd?: number }>;
     /** caption line id -> new text */
     captions?: Record<string, string>;
+    /** caption line id -> true to leave it out of the captions, false to bring it back */
+    removeCaptions?: Record<string, boolean>;
     edits?: Edits;
     outputPath?: string;
   };
 }>('/api/projects/:id', async (req) => {
   const p = load(req.params.id);
-  const { steamId, settings, moments, outputPath, captions, edits } = req.body;
+  const { steamId, settings, moments, outputPath, captions, removeCaptions, edits } = req.body;
   for (const [id, text] of Object.entries(captions ?? {})) editCaption(p, id, text);
+  for (const [id, removed] of Object.entries(removeCaptions ?? {})) {
+    const line = p.transcript?.find((l) => l.id === id);
+    if (line) line.removed = removed || undefined;
+  }
   if (steamId && steamId !== p.settings.steamId) setPlayer(p, steamId);
   let redetectSpeech = false;
   if (settings) {
