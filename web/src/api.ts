@@ -1,14 +1,14 @@
-import type { CaptionLine, CaptionSettings, Clip, Kill, MatchData, Moment, Settings, SyncModel } from '../../server/types.ts';
+import type { CaptionLine, CaptionSettings, Clip, Edits, Kill, MatchData, Moment, Settings, SyncModel } from '../../server/types.ts';
 import type { VideoInfo } from '../../server/util/ffmpeg.ts';
 import type { Job } from '../../server/jobs.ts';
 import type { ExportSettings } from '../../server/edit/render.ts';
 
-export type { CaptionLine, CaptionSettings, Clip, Kill, Moment, Settings, SyncModel, Job, ExportSettings };
+export type { CaptionLine, CaptionSettings, Clip, Edits, Kill, Moment, Settings, SyncModel, Job, ExportSettings };
 
 export interface ProjectView {
   id: string;
-  /** 'captions': a recording without a demo, captioned whole */
-  mode?: 'match' | 'captions';
+  /** 'captions' / 'edit': a recording without a demo, used whole */
+  mode?: 'match' | 'captions' | 'edit';
   name: string;
   videoPath: string;
   demoPath: string;
@@ -19,7 +19,11 @@ export interface ProjectView {
   sync: SyncModel | null;
   killfeedEvents: number[] | null;
   outputPath: string | null;
+  /** what gets rendered: the planned clips minus the editor's cuts */
   clips: Clip[];
+  /** the planned clips before the editor's cuts */
+  baseClips: Clip[];
+  edits: Edits;
   reelDuration: number;
   defaultOutputPath: string;
   /** false when the remembered player isn't in this match */
@@ -29,6 +33,7 @@ export interface ProjectView {
   speechJob: Job | null;
   transcript?: CaptionLine[] | null;
   transcriptJob: Job | null;
+  peaksJob: Job | null;
   /** caption lines for speech inside the current reel */
   reelCaptions: CaptionLine[];
   anchors: { tick: number; round: number }[];
@@ -60,6 +65,7 @@ export const api = {
   projects: () => req<{ id: string; name: string; createdAt: string }[]>('GET', '/api/projects'),
   create: (videoPath: string, demoPath: string) => req<ProjectView>('POST', '/api/projects', { videoPath, demoPath }),
   createCaptionTest: (videoPath: string) => req<ProjectView>('POST', '/api/projects/captions-test', { videoPath }),
+  createEditTest: (videoPath: string) => req<ProjectView>('POST', '/api/projects/edit-test', { videoPath }),
   get: (id: string) => req<ProjectView>('GET', `/api/projects/${id}`),
   patch: (id: string, body: object) => req<ProjectView>('PATCH', `/api/projects/${id}`, body),
   autoSync: (id: string) => req<Job>('POST', `/api/projects/${id}/sync/auto`),
@@ -69,6 +75,12 @@ export const api = {
   render: (id: string) => req<Job>('POST', `/api/projects/${id}/render`),
   detectSpeech: (id: string) => req<Job>('POST', `/api/projects/${id}/speech`),
   transcribe: (id: string) => req<Job>('POST', `/api/projects/${id}/transcribe`),
+  startPeaks: (id: string) => req<Job>('POST', `/api/projects/${id}/peaks`),
+  /** waveform bytes (100 per second of recording), or null while it's being computed */
+  peaks: async (id: string) => {
+    const r = await fetch(`/api/projects/${id}/peaks`);
+    return r.ok ? new Uint8Array(await r.arrayBuffer()) : null;
+  },
   captionsStatus: () => req<{ ok: boolean; missing: string[]; fonts: string[] }>('GET', '/api/captions/status'),
   job: (id: string) => req<Job | null>('GET', `/api/jobs/${id}`),
   cancel: (id: string) => req('DELETE', `/api/jobs/${id}`),

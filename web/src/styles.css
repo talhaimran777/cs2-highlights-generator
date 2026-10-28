@@ -177,3 +177,32 @@ select.input { width: auto; max-width: 100%; flex: 1; }
 .tag { font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; white-space: nowrap; }
 .trim { display: flex; gap: 2px; }
 input[type='checkbox'] { accent-color: var(--accent); width: 16px; height: 16px; }
+
+/* editor: the reel plays from the recording, two videos take turns across cuts */
+.editor { gap: 10px; }
+.editor-stage { position: relative; aspect-ratio: 16 / 9; margin: 0 auto; width: min(100%, calc(52vh * 16 / 9)); background: #000; border-radius: 10px; overflow: hidden; }
+.editor-stage video { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; }
+.editor-stage video.on { opacity: 1; }
+.editor-badge { position: absolute; left: 10px; bottom: 10px; font-size: 12px; padding: 2px 8px; border-radius: 6px; background: rgba(0, 0, 0, 0.6); pointer-events: none; }
+.editor-controls { gap: 6px; }
+.timeline { overflow-x: auto; overflow-y: hidden; border: 1px solid var(--line); border-radius: 10px; background: var(--bg); user-select: none; }
+.tl-inner { position: relative; cursor: text; }
+.tl-ruler { position: relative; height: 22px; border-bottom: 1px solid var(--line); }
+.tl-tick { position: absolute; top: 0; height: 100%; border-left: 1px solid var(--line); padding-left: 4px; font-size: 10px; color: var(--muted); white-space: nowrap; }
+.tl-track { position: relative; margin: 6px 0; }
+.tl-seg {
+  position: absolute; top: 0; bottom: 0; overflow: hidden; border-radius: 4px; cursor: pointer;
+  background: color-mix(in srgb, var(--c, var(--accent)) 22%, var(--panel)); border: 1px solid color-mix(in srgb, var(--c, var(--accent)) 55%, transparent);
+  box-shadow: inset -1px 0 0 var(--bg);
+}
+.tl-seg > span { position: relative; z-index: 1; display: block; padding: 2px 6px; font-size: 11px; font-weight: 600; white-space: nowrap; color: var(--c, var(--accent)); }
+.tl-seg.selected { border-color: var(--text); box-shadow: 0 0 0 1px var(--text) inset; background: color-mix(in srgb, var(--c, var(--accent)) 38%, var(--panel)); }
+.tl-wave { position: absolute; top: 0; pointer-events: none; }
+.tl-playhead { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: var(--accent); pointer-events: none; z-index: 3; }
+.tl-playhead::before { content: ''; position: absolute; top: 0; left: -5px; border: 6px solid transparent; border-top-color: var(--accent); }
+.shortcuts kbd { font-family: inherit; font-size: 11px; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 0 4px; color: var(--text); }.volume { display: flex; align-items: center; gap: 6px; margin-left: 8px; }
+.volume input[type='range'] { width: 110px; accent-color: var(--accent); }
+.volume .small { min-width: 34px; }
+.branding-avatar { align-items: end; }
+.branding-avatar img { width: 56px; height: 56px; border-radius: 50%; object-fit: cover; border: 2px solid var(--line); }
+.input.color, input.color { width: 56px; height: 38px; padding: 2px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); }

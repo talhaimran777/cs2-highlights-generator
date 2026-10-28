@@ -117,6 +117,16 @@ export interface Clip {
   speech?: { start: number; end: number };
 }
 
+/** Cuts made in the editor. Recording seconds, so they survive re-planning the clips. */
+export interface Edits {
+  /** removed ranges */
+  cuts: [number, number][];
+  /** extra edit points (S / Ctrl+K) */
+  splits: number[];
+}
+
+export const NO_EDITS: Edits = { cuts: [], splits: [] };
+
 /** A transcribed word, in recording seconds; `text` is what's shown (English or Roman Urdu). */
 export interface CaptionWord {
   start: number;
@@ -149,6 +159,21 @@ export interface CaptionSettings {
   uppercase: boolean;
 }
 
+/** Channel intro and subscribe outro added around every reel. */
+export interface Branding {
+  intro: boolean;
+  outro: boolean;
+  /** channel name, shown big in the intro */
+  name: string;
+  topLine: string;
+  bottomLine: string;
+  /** shown under the profile picture in the outro; default "@name" */
+  handle: string;
+  /** profile picture for the outro (png / jpg / webp) */
+  avatarPath: string;
+  accent: string;
+}
+
 export interface Settings {
   steamId: string;
   preRoll: number;
@@ -163,6 +188,7 @@ export interface Settings {
   /** audio tracks that carry voice (mic / Discord); null = all tracks */
   voiceTracks: number[] | null;
   captions: CaptionSettings;
+  branding: Branding;
   /** kill-feed region as fractions of frame size */
   killfeed: { x: number; y: number; w: number; h: number };
 }
@@ -178,5 +204,15 @@ export const DEFAULT_SETTINGS: Settings = {
   speechMaxWait: 8,
   voiceTracks: null,
   captions: { enabled: true, style: 'pop', font: 'Montserrat Black', sizePct: 7, positionPct: 70, uppercase: true },
+  branding: {
+    intro: true,
+    outro: true,
+    name: '',
+    topLine: 'Recorded live at',
+    bottomLine: 'Daily streams',
+    handle: '',
+    avatarPath: '',
+    accent: '#9146ff', // Twitch purple
+  },
   killfeed: { x: 0.7, y: 0.04, w: 0.3, h: 0.3 },
 };

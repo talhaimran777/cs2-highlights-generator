@@ -18,11 +18,12 @@ function fmtSize(b?: number) {
 
 /** Browses the local disk through the server, since browsers hide real file paths. */
 export function FilePicker(props: {
-  kind: 'video' | 'demo';
+  kind: 'video' | 'demo' | 'image';
   value: string;
   onChange: (path: string) => void;
 }) {
-  const exts = props.kind === 'video' ? ['.mp4', '.mkv', '.mov', '.flv', '.ts'] : ['.dem', '.zst', '.gz'];
+  const exts =
+    props.kind === 'video' ? ['.mp4', '.mkv', '.mov', '.flv', '.ts'] : props.kind === 'image' ? ['.png', '.jpg', '.jpeg', '.webp'] : ['.dem', '.zst', '.gz'];
   const [open, setOpen] = useState(false);
   const [dir, setDir] = useState(() => readLastDir(props.kind));
   const [listing, setListing] = useState<{ path: string; parent: string | null; entries: FsEntry[] } | null>(null);
@@ -58,7 +59,13 @@ export function FilePicker(props: {
       <div className="picker-row">
         <input
           className="input mono"
-          placeholder={props.kind === 'video' ? 'D:\\Recordings\\faceit-mirage.mkv' : 'C:\\Users\\you\\Downloads\\match.dem.zst'}
+          placeholder={
+            props.kind === 'video'
+              ? 'D:\\Recordings\\faceit-mirage.mkv'
+              : props.kind === 'image'
+                ? 'C:\\Users\\you\\Pictures\\avatar.png'
+                : 'C:\\Users\\you\\Downloads\\match.dem.zst'
+          }
           value={props.value}
           onChange={(e) => props.onChange(e.target.value)}
         />
@@ -80,7 +87,7 @@ export function FilePicker(props: {
           <ul className="browser-list">
             {files.map((e) => (
               <li key={e.path} onClick={() => pick(e)} className={e.dir ? 'dir' : 'file'}>
-                <span>{e.dir ? '📁' : props.kind === 'video' ? '🎬' : '📄'}</span>
+                <span>{e.dir ? '📁' : props.kind === 'video' ? '🎬' : props.kind === 'image' ? '🖼' : '📄'}</span>
                 <span className="name">{e.name}</span>
                 <span className="muted">{fmtSize(e.size)}</span>
               </li>

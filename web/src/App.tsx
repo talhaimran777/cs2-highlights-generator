@@ -1,15 +1,24 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, fmtTime, videoTime, waitJob, type CaptionSettings, type Job, type Moment, type ProjectView } from './api.ts';
 import { FilePicker } from './FilePicker.tsx';
+import { Editor } from './Editor.tsx';
+import { BrandingSection } from './Branding.tsx';
 
-type Step = 'player' | 'sync' | 'highlights' | 'captions' | 'export';
+type Step = 'player' | 'sync' | 'highlights' | 'edit' | 'captions' | 'export';
 const STEPS: { id: Step; label: string }[] = [
   { id: 'player', label: '1 · Player' },
   { id: 'sync', label: '2 · Sync' },
   { id: 'highlights', label: '3 · Highlights' },
-  { id: 'captions', label: '4 · Captions' },
-  { id: 'export', label: '5 · Export' },
+  { id: 'edit', label: '4 · Edit' },
+  { id: 'captions', label: '5 · Captions' },
+  { id: 'export', label: '6 · Export' },
 ];
+// a recording without a demo: just its own steps
+const TEST_STEPS: Record<'captions' | 'edit', { id: Step; label: string }[]> = {
+  captions: [{ id: 'captions', label: '1 · Captions' }, { id: 'export', label: '2 · Export' }],
+  edit: [{ id: 'edit', label: '1 · Edit' }, { id: 'export', label: '2 · Export' }],
+};
+const recordingOnly = (p: Pick<ProjectView, 'mode'>) => p.mode === 'captions' || p.mode === 'edit';
 
 const KIND_LABEL: Record<Moment['kind'], string> = {
   intro: 'Opening', clutch: 'Clutch', kills: 'Kills', bomb: 'Bomb', assist: 'Assist', team: 'Teammates', decider: 'Round end', funny: 'Funny', death: 'Death',
@@ -53,7 +62,9 @@ function Health() {
 function Home() {
   const [video, setVideo] = useState('');
   const [demo, setDemo] = useState('');
-  const [captionsOnly, setCaptionsOnly] = useState(false);
+  const [mode, setMode] = useState<'match' | 'captions' | 'edit'>('match');
+  const captionsOnly = mode === 'captions';
+  const recordingTest = mode !== 'match';
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [recent, setRecent] = useState<{ id: string; name: string; createdAt: string }[]>([]);
@@ -63,7 +74,12 @@ function Home() {
     setBusy(true);
     setError('');
     try {
-      const p = captionsOnly ? await api.createCaptionTest(video.trim()) : await api.create(video.trim(), demo.trim());
+      const p =
+        mode === 'captions'
+          ? await api.createCaptionTest(video.trim())
+          : mode === 'edit'
+            ? await api.createEditTest(video.trim())
+            : await api.create(video.trim(), demo.trim());
       location.hash = p.id;
     } catch (e: any) {
       setError(e.message);
@@ -76,34 +92,47 @@ function Home() {
     <main className="home">
       <section className="card">
         <div className="row spread">
-          <h1>{captionsOnly ? 'Captions test' : 'New match'}</h1>
+          <h1>{captionsOnly ? 'Captions test' : mode === 'edit' ? 'Editing test' : 'New match'}</h1>
           <div className="steps">
-            <button className={`step ${!captionsOnly ? 'active' : ''}`} onClick={() => setCaptionsOnly(false)}>
+            <button className={`step ${mode === 'match' ? 'active' : ''}`} onClick={() => setMode('match')}>
               Match + demo
             </button>
-            <button className={`step ${captionsOnly ? 'active' : ''}`} onClick={() => setCaptionsOnly(true)}>
+            <button className={`step ${captionsOnly ? 'active' : ''}`} onClick={() => setMode('captions')}>
               Captions test
+            </button>
+            <button className={`step ${mode === 'edit' ? 'active' : ''}`} onClick={() => setMode('edit')}>
+              Editing test
             </button>
           </div>
         </div>
         <p className="muted">
           {captionsOnly
             ? 'Pick any recording, no demo needed. The whole clip gets captioned so you can check how accurate the captions are. Files are read where they are and nothing is uploaded.'
-            : 'Pick your full OBS recording and the FACEIT demo of the same match. Files are read where they are and nothing is uploaded.'}
+            : mode === 'edit'
+              ? 'Pick any recording, no demo needed. The whole clip opens in the editor so you can try cutting it. Files are read where they are and nothing is uploaded.'
+              : 'Pick your full OBS recording and the FACEIT demo of the same match. Files are read where they are and nothing is uploaded.'}
         </p>
         <label className="field">
-          <span>{captionsOnly ? 'Recording' : 'Match recording'}</span>
+          <span>{recordingTest ? 'Recording' : 'Match recording'}</span>
           <FilePicker kind="video" value={video} onChange={setVideo} />
         </label>
-        {!captionsOnly && (
+        {!recordingTest && (
           <label className="field">
             <span>FACEIT demo (.dem or .dem.zst)</span>
             <FilePicker kind="demo" value={demo} onChange={setDemo} />
           </label>
         )}
         {error && <div className="error">{error}</div>}
-        <button className="btn btn-primary" disabled={!video || (!captionsOnly && !demo) || busy} onClick={create}>
-          {captionsOnly ? (busy ? 'Reading recording…' : 'Start captions test') : busy ? 'Parsing demo…' : 'Analyze match'}
+        <button className="btn btn-primary" disabled={!video || (!recordingTest && !demo) || busy} onClick={create}>
+          {recordingTest
+            ? busy
+              ? 'Reading recording…'
+              : captionsOnly
+                ? 'Start captions test'
+                : 'Start editing test'
+            : busy
+              ? 'Parsing demo…'
+              : 'Analyze match'}
         </button>
       </section>
       {recent.length > 0 && (
@@ -155,7 +184,7 @@ function ProjectScreen({ id }: { id: string }) {
       .get(id)
       .then((proj) => {
         setP(proj);
-        setStep(proj.mode === 'captions' ? 'captions' : !proj.hasPlayer ? 'player' : !proj.sync ? 'sync' : 'highlights');
+        setStep(proj.mode === 'captions' ? 'captions' : proj.mode === 'edit' ? 'edit' : !proj.hasPlayer ? 'player' : !proj.sync ? 'sync' : 'highlights');
       })
       .catch((e) => setError(e.message));
   }, [id]);
@@ -183,12 +212,9 @@ function ProjectScreen({ id }: { id: string }) {
 
   if (!p) return <main className="home">{error ? <div className="error">{error}</div> : <div className="muted">Loading…</div>}</main>;
 
-  const captionsTest = p.mode === 'captions';
-  // a captions test has no demo: just the captions and export steps
-  const steps = captionsTest
-    ? [{ id: 'captions' as Step, label: '1 · Captions' }, { id: 'export' as Step, label: '2 · Export' }]
-    : STEPS;
-  const enabled = (s: Step) => captionsTest || s === 'player' || (p.hasPlayer && (s === 'sync' || !!p.sync));
+  const testMode = p.mode === 'captions' || p.mode === 'edit' ? p.mode : null;
+  const steps = testMode ? TEST_STEPS[testMode] : STEPS;
+  const enabled = (s: Step) => !!testMode || s === 'player' || (p.hasPlayer && (s === 'sync' || !!p.sync));
 
   return (
     <main className="project">
@@ -196,7 +222,7 @@ function ProjectScreen({ id }: { id: string }) {
         <div>
           <h1>{p.name}</h1>
           <div className="muted">
-            {captionsTest ? 'No demo' : `${p.match.rounds.length} rounds`} · recording {fmtTime(p.video.duration)} · {p.video.width}×{p.video.height}
+            {testMode ? 'No demo' : `${p.match.rounds.length} rounds`} · recording {fmtTime(p.video.duration)} · {p.video.width}×{p.video.height}
             {p.video.audio.length > 1 && ` · ${p.video.audio.length} audio tracks`}
           </div>
         </div>
@@ -210,13 +236,21 @@ function ProjectScreen({ id }: { id: string }) {
       </div>
       {error && <div className="error">{error}</div>}
 
+      {step === 'edit' ? (
+        <Editor
+          p={p}
+          update={update}
+          nextLabel={testMode === 'edit' ? 'Export' : 'Captions'}
+          onNext={() => setStep(testMode === 'edit' ? 'export' : 'captions')}
+        />
+      ) : (
       <div className="split">
         <div className="pane">
           {step === 'player' && (
             <PlayerStep p={p} onPick={(steamId) => update(() => api.patch(p.id, { steamId })).then(() => setStep('sync'))} />
           )}
           {step === 'sync' && <SyncStep p={p} setP={setP} update={update} preview={preview} onNext={() => setStep('highlights')} />}
-          {step === 'highlights' && <HighlightsStep p={p} update={update} preview={preview} onNext={() => setStep('captions')} />}
+          {step === 'highlights' && <HighlightsStep p={p} update={update} preview={preview} onNext={() => setStep('edit')} />}
           {step === 'captions' && <CaptionsStep p={p} update={update} preview={preview} onNext={() => setStep('export')} />}
           {step === 'export' && <ExportStep p={p} setP={setP} update={update} />}
         </div>
@@ -233,6 +267,7 @@ function ProjectScreen({ id }: { id: string }) {
           </div>
         </aside>
       </div>
+      )}
     </main>
   );
 }
@@ -403,7 +438,7 @@ function HighlightsStep({ p, update, preview, onNext }: { p: ProjectView; update
             <span className="muted"> of {fmtTime(p.video.duration)} recorded</span>
           </div>
           <button className="btn btn-primary" onClick={onNext}>
-            Export →
+            Edit →
           </button>
         </div>
         <div className="row wrap">
@@ -520,8 +555,8 @@ function ExportStep({ p, setP, update }: { p: ProjectView; setP: (p: ProjectView
   return (
     <>
       <section className="card">
-        <h2>{p.mode === 'captions' ? 'Export captioned recording' : 'Export highlight reel'}</h2>
-        {p.mode !== 'captions' && (
+        <h2>{p.mode === 'captions' ? 'Export captioned recording' : p.mode === 'edit' ? 'Export edited recording' : 'Export highlight reel'}</h2>
+        {!recordingOnly(p) && (
         <div className="grid2">
           <label className="field">
             <span>Seconds before each moment</span>
@@ -549,7 +584,8 @@ function ExportStep({ p, setP, update }: { p: ProjectView; setP: (p: ProjectView
         </div>
         )}
         {/* a captions test has no cuts to protect; its voice tracks are chosen on the Captions page */}
-        {p.mode !== 'captions' && <SpeechProtection p={p} setting={setting} update={update} />}
+        {!recordingOnly(p) && <SpeechProtection p={p} setting={setting} update={update} />}
+        {p.mode !== 'captions' && <BrandingSection p={p} setting={setting} />}
         <QualityMatch p={p} />
         <label className="field">
           <span>Save to</span>
@@ -561,6 +597,8 @@ function ExportStep({ p, setP, update }: { p: ProjectView; setP: (p: ProjectView
               ? 'Rendering…'
               : p.mode === 'captions'
                 ? `Render with captions (${fmtTime(p.reelDuration)})`
+                : p.mode === 'edit'
+                  ? `Render edit (${fmtTime(p.reelDuration)})`
                 : `Render ${p.clips.length} clips (${fmtTime(p.reelDuration)})`}
           </button>
           {job?.status === 'running' && (

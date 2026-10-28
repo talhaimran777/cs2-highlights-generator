@@ -4,20 +4,24 @@ import { createReadStream, existsSync, readdirSync, statSync } from 'node:fs';
 import { extname, join, resolve } from 'node:path';
 import { cancelJob, getJob, latestJob, startJob } from './jobs.ts';
 import {
-  analyzeSpeech, autoSync, clipsFor, createCaptionTest, createProject, defaultOutputPath, editCaption, getProject, hasPlayer, listProjects, loadSettings,
-  reelCaptions, renderProject, saveProject, saveSettings, setPlayer, syncAnchors, transcribeProject, type Project,
+  analyzeSpeech, autoSync, baseClipsFor, clipsFor, createProject, createRecordingTest, defaultOutputPath, editCaption, editsOf, getProject, hasPlayer, listProjects,
+  BUMPER_CACHE, loadSettings, peaksFile, reelCaptions, renderProject, saveProject, saveSettings, setPlayer, syncAnchors, transcribeProject, type Project,
 } from './project.ts';
 import { captionsReady } from './captions/transcribe.ts';
 import { availableFonts, fontFile } from './captions/fonts.ts';
 import { manualSync } from './sync/align.ts';
 import { totalDuration } from './edit/plan.ts';
+import { normalizeCuts } from './edit/edits.ts';
+import { computePeaks, PEAKS_PER_SEC, readPeaks } from './audio/peaks.ts';
 import { exportSettings } from './edit/render.ts';
 import { checkFfmpeg, hasNvenc } from './util/ffmpeg.ts';
-import type { Settings } from './types.ts';
+import { bumperFile, PREVIEW_TARGET } from './branding/bumper.ts';
+import type { Edits, Settings } from './types.ts';
 
 const PORT = Number(process.env.PORT ?? 5174);
 const VIDEO_EXT = ['.mp4', '.mkv', '.mov', '.flv', '.ts'];
 const DEMO_EXT = ['.dem', '.zst', '.gz'];
+const IMAGE_EXT = ['.png', '.jpg', '.jpeg', '.webp'];
 
 const app = Fastify({ logger: { level: 'warn' } });
 
@@ -39,12 +43,15 @@ function view(p: Project) {
   return {
     ...p,
     clips,
+    baseClips: baseClipsFor(p),
+    edits: editsOf(p),
     reelDuration: totalDuration(clips),
     defaultOutputPath: defaultOutputPath(p),
     hasPlayer: hasPlayer(p),
     exportSettings: exportSettings(p.video),
     speechJob: latestJob(p.id, 'speech'),
     transcriptJob: latestJob(p.id, 'transcribe'),
+    peaksJob: latestJob(p.id, 'peaks'),
     reelCaptions: reelCaptions(p, clips),
     anchors: hasPlayer(p) ? syncAnchors(p) : [],
   };
@@ -89,7 +96,7 @@ app.get<{ Querystring: { path?: string } }>('/api/fs', async (req) => {
       const full = join(abs, e.name);
       if (e.isDirectory()) return [{ name: e.name, path: full, dir: true }];
       const ext = extname(e.name).toLowerCase();
-      if (!VIDEO_EXT.includes(ext) && !DEMO_EXT.includes(ext)) return [];
+      if (!VIDEO_EXT.includes(ext) && !DEMO_EXT.includes(ext) && !IMAGE_EXT.includes(ext)) return [];
       try {
         const st = statSync(full);
         return [{ name: e.name, path: full, dir: false, size: st.size, mtime: st.mtimeMs }];
@@ -119,15 +126,42 @@ function startSpeechJob(id: string) {
 app.post<{ Body: { videoPath: string; demoPath: string } }>('/api/projects', async (req) => {
   const p = createProject(req.body.videoPath, req.body.demoPath);
   startSpeechJob(p.id);
+  startPeaksJob(p.id);
   return view(p);
 });
 
 app.post<{ Params: { id: string } }>('/api/projects/:id/speech', async (req) => startSpeechJob(load(req.params.id).id));
 
+/** Waveform for the editor's timeline; computed once per recording. */
+function startPeaksJob(id: string) {
+  return startJob('peaks', id, async (progress, signal) => {
+    const p = load(id);
+    return computePeaks(p.videoPath, p.video, peaksFile(p), progress, signal);
+  });
+}
+
+app.post<{ Params: { id: string } }>('/api/projects/:id/peaks', async (req) => startPeaksJob(load(req.params.id).id));
+
+/** Raw peaks, one byte per 1/PEAKS_PER_SEC s of the recording. */
+app.get<{ Params: { id: string } }>('/api/projects/:id/peaks', (req, reply) => {
+  const data = readPeaks(peaksFile(load(req.params.id)));
+  if (!data) return reply.code(404).send({ error: 'Waveform not ready' });
+  reply.type('application/octet-stream').header('X-Peaks-Per-Sec', String(PEAKS_PER_SEC));
+  return reply.send(data);
+});
+
 /** Captions test: just a recording, no demo; the whole video gets captioned. */
 app.post<{ Body: { videoPath: string } }>('/api/projects/captions-test', async (req) => {
-  const p = createCaptionTest(req.body.videoPath);
+  const p = createRecordingTest(req.body.videoPath, 'captions');
   startSpeechJob(p.id);
+  return view(p);
+});
+
+/** Editing test: just a recording, no demo; the whole video goes into the editor. */
+app.post<{ Body: { videoPath: string } }>('/api/projects/edit-test', async (req) => {
+  const p = createRecordingTest(req.body.videoPath, 'edit');
+  startSpeechJob(p.id);
+  startPeaksJob(p.id);
   return view(p);
 });
 
@@ -141,11 +175,12 @@ app.patch<{
     moments?: Record<string, { enabled?: boolean; trimStart?: number; trimEnd?: number }>;
     /** caption line id -> new text */
     captions?: Record<string, string>;
+    edits?: Edits;
     outputPath?: string;
   };
 }>('/api/projects/:id', async (req) => {
   const p = load(req.params.id);
-  const { steamId, settings, moments, outputPath, captions } = req.body;
+  const { steamId, settings, moments, outputPath, captions, edits } = req.body;
   for (const [id, text] of Object.entries(captions ?? {})) editCaption(p, id, text);
   if (steamId && steamId !== p.settings.steamId) setPlayer(p, steamId);
   let redetectSpeech = false;
@@ -164,6 +199,13 @@ app.patch<{
   for (const [id, patch] of Object.entries(moments ?? {})) {
     const m = p.moments.find((x) => x.id === id);
     if (m) Object.assign(m, patch);
+  }
+  if (edits) {
+    const inside = (t: number) => Math.min(p.video.duration, Math.max(0, Number(t) || 0));
+    p.edits = {
+      cuts: normalizeCuts((edits.cuts ?? []).map(([a, b]) => [inside(a), inside(b)])),
+      splits: [...new Set((edits.splits ?? []).map(inside))].sort((a, b) => a - b),
+    };
   }
   if (outputPath !== undefined) p.outputPath = outputPath || null;
   saveProject(p);
@@ -249,6 +291,23 @@ function streamFile(path: string, range: string | undefined, reply: any) {
     .type(type);
   return reply.send(createReadStream(path, { start, end }));
 }
+
+/** The channel intro / outro with this project's branding, small and quick, for previewing. */
+app.get<{ Params: { id: string; kind: string } }>('/api/projects/:id/bumper/:kind', async (req, reply) => {
+  const kind = req.params.kind;
+  if (kind !== 'intro' && kind !== 'outro') return reply.code(404).send({ error: 'Unknown bumper' });
+  const file = await bumperFile(kind, load(req.params.id).settings.branding, PREVIEW_TARGET, BUMPER_CACHE);
+  return streamFile(file, req.headers.range, reply);
+});
+
+/** A local image (the profile picture), for showing it in the UI. */
+app.get<{ Querystring: { path?: string } }>('/api/image', (req, reply) => {
+  const path = req.query.path ?? '';
+  const ext = extname(path).toLowerCase();
+  if (!IMAGE_EXT.includes(ext) || !existsSync(path)) return reply.code(404).send({ error: 'Image not found' });
+  reply.type(ext === '.png' ? 'image/png' : ext === '.webp' ? 'image/webp' : 'image/jpeg');
+  return reply.send(createReadStream(path));
+});
 
 app.get<{ Params: { id: string } }>('/api/projects/:id/media', (req, reply) =>
   streamFile(load(req.params.id).videoPath, req.headers.range, reply),

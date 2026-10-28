@@ -1,4 +1,4 @@
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { filterPath, hasEncoder, runFfmpeg, type VideoInfo } from '../util/ffmpeg.ts';
 import type { Clip } from '../types.ts';
@@ -17,6 +17,16 @@ export interface RenderInput {
   workDir: string;
   /** ASS subtitles to burn into a clip (times relative to the clip), or null */
   captions?: (clip: Clip) => string | null;
+  /** channel intro / outro, rendered with the same settings as the clips */
+  intro?: Bookend;
+  outro?: Bookend;
+}
+
+/** A ready-made segment added before or after the reel. */
+export interface Bookend {
+  dur: number;
+  /** the segment's file (rendered and cached on first use) */
+  file: (signal?: AbortSignal) => Promise<string>;
 }
 
 /** Per source codec: GPU encoder first, then the CPU one. */
@@ -136,7 +146,13 @@ export async function renderReel(
 
   const common = encodeArgs(info);
 
-  const plan: { kind: 'card' | 'clip'; dur: number; run: (out: string, prog: (s: number) => void) => Promise<void> }[] = [];
+  const plan: { kind: 'bookend' | 'card' | 'clip'; dur: number; run: (out: string, prog: (s: number) => void) => Promise<void> }[] = [];
+  const bookend = (b: Bookend) => ({
+    kind: 'bookend' as const,
+    dur: b.dur,
+    run: async (out: string) => copyFileSync(await b.file(signal), out),
+  });
+  if (input.intro) plan.push(bookend(input.intro));
   const seenRounds = new Set<number>();
   for (const clip of clips) {
     const card = input.cards.get(clip.round);
@@ -172,6 +188,8 @@ export async function renderReel(
       },
     });
   }
+
+  if (input.outro) plan.push(bookend(input.outro));
 
   const total = plan.reduce((s, p) => s + p.dur, 0);
   let done = 0;

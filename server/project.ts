@@ -6,10 +6,12 @@ import { buildMoments } from './demo/moments.ts';
 import { detectKillfeed } from './sync/killfeed.ts';
 import { fitSync, type Anchor } from './sync/align.ts';
 import { planClips, roundCardText } from './edit/plan.ts';
-import { renderReel } from './edit/render.ts';
+import { applyEdits } from './edit/edits.ts';
+import { encodeArgs, renderReel, type Bookend } from './edit/render.ts';
+import { bumperFile, bumperSeconds, reelTarget, type BumperKind } from './branding/bumper.ts';
 import { probe, type VideoInfo } from './util/ffmpeg.ts';
 import { detectSpeech, type Speech } from './audio/speech.ts';
-import { DEFAULT_SETTINGS, type CaptionLine, type Clip, type MatchData, type Moment, type RoundIntro, type Settings, type SyncModel } from './types.ts';
+import { DEFAULT_SETTINGS, NO_EDITS, type CaptionLine, type Edits, type Clip, type MatchData, type Moment, type RoundIntro, type Settings, type SyncModel } from './types.ts';
 import { transcribe } from './captions/transcribe.ts';
 import { buildAss } from './captions/ass.ts';
 import { resolveFont } from './captions/fonts.ts';
@@ -20,12 +22,15 @@ const PROJECT_VERSION = 10;
 export const DATA_DIR = resolve(process.env.CS2H_DATA ?? 'data');
 const PROJECTS_DIR = join(DATA_DIR, 'projects');
 const SETTINGS_FILE = join(DATA_DIR, 'settings.json');
+/** profile picture and cached intro / outro renders */
+export const BRANDING_DIR = join(DATA_DIR, 'branding');
+export const BUMPER_CACHE = join(BRANDING_DIR, 'cache');
 
 export interface Project {
   id: string;
   version?: number;
-  /** 'captions': a recording without a demo, captioned whole (to try captions out) */
-  mode?: 'match' | 'captions';
+  /** 'captions' / 'edit': a recording without a demo, used whole (to try captions or the editor out) */
+  mode?: 'match' | 'captions' | 'edit';
   name: string;
   createdAt: string;
   videoPath: string;
@@ -41,6 +46,8 @@ export interface Project {
   speech?: Speech | null;
   /** captions for the speech inside the reel (English / Roman Urdu), editable */
   transcript?: CaptionLine[] | null;
+  /** cuts made in the editor */
+  edits?: Edits;
   outputPath: string | null;
 }
 
@@ -63,8 +70,9 @@ export function getProject(id: string): Project | null {
   const f = join(PROJECTS_DIR, `${basename(id)}.json`);
   if (!existsSync(f)) return null;
   const p: Project = JSON.parse(readFileSync(f, 'utf8'));
-  // settings added after this project was saved get their defaults
-  p.settings = { ...DEFAULT_SETTINGS, ...p.settings };
+  // settings added after this project was saved get their defaults;
+  // the intro / outro belong to the channel, so every project uses the current ones
+  p.settings = { ...DEFAULT_SETTINGS, ...p.settings, branding: loadSettings().branding };
   if (p.version !== PROJECT_VERSION) {
     upgradeProject(p);
     saveProject(p);
@@ -114,15 +122,18 @@ export function listProjects(): Pick<Project, 'id' | 'name' | 'createdAt'>[] {
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 
-/** A recording on its own (no demo): the whole video is the reel, so captions can be tried on any clip. */
-export function createCaptionTest(videoPath: string): Project {
+/** A captions or editing test: a recording without a demo, used whole. */
+export const recordingOnly = (p: Pick<Project, 'mode'>) => p.mode === 'captions' || p.mode === 'edit';
+
+/** A recording on its own (no demo): the whole video is the reel, so captions or the editor can be tried on any clip. */
+export function createRecordingTest(videoPath: string, mode: 'captions' | 'edit'): Project {
   if (!existsSync(videoPath)) throw new Error(`File not found: ${videoPath}`);
   const settings = loadSettings();
   const p: Project = {
     id: randomUUID().slice(0, 8),
     version: PROJECT_VERSION,
-    mode: 'captions',
-    name: `Captions test · ${basename(videoPath, extname(videoPath))}`,
+    mode,
+    name: `${mode === 'edit' ? 'Editing' : 'Captions'} test · ${basename(videoPath, extname(videoPath))}`,
     createdAt: new Date().toISOString(),
     videoPath,
     demoPath: '',
@@ -198,15 +209,25 @@ export async function autoSync(p: Project, onProgress?: (f: number) => void, sig
   return p.sync;
 }
 
-export function clipsFor(p: Project): Clip[] {
-  if (p.mode === 'captions') {
+/** The clips before the editor's cuts. */
+export function baseClipsFor(p: Project): Clip[] {
+  if (recordingOnly(p)) {
     return [{ round: 0, start: 0, end: p.video.duration, momentIds: [], label: 'Full recording' }];
   }
   if (!p.sync) return [];
   return planClips(p.moments, p.sync, p.settings, p.video.duration, p.speech);
 }
 
-export const voiceTracks = (p: Project) => p.settings.voiceTracks ?? p.video.audio.map((_, i) => i);
+/** What gets rendered: the planned clips minus the editor's cuts. */
+export const clipsFor = (p: Project): Clip[] => applyEdits(baseClipsFor(p), p.edits);
+
+export const editsOf = (p: Project): Edits => p.edits ?? NO_EDITS;
+
+/** Cached waveform of the whole recording, for the editor's timeline. */
+// not under work/<id>: rendering clears that folder
+export const peaksFile = (p: Project) => join(DATA_DIR, 'peaks', `${p.id}.u8`);
+
+export const voiceTracks =(p: Project) => p.settings.voiceTracks ?? p.video.audio.map((_, i) => i);
 
 export async function analyzeSpeech(p: Project, onProgress?: (f: number) => void, signal?: AbortSignal): Promise<Speech> {
   p.speech = await detectSpeech(p.videoPath, p.video, voiceTracks(p), onProgress, signal);
@@ -226,7 +247,7 @@ export function reelCaptions(p: Project, clips = clipsFor(p)): CaptionLine[] {
  */
 export async function transcribeProject(p: Project, onProgress?: (f: number) => void, signal?: AbortSignal) {
   if (!p.speech) throw new Error('Speech detection has to finish first');
-  if (!p.sync && p.mode !== 'captions') throw new Error('Sync the recording first');
+  if (!p.sync && !recordingOnly(p)) throw new Error('Sync the recording first');
   const clips = clipsFor(p);
   const known = new Map((p.transcript ?? []).map((l) => [l.id, l]));
   const wanted = p.speech.utterances.filter((u) => overlaps(u, clips));
@@ -264,21 +285,30 @@ export function clipCaptions(p: Project) {
 }
 
 export function defaultOutputPath(p: Project) {
-  const suffix = p.mode === 'captions' ? '_captions' : '_highlights';
+  const suffix = p.mode === 'captions' ? '_captions' : p.mode === 'edit' ? '_edited' : '_highlights';
   return join(dirname(p.videoPath), `${basename(p.videoPath, extname(p.videoPath))}${suffix}.mp4`);
 }
 
 export async function renderProject(p: Project, onProgress?: (f: number) => void, signal?: AbortSignal): Promise<string> {
-  if (!p.sync && p.mode !== 'captions') throw new Error('Sync the recording first');
+  if (!p.sync && !recordingOnly(p)) throw new Error('Sync the recording first');
   const clips = clipsFor(p);
   if (clips.length === 0) throw new Error('No clips enabled');
   const cards = new Map<number, { title: string; subtitle: string }>();
-  if (p.settings.titleCards && p.mode !== 'captions') {
+  if (p.settings.titleCards && !recordingOnly(p)) {
     for (const c of clips) cards.set(c.round, roundCardText(p.match, c.round, p.moments));
   }
   const outPath = p.outputPath ?? defaultOutputPath(p);
+  const b = p.settings.branding;
+  // a captions test is only for checking captions; everything else gets the channel's intro / outro
+  const branded = p.mode !== 'captions' && !!b.name.trim();
+  const target = reelTarget(p.video, encodeArgs(p.video));
+  const bookend = (kind: BumperKind): Bookend => ({ dur: bumperSeconds(kind), file: (signal) => bumperFile(kind, b, target, BUMPER_CACHE, signal) });
   await renderReel(
-    { videoPath: p.videoPath, info: p.video, clips, cards, outPath, workDir: join(DATA_DIR, 'work', p.id), captions: clipCaptions(p) },
+    {
+      videoPath: p.videoPath, info: p.video, clips, cards, outPath, workDir: join(DATA_DIR, 'work', p.id), captions: clipCaptions(p),
+      intro: branded && b.intro ? bookend('intro') : undefined,
+      outro: branded && b.outro ? bookend('outro') : undefined,
+    },
     onProgress,
     signal,
   );
