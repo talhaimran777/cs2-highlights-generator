@@ -92,6 +92,21 @@ function runWhisper(bin: string, files: string[], language: string, onFile: () =
   });
 }
 
+const SPAN_GAP_S = 5; // utterances closer than this are decoded in one go
+
+/** Recording ranges to decode: each utterance with its padding, close ones joined. */
+export function audioSpans(utterances: [number, number][]): [number, number][] {
+  const spans: [number, number][] = [];
+  for (const [a, b] of [...utterances].sort((x, y) => x[0] - y[0])) {
+    const from = Math.max(0, a - PAD_S);
+    const to = b + PAD_S;
+    const last = spans.at(-1);
+    if (last && from - last[1] <= SPAN_GAP_S) last[1] = Math.max(last[1], to);
+    else spans.push([from, to]);
+  }
+  return spans;
+}
+
 /**
  * Transcribes the given utterances (recording seconds) from the voice track(s).
  * English words stay English; Urdu is written in Roman Urdu.
@@ -110,25 +125,35 @@ export async function transcribe(
   rmSync(workDir, { recursive: true, force: true });
   mkdirSync(workDir, { recursive: true });
 
-  // 1. the voice audio once, as 16 kHz mono
-  const pcmPath = join(workDir, 'voice.s16');
+  // 1. the voice audio as 16 kHz mono, only around the utterances (not the whole recording):
+  //    nearby utterances share one seek-and-decode
   const audio = tracks.length <= 1
     ? ['-map', `0:a:${tracks[0] ?? 0}`]
     : ['-filter_complex', `${tracks.map((t) => `[0:a:${t}]`).join('')}amix=inputs=${tracks.length}:normalize=0[v]`, '-map', '[v]'];
-  await runFfmpeg(['-i', videoPath, '-vn', ...audio, '-ac', '1', '-ar', String(SAMPLE_RATE), '-f', 's16le', pcmPath], undefined, signal);
-  const pcm = readFileSync(pcmPath);
-  const all = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.length >> 1);
-  onProgress?.(0.1);
+  const spans = audioSpans(utterances);
+  const pcmPath = join(workDir, 'voice.s16');
+  const decoded: { from: number; samples: Int16Array }[] = [];
+  for (const [i, [from, to]] of spans.entries()) {
+    await runFfmpeg(
+      ['-ss', from.toFixed(3), '-i', videoPath, '-t', (to - from).toFixed(3), '-vn', ...audio, '-ac', '1', '-ar', String(SAMPLE_RATE), '-f', 's16le', pcmPath],
+      undefined,
+      signal,
+    );
+    const pcm = readFileSync(pcmPath);
+    decoded.push({ from, samples: new Int16Array(pcm.buffer, pcm.byteOffset, pcm.length >> 1) });
+    onProgress?.((0.1 * (i + 1)) / spans.length);
+  }
+  rmSync(pcmPath, { force: true });
 
   // 2. one WAV per utterance
   const items = utterances.map(([a, b], i) => {
     const from = Math.max(0, a - PAD_S);
     const to = b + PAD_S;
+    const span = decoded.find((d, j) => from >= d.from - 1e-6 && to <= spans[j][1] + 1e-6)!;
     const file = join(workDir, `u${String(i).padStart(4, '0')}.wav`);
-    writeFileSync(file, wavFile(all.subarray(Math.floor(from * SAMPLE_RATE), Math.ceil(to * SAMPLE_RATE))));
+    writeFileSync(file, wavFile(span.samples.subarray(Math.floor((from - span.from) * SAMPLE_RATE), Math.ceil((to - span.from) * SAMPLE_RATE))));
     return { from, start: a, end: b, file };
   });
-  rmSync(pcmPath);
 
   // 3. two passes over every utterance (see merge.ts for why language detection isn't used):
   //    Hindi script captures every word as spoken; English spells the English words properly.

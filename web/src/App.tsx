@@ -774,11 +774,16 @@ function CaptionsStep({ p, update, preview, onNext }: { p: ProjectView; update: 
       {lines.length > 0 && (
         <section className="card">
           <h2>Lines</h2>
-          <p className="muted small">Fix any word: click a line, type, and click outside it. Timing is kept.</p>
+          <p className="muted small">
+            Only speech inside your {fmtTime(p.reelDuration)} reel is captioned; times are where each line plays in it. Fix any word: click a line,
+            type, and click outside it. Timing is kept.
+          </p>
           <div className="caption-lines">
             {lines.map((l) => (
               <div key={l.id} className="caption-line">
-                <span className="muted small mono">{fmtTime(l.start)}</span>
+                <span className="muted small mono" title={`At ${fmtTime(l.start)} in the recording`}>
+                  {fmtTime(reelTime(p.clips, l.start))}
+                </span>
                 <span className={`tag ${l.lang === 'ur' ? 'speech' : ''}`} title={l.source}>
                   {l.lang === 'ur' ? 'UR' : 'EN'}
                 </span>
@@ -801,6 +806,16 @@ function CaptionsStep({ p, update, preview, onNext }: { p: ProjectView; update: 
       )}
     </>
   );
+}
+
+/** Where a recording time lands in the edited reel (its clips back to back, as in the editor). */
+function reelTime(clips: ProjectView['clips'], t: number) {
+  let reel = 0;
+  for (const c of clips) {
+    if (t < c.end) return reel + Math.max(0, t - c.start);
+    reel += c.end - c.start;
+  }
+  return reel;
 }
 
 /** Claude rewrites the transcribed lines into natural Roman Urdu / English, keeping the timing. */
