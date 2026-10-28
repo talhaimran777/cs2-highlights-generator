@@ -1,8 +1,5 @@
 import type { CaptionLine, CaptionSettings, CaptionWord } from '../types.ts';
 
-const MAX_WORDS = 4;
-const MAX_CHARS = 18;
-const PAUSE_S = 0.3; // a pause this long starts a new caption
 const HOLD_S = 0.15; // keep the last word up a moment after it's said
 
 // ASS colors are &HAABBGGRR
@@ -11,17 +8,29 @@ const YELLOW = '&H0000D4FF'; // #FFD400
 const BLACK = '&H00000000';
 const SHADOW = '&H80000000';
 
-/** Splits a line's words into on-screen captions of a few words, breaking at pauses and sentence ends. */
-export function chunkWords(words: CaptionWord[]): CaptionWord[][] {
+/**
+ * Most characters in one caption: about 9 per word asked for, but never more
+ * than fit across the frame at the caption size (bold caps are ~0.62 em wide).
+ */
+export function captionChars(settings: Pick<CaptionSettings, 'wordsPerCaption' | 'sizePct'>, video: { width: number; height: number }) {
+  const fit = Math.floor((0.9 * video.width) / (0.62 * ((video.height * settings.sizePct) / 100)));
+  return Math.max(8, Math.min(9 * settings.wordsPerCaption, fit));
+}
+
+/**
+ * Splits a line's words into on-screen captions of up to `maxWords`, breaking at sentence ends and at
+ * pauses longer than `pauseS` (shorter ones are breaths mid-sentence).
+ */
+export function chunkWords(words: CaptionWord[], maxWords = 2, maxChars = 18, pauseS = 0.7): CaptionWord[][] {
   const chunks: CaptionWord[][] = [];
   let cur: CaptionWord[] = [];
   for (const w of words) {
     const prev = cur.at(-1);
     const chars = cur.reduce((n, x) => n + x.text.length + 1, 0) + w.text.length;
     const breakHere =
-      cur.length >= MAX_WORDS ||
-      (cur.length > 0 && chars > MAX_CHARS) ||
-      (prev && w.start - prev.end > PAUSE_S) ||
+      cur.length >= maxWords ||
+      (cur.length > 0 && chars > maxChars) ||
+      (prev && w.start - prev.end > pauseS) ||
       (prev && /[.!?]$/.test(prev.text));
     if (breakHere && cur.length) {
       chunks.push(cur);
@@ -69,7 +78,7 @@ export function buildAss(
     )
     .filter((ws) => ws.length)
     .sort((a, b) => a[0].start - b[0].start)
-    .flatMap(chunkWords);
+    .flatMap((ws) => chunkWords(ws, settings.wordsPerCaption, captionChars(settings, video), settings.pauseS));
   if (chunks.length === 0) return null;
 
   const size = Math.round((video.height * settings.sizePct) / 100);

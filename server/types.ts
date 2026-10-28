@@ -163,6 +163,10 @@ export interface CaptionSettings {
   /** vertical center of the caption as % of frame height */
   positionPct: number;
   uppercase: boolean;
+  /** most words on screen at a time (1-4) */
+  wordsPerCaption: number;
+  /** a pause at least this long (seconds) starts a new caption */
+  pauseS: number;
   /** rewrite transcribed lines with Claude (needs ANTHROPIC_API_KEY) */
   cleanup: boolean;
 }
@@ -211,7 +215,7 @@ export const DEFAULT_SETTINGS: Settings = {
   protectSpeech: true,
   speechMaxWait: 8,
   voiceTracks: null,
-  captions: { enabled: true, style: 'pop', font: 'Montserrat Black', sizePct: 7, positionPct: 70, uppercase: true, cleanup: true },
+  captions: { enabled: true, style: 'pop', font: 'Montserrat Black', sizePct: 7, positionPct: 70, uppercase: true, wordsPerCaption: 2, pauseS: 0.7, cleanup: true },
   branding: {
     intro: true,
     outro: true,

@@ -666,7 +666,8 @@ function CaptionsStep({
   const setRemoved = (id: string, on: boolean) => update(() => api.patch(p.id, { removeCaptions: { [id]: on } }));
   const urdu = lines.filter((l) => l.lang === 'ur').length;
   const fonts = status?.fonts ?? [];
-  const sample = (lines.find((l) => l.words.length >= 3)?.words.slice(0, 3).map((w) => w.text) ?? ['bhai', 'peeche', 'dekho']).map((t) =>
+  const n = caps.wordsPerCaption;
+  const sample = (lines.find((l) => l.words.length >= n)?.words.slice(0, n).map((w) => w.text) ?? ['bhai', 'peeche', 'jaldi', 'dekho'].slice(0, n)).map((t) =>
     caps.uppercase ? t.toUpperCase() : t,
   );
 
@@ -730,9 +731,22 @@ function CaptionsStep({
           <button
             className="btn btn-primary"
             disabled={running || !status?.ok || !p.speech}
-            onClick={() => update(async () => (await api.transcribe(p.id), api.get(p.id)))}
+            onClick={() => {
+              const old = p.transcript ?? [];
+              const edited = old.filter((l) => l.edited).length;
+              if (
+                old.length &&
+                !confirm(
+                  `Transcribe again from scratch? The ${old.length} current lines are replaced` +
+                    (edited ? `, including ${edited} you edited by hand.` : '.'),
+                )
+              ) {
+                return;
+              }
+              update(async () => (await api.transcribe(p.id), api.get(p.id)));
+            }}
           >
-            {running ? 'Transcribing…' : lines.length ? 'Transcribe new speech' : 'Transcribe'}
+            {running ? 'Transcribing…' : (p.transcript ?? []).length ? 'Transcribe again' : 'Transcribe'}
           </button>
           {running && <Progress value={job!.progress} />}
           {!running && lines.length > 0 && (
@@ -782,6 +796,16 @@ function CaptionsStep({
               ))}
             </select>
           </label>
+          <label className="field">
+            <span>Words on screen</span>
+            <div className="steps words-per-caption">
+              {[1, 2, 3, 4].map((k) => (
+                <button key={k} className={`step ${caps.wordsPerCaption === k ? 'active' : ''}`} onClick={() => setCaps({ wordsPerCaption: k })}>
+                  {k}
+                </button>
+              ))}
+            </div>
+          </label>
           <label className="field check">
             <input type="checkbox" checked={caps.uppercase} onChange={(e) => setCaps({ uppercase: e.target.checked })} />
             <span>ALL CAPS</span>
@@ -793,6 +817,10 @@ function CaptionsStep({
           <label className="field">
             <span>Position · {caps.positionPct}% down</span>
             <input type="range" min={40} max={92} step={1} value={caps.positionPct} onChange={(e) => setCaps({ positionPct: Number(e.target.value) })} />
+          </label>
+          <label className="field" title="A pause in your speech at least this long starts a new caption. Shorter pauses are breaths, so the words stay together.">
+            <span>Break at pauses · {caps.pauseS.toFixed(1)} s</span>
+            <input type="range" min={0.2} max={2} step={0.1} value={caps.pauseS} onChange={(e) => setCaps({ pauseS: Number(e.target.value) })} />
           </label>
         </div>
       </section>

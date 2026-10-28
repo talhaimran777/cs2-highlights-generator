@@ -3,8 +3,10 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node
 import { join, resolve } from 'node:path';
 import { FFMPEG, runFfmpeg } from '../util/ffmpeg.ts';
 import { romanize } from './romanize.ts';
-import { mergeEnglish } from './merge.ts';
+import { mergeEnglish, soundKey, type TimedWord } from './merge.ts';
+import { retime, spreadWords } from './cleanup.ts';
 import { alignWords, envelope, lineRange } from './align.ts';
+import { CHUNK_GAP_S, chunkSlots, cutWords, planChunks } from './chunks.ts';
 import type { CaptionLine, CaptionWord } from '../types.ts';
 
 const TOOLS = resolve(process.env.CS2H_TOOLS ?? 'tools');
@@ -93,6 +95,19 @@ function runWhisper(bin: string, files: string[], language: string, onFile: () =
   });
 }
 
+const JOIN_S = 0.6; // utterances closer than this are one sentence the speech detector cut up
+
+/** Utterances in order, with ones that nearly touch joined into one. */
+export function joinNear(utterances: [number, number][]): [number, number][] {
+  const out: [number, number][] = [];
+  for (const [a, b] of [...utterances].sort((x, y) => x[0] - y[0])) {
+    const last = out.at(-1);
+    if (last && a - last[1] < JOIN_S) last[1] = Math.max(last[1], b);
+    else out.push([a, b]);
+  }
+  return out;
+}
+
 const SPAN_GAP_S = 5; // utterances closer than this are decoded in one go
 
 /** Recording ranges to decode: each utterance with its padding, close ones joined. */
@@ -174,28 +189,46 @@ export async function transcribe(
   rmSync(workDir, { recursive: true, force: true });
   mkdirSync(workDir, { recursive: true });
 
-  // 1. the voice audio, only around the utterances; 2. one WAV per utterance
-  const ranges = utterances.map(([a, b]): [number, number] => [Math.max(0, a - PAD_S), b + PAD_S]);
+  // 1. the voice audio, only around the utterances
+  const sorted = joinNear(utterances);
+  const ranges = sorted.map(([a, b]): [number, number] => [Math.max(0, a - PAD_S), b + PAD_S]);
   const voice = await decodeVoice(videoPath, ranges, tracks, workDir, (f) => onProgress?.(0.1 * f), signal);
-  const items = utterances.map(([a, b], i) => {
+  const items = sorted.map(([a, b], i) => {
     const [from, to] = ranges[i];
     const samples = voice(from, to);
-    const file = join(workDir, `u${String(i).padStart(4, '0')}.wav`);
-    writeFileSync(file, wavFile(samples));
-    return { from, start: a, end: b, file, env: envelope(samples, SAMPLE_RATE) };
+    return { from, start: a, end: b, samples, env: envelope(samples, SAMPLE_RATE) };
   });
 
-  // 3. two passes over every utterance (see merge.ts for why language detection isn't used):
-  //    Hindi script captures every word as spoken; English spells the English words properly.
-  const totalWork = items.length * 2;
+  // 2. utterances joined into chunks so Whisper hears them in context (see chunks.ts)
+  const chunks = planChunks(ranges).map((idx, c) => {
+    const slots = chunkSlots(idx.map((i) => ranges[i][1] - ranges[i][0]));
+    const gap = new Int16Array(Math.round(CHUNK_GAP_S * SAMPLE_RATE));
+    const parts = idx.flatMap((i, k) => (k ? [gap, items[i].samples] : [items[i].samples]));
+    const all = new Int16Array(parts.reduce((n, x) => n + x.length, 0));
+    parts.reduce((o, x) => (all.set(x, o), o + x.length), 0);
+    const file = join(workDir, `c${String(c).padStart(4, '0')}.wav`);
+    writeFileSync(file, wavFile(all));
+    return { idx, slots, file, env: envelope(all, SAMPLE_RATE) };
+  });
+
+  // 3. passes (see merge.ts for why language detection isn't used): the chunks
+  //    in Hindi script, which captures every word as spoken, and in English,
+  //    which spells the English words properly; then each utterance alone in
+  //    Hindi script, which tells where its words are (see cutWords)
+  const alone = items.map((x, i) => {
+    const file = join(workDir, `u${String(i).padStart(4, '0')}.wav`);
+    writeFileSync(file, wavFile(x.samples));
+    return file;
+  });
+  const totalWork = chunks.length * 2 + alone.length;
   let done = 0;
   const tick = () => onProgress?.(Math.min(0.99, 0.1 + (0.9 * ++done) / totalWork));
-  const run = async (lang: string) => {
+  const run = async (files: string[], lang: string) => {
     let lastErr: unknown;
     for (const bin of bins) {
       try {
-        await runWhisper(bin, items.map((x) => x.file), lang, tick, signal);
-        return items.map((x) => parseWhisperJson(JSON.parse(readFileSync(`${x.file}.json`, 'utf8'))).words);
+        await runWhisper(bin, files, lang, tick, signal);
+        return files.map((f) => parseWhisperJson(JSON.parse(readFileSync(`${f}.json`, 'utf8'))).words);
       } catch (e) {
         if (signal?.aborted) throw e;
         lastErr = e; // e.g. the CUDA build failing on this GPU: try the CPU build
@@ -203,22 +236,45 @@ export async function transcribe(
     }
     throw lastErr;
   };
-  const spoken = await run('hi');
-  const english = await run('en');
+  const files = chunks.map((c) => c.file);
+  const spoken = await run(files, 'hi');
+  const english = await run(files, 'en');
+  const heardAlone = (await run(alone, 'hi')).map((ws) => ws.map((w) => ({ ...w, text: romanize(w.text) })));
 
-  // 4. merge, back to recording time, hallucinations dropped
+  // 4. per chunk: English spellings merged in, then cut back into utterances
+  const found = items.map(() => ({ words: [] as TimedWord[], source: [] as string[], english: [] as boolean[] }));
+  chunks.forEach((c, ci) => {
+    const roman = spoken[ci].map((w) => ({ ...w, text: romanize(w.text) }));
+    const base = roman.length ? mergeEnglish(roman, english[ci]).words : english[ci];
+    const source = roman.length ? spoken[ci].map((w) => w.text) : base.map((w) => w.text);
+    const isEnglish = base.map((w, j) => !roman.length || w.text !== roman[j].text);
+    // snapped to the silences between utterances first, so the timing points the right way
+    const timed = alignWords(base, c.env, 0);
+    const cuts = cutWords(timed, c.slots, c.idx.map((i) => heardAlone[i].map((w) => w.text)), soundKey);
+    c.idx.forEach((i, k) => {
+      const [from, to] = [cuts[k], cuts[k + 1]];
+      found[i] = { words: base.slice(from, to), source: source.slice(from, to), english: isEnglish.slice(from, to) };
+    });
+  });
+
+  // 5. back to recording time, hallucinations dropped
   const lines: CaptionLine[] = [];
   items.forEach((x, i) => {
-    const source = spoken[i].map((w) => w.text).join(' ');
-    const roman = spoken[i].map((w) => ({ ...w, text: romanize(w.text) }));
-    const both = roman.length ? mergeEnglish(roman, english[i]) : { words: english[i], englishCount: english[i].length };
-    const merged = { ...both, words: collapseRepeats(both.words) };
-    const text = merged.words.map((w) => w.text).join(' ');
+    const heard = heardAlone[i];
+    // nothing for it in the chunk (a quick "one, one, one" can get skipped in context): use it heard alone
+    const f = found[i].words.length ? found[i] : { words: heard, source: heard.map((w) => w.text), english: heard.map(() => false) };
+    const keep = collapseRepeats(f.words.map((w, j) => ({ ...w, j })));
+    const tokens = keep.map((w) => w.text);
+    const text = tokens.join(' ');
     if (!text.trim() || HALLUCINATIONS.some((h) => h.test(text.trim()))) return;
-    const timed: CaptionWord[] = merged.words.map((w) => ({ start: x.from + w.start, end: x.from + w.end, text: w.text }));
+    // timing from the utterance heard alone: in a chunk Whisper's word times drift
+    const dur = x.samples.length / SAMPLE_RATE;
+    const rel = heard.length ? retime(heard, tokens, { start: 0, end: dur }) : spreadWords(tokens, Math.min(PAD_S, dur), Math.max(0, dur - PAD_S));
+    const timed: CaptionWord[] = rel.map((w) => ({ start: x.from + w.start, end: x.from + w.end, text: w.text }));
     const words = alignWords(timed, x.env, x.from);
-    const lang = merged.englishCount >= 0.8 * merged.words.length ? 'en' : 'ur';
-    lines.push({ id: `u${x.start.toFixed(2)}`, start: x.start, end: x.end, lang, source: source || text, words, aligned: true });
+    const englishCount = keep.filter((w) => f.english[w.j]).length;
+    const lang = englishCount >= 0.8 * keep.length ? 'en' : 'ur';
+    lines.push({ id: `u${x.start.toFixed(2)}`, start: x.start, end: x.end, lang, source: f.source.join(' ') || text, words, aligned: true });
   });
   rmSync(workDir, { recursive: true, force: true });
   onProgress?.(1);

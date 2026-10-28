@@ -122,6 +122,8 @@ select.input { width: auto; max-width: 100%; flex: 1; }
 .sync-status { padding: 10px 12px; border-radius: 8px; }
 .sync-status.ok { background: color-mix(in srgb, var(--ok) 10%, transparent); color: var(--ok); }
 .sync-status.warn { background: color-mix(in srgb, var(--warn) 10%, transparent); color: var(--warn); }
+.words-per-caption { width: fit-content; }
+.words-per-caption .step { padding: 5px 16px; }
 .steps-help { margin: 0; padding-left: 20px; }
 
 .progress { position: relative; flex: 1; height: 22px; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; min-width: 120px; }

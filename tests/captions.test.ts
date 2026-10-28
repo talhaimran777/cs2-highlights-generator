@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildAss, chunkWords, escapeAss } from '../server/captions/ass.ts';
+import { buildAss, captionChars, chunkWords, escapeAss } from '../server/captions/ass.ts';
 import { DEFAULT_SETTINGS, type CaptionLine, type CaptionWord } from '../server/types.ts';
 
 const w = (start: number, text: string, len = 0.3): CaptionWord => ({ start, end: start + len, text });
@@ -9,9 +9,30 @@ const line = (words: CaptionWord[]): CaptionLine => ({
 const video = { width: 1920, height: 1080 };
 
 describe('caption chunks', () => {
-  it('at most 4 words', () => {
+  it('at most 2 words', () => {
     const words = 'a b c d e f'.split(' ').map((t, i) => w(i * 0.35, t));
-    expect(chunkWords(words).map((c) => c.length)).toEqual([4, 2]);
+    expect(chunkWords(words).map((c) => c.length)).toEqual([2, 2, 2]);
+  });
+
+  it('shows as many words at a time as the setting asks', () => {
+    const words = 'a b c d e f'.split(' ').map((t, i) => w(i * 0.35, t));
+    expect(chunkWords(words, 3).map((c) => c.length)).toEqual([3, 3]);
+    expect(chunkWords(words, 4).map((c) => c.length)).toEqual([4, 2]);
+    expect(chunkWords(words, 1).map((c) => c.length)).toEqual([1, 1, 1, 1, 1, 1]);
+  });
+
+  it('gives more words more room, but never more than fits the frame', () => {
+    expect(captionChars({ wordsPerCaption: 2, sizePct: 7 }, video)).toBe(18);
+    expect(captionChars({ wordsPerCaption: 4, sizePct: 7 }, video)).toBe(36);
+    expect(captionChars({ wordsPerCaption: 4, sizePct: 11 }, video)).toBeLessThan(36);
+  });
+
+  it('a breath mid-sentence does not leave a word on its own', () => {
+    const t = (start: number, end: number, text: string): CaptionWord => ({ start, end, text });
+    const words = [t(94.26, 94.32, 'main'), t(94.54, 94.6, 'flashes'), t(94.6, 94.62, 'kar'), t(94.67, 95.14, 'raha'), t(95.5, 95.56, 'hon')];
+    expect(chunkWords(words, 3, 27).map((c) => c.map((x) => x.text).join(' '))).toEqual(['main flashes kar', 'raha hon']);
+    // a lower pause setting breaks there again
+    expect(chunkWords(words, 3, 27, 0.3).map((c) => c.map((x) => x.text).join(' '))).toEqual(['main flashes kar', 'raha', 'hon']);
   });
 
   it('breaks at pauses and sentence ends', () => {
@@ -41,9 +62,9 @@ describe('ASS', () => {
 
   it('clean and karaoke presets', () => {
     const clean = buildAss(lines, { start: 8, end: 20 }, video, { ...caps, style: 'clean' }, 'Anton')!;
-    expect(clean.split('\n').filter((l) => l.startsWith('Dialogue:'))).toHaveLength(1);
+    expect(clean.split('\n').filter((l) => l.startsWith('Dialogue:'))).toHaveLength(2); // 'bhai peeche', then 'dekho'
     const kara = buildAss(lines, { start: 8, end: 20 }, video, { ...caps, style: 'karaoke', uppercase: false }, 'Anton')!;
-    expect(kara).toContain('{\\kf40}bhai {\\kf40}peeche {\\kf30}dekho');
+    expect(kara).toContain('{\\kf40}bhai {\\kf30}peeche');
   });
 
   it('leaves out words outside the clip; null when nothing is said', () => {

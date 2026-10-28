@@ -1,6 +1,6 @@
 import { useEffect, useMemo, type MutableRefObject } from 'react';
 import type { CaptionLine, CaptionWord, ProjectView } from './api.ts';
-import { chunkWords } from '../../server/captions/ass.ts';
+import { captionChars, chunkWords } from '../../server/captions/ass.ts';
 import { buildSegments, parseFps, PlayerControls, recToReel, ReelStage, useReelPlayer } from './reel.tsx';
 
 const HOLD_S = 0.15; // as in the burned-in captions: the last word stays up a moment
@@ -25,8 +25,12 @@ export function CaptionPreview({ p, control }: { p: ProjectView; control: Mutabl
     };
   });
 
-  const chunks = useMemo(() => captionChunks(p.reelCaptions), [p.reelCaptions]);
   const caps = p.settings.captions;
+  const maxChars = captionChars(caps, p.video);
+  const chunks = useMemo(
+    () => captionChunks(p.reelCaptions, caps.wordsPerCaption, maxChars, caps.pauseS),
+    [p.reelCaptions, caps.wordsPerCaption, maxChars, caps.pauseS],
+  );
   const rec = player.recNow();
   const shown = chunks.find((c) => rec >= c.start && rec < c.end);
 
@@ -58,10 +62,10 @@ export function CaptionPreview({ p, control }: { p: ProjectView; control: Mutabl
 }
 
 /** The on-screen captions over time (recording seconds), grouped exactly like the export. */
-function captionChunks(lines: CaptionLine[]) {
+function captionChunks(lines: CaptionLine[], maxWords: number, maxChars: number, pauseS: number) {
   const chunks = [...lines]
     .sort((a, b) => a.start - b.start)
-    .flatMap((l) => chunkWords(l.words.filter((w) => w.text.trim())));
+    .flatMap((l) => chunkWords(l.words.filter((w) => w.text.trim()), maxWords, maxChars, pauseS));
   return chunks.map((words, i) => {
     const next = chunks[i + 1]?.[0].start ?? Infinity;
     return { words, start: words[0].start, end: Math.min(next, words.at(-1)!.end + HOLD_S) };

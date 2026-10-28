@@ -80,9 +80,8 @@ app.post<{ Params: { id: string } }>('/api/projects/:id/transcribe', async (req)
   return startJob('transcribe', id, async (progress, signal) => {
     const working = load(id);
     await transcribeProject(working, progress, signal);
-    await alignProject(working, undefined, signal); // lines transcribed before word alignment existed
-    const p = load(id); // keep edits made meanwhile
-    p.transcript = keepUserChanges(working.transcript!, p.transcript);
+    const p = load(id); // keep other changes made meanwhile; the captions start fresh
+    p.transcript = working.transcript!;
     saveProject(p);
     if (cleanupAvailable() && p.settings.captions.cleanup) startCleanupJob(id);
     return p.transcript.length;

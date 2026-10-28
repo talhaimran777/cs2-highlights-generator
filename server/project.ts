@@ -54,7 +54,12 @@ export interface Project {
 
 export function loadSettings(): Settings {
   if (!existsSync(SETTINGS_FILE)) return { ...DEFAULT_SETTINGS };
-  return { ...DEFAULT_SETTINGS, ...JSON.parse(readFileSync(SETTINGS_FILE, 'utf8')) };
+  return withDefaults(JSON.parse(readFileSync(SETTINGS_FILE, 'utf8')));
+}
+
+/** Settings saved before a field existed get its default (caption settings too). */
+export function withDefaults(s: Partial<Settings>): Settings {
+  return { ...DEFAULT_SETTINGS, ...s, captions: { ...DEFAULT_SETTINGS.captions, ...s.captions } };
 }
 
 export function saveSettings(s: Settings) {
@@ -73,7 +78,7 @@ export function getProject(id: string): Project | null {
   const p: Project = JSON.parse(readFileSync(f, 'utf8'));
   // settings added after this project was saved get their defaults;
   // the intro / outro belong to the channel, so every project uses the current ones
-  p.settings = { ...DEFAULT_SETTINGS, ...p.settings, branding: loadSettings().branding };
+  p.settings = { ...withDefaults(p.settings), branding: loadSettings().branding };
   if (p.version !== PROJECT_VERSION) {
     upgradeProject(p);
     saveProject(p);
@@ -86,7 +91,7 @@ export function getProject(id: string): Project | null {
  * assists and round intros), keeping the sync, kill-feed scan and toggles.
  */
 function upgradeProject(p: Project) {
-  p.settings = { ...DEFAULT_SETTINGS, ...p.settings };
+  p.settings = withDefaults(p.settings);
   if (existsSync(p.videoPath)) p.video = probe(p.videoPath); // newer probes read the encoding settings
   if (existsSync(p.demoPath)) {
     p.match = parseDemo(p.demoPath);
@@ -243,18 +248,16 @@ export function reelCaptions(p: Project, clips = clipsFor(p)): CaptionLine[] {
 }
 
 /**
- * Transcribes the speech inside the reel. Lines already transcribed (and any
- * you edited) are kept; only new speech goes through Whisper.
+ * Transcribes the speech inside the reel from scratch: every earlier line
+ * (edited and removed ones too) is replaced.
  */
 export async function transcribeProject(p: Project, onProgress?: (f: number) => void, signal?: AbortSignal) {
   if (!p.speech) throw new Error('Speech detection has to finish first');
   if (!p.sync && !recordingOnly(p)) throw new Error('Sync the recording first');
   const clips = clipsFor(p);
-  const known = new Map((p.transcript ?? []).map((l) => [l.id, l]));
   const wanted = p.speech.utterances.filter((u) => overlaps(u, clips));
-  const todo = wanted.filter((u) => !known.has(`u${u[0].toFixed(2)}`));
-  const fresh = await transcribe(p.videoPath, todo, voiceTracks(p), join(DATA_DIR, 'work', p.id, 'whisper'), onProgress, signal);
-  p.transcript = [...known.values(), ...fresh].sort((a, b) => a.start - b.start);
+  const fresh = await transcribe(p.videoPath, wanted, voiceTracks(p), join(DATA_DIR, 'work', p.id, 'whisper'), onProgress, signal);
+  p.transcript = fresh.sort((a, b) => a.start - b.start);
   return p.transcript;
 }
 
