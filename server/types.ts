@@ -144,6 +144,8 @@ export interface CaptionLine {
   source: string;
   words: CaptionWord[];
   edited?: boolean;
+  /** rewritten into natural Roman Urdu / English by Claude */
+  cleaned?: boolean;
 }
 
 export type CaptionStyle = 'pop' | 'clean' | 'karaoke';
@@ -157,6 +159,8 @@ export interface CaptionSettings {
   /** vertical center of the caption as % of frame height */
   positionPct: number;
   uppercase: boolean;
+  /** rewrite transcribed lines with Claude (needs ANTHROPIC_API_KEY) */
+  cleanup: boolean;
 }
 
 /** Channel intro and subscribe outro added around every reel. */
@@ -203,7 +207,7 @@ export const DEFAULT_SETTINGS: Settings = {
   protectSpeech: true,
   speechMaxWait: 8,
   voiceTracks: null,
-  captions: { enabled: true, style: 'pop', font: 'Montserrat Black', sizePct: 7, positionPct: 70, uppercase: true },
+  captions: { enabled: true, style: 'pop', font: 'Montserrat Black', sizePct: 7, positionPct: 70, uppercase: true, cleanup: true },
   branding: {
     intro: true,
     outro: true,

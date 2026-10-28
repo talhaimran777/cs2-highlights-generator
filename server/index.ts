@@ -4,10 +4,11 @@ import { createReadStream, existsSync, readdirSync, statSync } from 'node:fs';
 import { extname, join, resolve } from 'node:path';
 import { cancelJob, getJob, latestJob, startJob } from './jobs.ts';
 import {
-  analyzeSpeech, autoSync, baseClipsFor, clipsFor, createProject, createRecordingTest, defaultOutputPath, editCaption, editsOf, getProject, hasPlayer, listProjects,
+  analyzeSpeech, autoSync, cleanupProject, baseClipsFor, clipsFor, createProject, createRecordingTest, defaultOutputPath, editCaption, editsOf, getProject, hasPlayer, listProjects,
   BUMPER_CACHE, loadSettings, peaksFile, reelCaptions, renderProject, saveProject, saveSettings, setPlayer, syncAnchors, transcribeProject, type Project,
 } from './project.ts';
 import { captionsReady } from './captions/transcribe.ts';
+import { cleanupAvailable } from './captions/cleanup.ts';
 import { availableFonts, fontFile } from './captions/fonts.ts';
 import { manualSync } from './sync/align.ts';
 import { totalDuration } from './edit/plan.ts';
@@ -17,6 +18,9 @@ import { exportSettings } from './edit/render.ts';
 import { checkFfmpeg, hasNvenc } from './util/ffmpeg.ts';
 import { bumperFile, PREVIEW_TARGET } from './branding/bumper.ts';
 import type { Edits, Settings } from './types.ts';
+
+// ANTHROPIC_API_KEY (caption cleanup) can live in .env, so it works without a system-wide variable
+if (existsSync('.env')) process.loadEnvFile('.env');
 
 const PORT = Number(process.env.PORT ?? 5174);
 const VIDEO_EXT = ['.mp4', '.mkv', '.mov', '.flv', '.ts'];
@@ -51,6 +55,7 @@ function view(p: Project) {
     exportSettings: exportSettings(p.video),
     speechJob: latestJob(p.id, 'speech'),
     transcriptJob: latestJob(p.id, 'transcribe'),
+    cleanupJob: latestJob(p.id, 'cleanup'),
     peaksJob: latestJob(p.id, 'peaks'),
     reelCaptions: reelCaptions(p, clips),
     anchors: hasPlayer(p) ? syncAnchors(p) : [],
@@ -59,7 +64,7 @@ function view(p: Project) {
 
 app.get('/api/health', async () => ({ ffmpeg: checkFfmpeg(), nvenc: hasNvenc(), settings: loadSettings() }));
 
-app.get('/api/captions/status', async () => ({ ...captionsReady(), fonts: availableFonts() }));
+app.get('/api/captions/status', async () => ({ ...captionsReady(), fonts: availableFonts(), cleanup: cleanupAvailable() }));
 
 /** Caption fonts for the in-app preview (same files libass burns in). */
 app.get<{ Params: { name: string } }>('/api/fonts/:name', (req, reply) => {
@@ -78,8 +83,27 @@ app.post<{ Params: { id: string } }>('/api/projects/:id/transcribe', async (req)
     const edited = new Map((p.transcript ?? []).filter((l) => l.edited).map((l) => [l.id, l]));
     p.transcript = working.transcript!.map((l) => edited.get(l.id) ?? l);
     saveProject(p);
+    if (cleanupAvailable() && p.settings.captions.cleanup) startCleanupJob(id);
     return p.transcript.length;
   });
+});
+
+/** Claude rewrites the caption lines into natural Roman Urdu / English. */
+function startCleanupJob(id: string) {
+  return startJob('cleanup', id, async (progress, signal) => {
+    const working = load(id);
+    await cleanupProject(working, progress, signal);
+    const p = load(id); // keep edits made meanwhile
+    const edited = new Map((p.transcript ?? []).filter((l) => l.edited).map((l) => [l.id, l]));
+    p.transcript = working.transcript!.map((l) => edited.get(l.id) ?? l);
+    saveProject(p);
+    return p.transcript.filter((l) => l.cleaned).length;
+  });
+}
+
+app.post<{ Params: { id: string } }>('/api/projects/:id/captions/cleanup', async (req) => {
+  if (!cleanupAvailable()) throw Object.assign(new Error('Set ANTHROPIC_API_KEY and restart the app to use caption cleanup'), { statusCode: 400 });
+  return startCleanupJob(load(req.params.id).id);
 });
 
 /** Minimal local file browser: the browser can't hand us real paths. */

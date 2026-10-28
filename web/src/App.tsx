@@ -203,7 +203,8 @@ function ProjectScreen({ id }: { id: string }) {
 
   // Speech detection runs in the background; refresh until it's done so clips pick it up.
   // (transcription too)
-  const backgroundRunning = p?.speechJob?.status === 'running' || p?.transcriptJob?.status === 'running';
+  const backgroundRunning =
+    p?.speechJob?.status === 'running' || p?.transcriptJob?.status === 'running' || p?.cleanupJob?.status === 'running';
   useEffect(() => {
     if (!backgroundRunning) return;
     const t = setInterval(() => api.get(id).then(setP).catch(() => {}), 2000);
@@ -631,7 +632,7 @@ const CAPTION_STYLES: { id: CaptionSettings['style']; label: string; hint: strin
 
 /** Animated captions: transcription status, style controls, live preview, editable lines. */
 function CaptionsStep({ p, update, preview, onNext }: { p: ProjectView; update: Update; preview: Preview; onNext: () => void }) {
-  const [status, setStatus] = useState<{ ok: boolean; missing: string[]; fonts: string[] } | null>(null);
+  const [status, setStatus] = useState<{ ok: boolean; missing: string[]; fonts: string[]; cleanup: boolean } | null>(null);
   useEffect(() => void api.captionsStatus().then(setStatus).catch(() => {}), []);
   const caps = p.settings.captions;
   const setCaps = (patch: Partial<CaptionSettings>) => update(() => api.patch(p.id, { settings: { captions: { ...caps, ...patch } } }));
@@ -716,6 +717,7 @@ function CaptionsStep({ p, update, preview, onNext }: { p: ProjectView; update: 
           )}
           {job?.status === 'error' && <span className="error">{job.error}</span>}
         </div>
+        <CaptionCleanup p={p} available={!!status?.cleanup} lines={lines} update={update} setCaps={setCaps} />
       </section>
 
       <section className="card">
@@ -788,7 +790,7 @@ function CaptionsStep({ p, update, preview, onNext }: { p: ProjectView; update: 
                     if (text && text !== l.words.map((w) => w.text).join(' ')) update(() => api.patch(p.id, { captions: { [l.id]: text } }));
                   }}
                 />
-                {l.edited && <span className="muted small">edited</span>}
+                {l.edited ? <span className="muted small">edited</span> : l.cleaned && <span className="muted small" title="Spelling cleaned up by Claude">✨</span>}
                 <button className="btn btn-sm" onClick={() => preview.play(l.start - 0.5, l.end + 0.5)}>
                   ▶
                 </button>
@@ -798,6 +800,53 @@ function CaptionsStep({ p, update, preview, onNext }: { p: ProjectView; update: 
         </section>
       )}
     </>
+  );
+}
+
+/** Claude rewrites the transcribed lines into natural Roman Urdu / English, keeping the timing. */
+function CaptionCleanup({
+  p,
+  available,
+  lines,
+  update,
+  setCaps,
+}: {
+  p: ProjectView;
+  available: boolean;
+  lines: ProjectView['reelCaptions'];
+  update: Update;
+  setCaps: (patch: Partial<CaptionSettings>) => Promise<void>;
+}) {
+  const job = p.cleanupJob;
+  const running = job?.status === 'running';
+  const todo = lines.filter((l) => !l.edited && !l.cleaned).length;
+  if (!available) {
+    return (
+      <div className="muted small">
+        For natural Roman Urdu spelling, put <span className="mono">ANTHROPIC_API_KEY=…</span> in a <span className="mono">.env</span> file in the app's
+        folder and restart the app: Claude then cleans up every transcribed line.
+      </div>
+    );
+  }
+  return (
+    <div className="row wrap small">
+      <label className="row">
+        <input type="checkbox" checked={p.settings.captions.cleanup} onChange={(e) => setCaps({ cleanup: e.target.checked })} />
+        Clean up spelling with Claude after transcribing
+      </label>
+      <span className="grow" />
+      {running ? (
+        <>
+          <span className="muted">Cleaning up…</span>
+          <Progress value={job!.progress} />
+        </>
+      ) : (
+        <button className="btn btn-sm" disabled={todo === 0} onClick={() => update(async () => (await api.cleanupCaptions(p.id), api.get(p.id)))}>
+          {todo ? `Clean up ${todo} lines now` : 'All lines cleaned up'}
+        </button>
+      )}
+      {job?.status === 'error' && <span className="error">{job.error}</span>}
+    </div>
   );
 }
 

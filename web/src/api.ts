@@ -33,6 +33,7 @@ export interface ProjectView {
   speechJob: Job | null;
   transcript?: CaptionLine[] | null;
   transcriptJob: Job | null;
+  cleanupJob: Job | null;
   peaksJob: Job | null;
   /** caption lines for speech inside the current reel */
   reelCaptions: CaptionLine[];
@@ -81,7 +82,8 @@ export const api = {
     const r = await fetch(`/api/projects/${id}/peaks`);
     return r.ok ? new Uint8Array(await r.arrayBuffer()) : null;
   },
-  captionsStatus: () => req<{ ok: boolean; missing: string[]; fonts: string[] }>('GET', '/api/captions/status'),
+  captionsStatus: () => req<{ ok: boolean; missing: string[]; fonts: string[]; cleanup: boolean }>('GET', '/api/captions/status'),
+  cleanupCaptions: (id: string) => req<Job>('POST', `/api/projects/${id}/captions/cleanup`),
   job: (id: string) => req<Job | null>('GET', `/api/jobs/${id}`),
   cancel: (id: string) => req('DELETE', `/api/jobs/${id}`),
 };

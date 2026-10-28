@@ -5,3 +5,4 @@ data/
 # downloaded once by the captions setup: whisper.cpp builds, speech model, fonts
 tools/
 server/assets/fonts/*.ttf
+.env

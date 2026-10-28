@@ -13,6 +13,7 @@ import { probe, type VideoInfo } from './util/ffmpeg.ts';
 import { detectSpeech, type Speech } from './audio/speech.ts';
 import { DEFAULT_SETTINGS, NO_EDITS, type CaptionLine, type Edits, type Clip, type MatchData, type Moment, type RoundIntro, type Settings, type SyncModel } from './types.ts';
 import { transcribe } from './captions/transcribe.ts';
+import { cleanupCaptions, spreadWords } from './captions/cleanup.ts';
 import { buildAss } from './captions/ass.ts';
 import { resolveFont } from './captions/fonts.ts';
 
@@ -257,22 +258,22 @@ export async function transcribeProject(p: Project, onProgress?: (f: number) => 
   return p.transcript;
 }
 
+/** Rewrites the reel's caption lines with Claude (hand edits and already-cleaned lines are kept). */
+export async function cleanupProject(p: Project, onProgress?: (f: number) => void, signal?: AbortSignal) {
+  const inReel = new Set(reelCaptions(p).map((l) => l.id));
+  const cleaned = await cleanupCaptions((p.transcript ?? []).filter((l) => inReel.has(l.id)), onProgress, signal);
+  const byId = new Map(cleaned.map((l) => [l.id, l]));
+  // lines cleanup dropped (filler sounds) disappear; lines outside the reel stay as they are
+  p.transcript = (p.transcript ?? []).flatMap((l) => (inReel.has(l.id) ? (byId.has(l.id) ? [byId.get(l.id)!] : []) : [l]));
+  return p.transcript;
+}
+
 /** Replaces a caption's text, spreading the line's time over the new words by length. */
 export function editCaption(p: Project, id: string, text: string) {
   const line = p.transcript?.find((l) => l.id === id);
   if (!line) return;
   const tokens = text.trim().split(/\s+/).filter(Boolean);
-  const from = line.words[0]?.start ?? line.start;
-  const to = line.words.at(-1)?.end ?? line.end;
-  const weights = tokens.map((t) => t.length + 1);
-  const total = weights.reduce((a, b) => a + b, 0) || 1;
-  let t = from;
-  line.words = tokens.map((tok, i) => {
-    const d = ((to - from) * weights[i]) / total;
-    const w = { start: t, end: t + d, text: tok };
-    t += d;
-    return w;
-  });
+  line.words = spreadWords(tokens, line.words[0]?.start ?? line.start, line.words.at(-1)?.end ?? line.end);
   line.edited = true;
 }
 
