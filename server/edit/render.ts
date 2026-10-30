@@ -20,6 +20,8 @@ export interface RenderInput {
   /** channel intro / outro, rendered with the same settings as the clips */
   intro?: Bookend;
   outro?: Bookend;
+  /** several files on one timeline (clips mode): the file a clip comes from and where it starts */
+  sourceOf?: (clip: Clip) => { path: string; info: VideoInfo; offset: number };
 }
 
 /** A ready-made segment added before or after the reel. */
@@ -167,18 +169,24 @@ export async function renderReel(
       kind: 'clip',
       dur,
       run: (out, prog) => {
+        const src = input.sourceOf?.(clip) ?? { path: input.videoPath, info, offset: 0 };
+        const filters: string[] = [];
+        // a clip recorded at another size or frame rate is conformed, so the lossless join still works
+        if (src.info.width !== info.width || src.info.height !== info.height) {
+          filters.push(`scale=${info.width}:${info.height}:force_original_aspect_ratio=decrease`, `pad=${info.width}:${info.height}:(ow-iw)/2:(oh-ih)/2`, 'setsar=1');
+        }
+        if (src.info.fps !== info.fps) filters.push(`fps=${info.fps}`);
         // captions are burned in while the clip is encoded anyway
-        let vf: string[] = [];
         if (ass) {
           const assFile = out.replace(/\.mp4$/, '.ass');
           writeFileSync(assFile, ass);
-          vf = ['-vf', `ass='${filterPath(assFile)}':fontsdir='${filterPath(FONTS_DIR)}'`];
+          filters.push(`ass='${filterPath(assFile)}':fontsdir='${filterPath(FONTS_DIR)}'`);
         }
         return runFfmpeg(
           [
-            '-ss', clip.start.toFixed(3), '-i', input.videoPath, '-t', dur.toFixed(3),
+            '-ss', (clip.start - src.offset).toFixed(3), '-i', src.path, '-t', dur.toFixed(3),
             '-map', '0:v:0', '-map', '0:a?',
-            ...vf,
+            ...(filters.length ? ['-vf', filters.join(',')] : []),
             '-af', `afade=t=in:d=${fade},afade=t=out:st=${(dur - fade).toFixed(3)}:d=${fade}`,
             ...common, out,
           ],

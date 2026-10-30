@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, extname, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { findArrivals, parseDemo, scoreRounds } from './demo/parse.ts';
@@ -11,14 +11,17 @@ import { encodeArgs, renderReel, type Bookend } from './edit/render.ts';
 import { bumperFile, bumperSeconds, reelTarget, type BumperKind } from './branding/bumper.ts';
 import { probe, type VideoInfo } from './util/ffmpeg.ts';
 import { detectSpeech, type Speech } from './audio/speech.ts';
-import { DEFAULT_SETTINGS, NO_EDITS, type CaptionLine, type Edits, type Clip, type MatchData, type Moment, type RoundIntro, type Settings, type SyncModel } from './types.ts';
+import { DEFAULT_SETTINGS, NO_EDITS, type CaptionLine, type Edits, type Clip, type MatchData, type Moment, type RoundIntro, type Settings, type Source, type SyncModel } from './types.ts';
+import { computePeaks, PEAKS_PER_SEC, readPeaks } from './audio/peaks.ts';
+import { analyzeClip } from './clips/analyze.ts';
+import { clipCardText, clipMoments, planSourceClips, roundStartsFrom } from './clips/moments.ts';
 import { alignLines, transcribe } from './captions/transcribe.ts';
 import { cleanupCaptions, retime } from './captions/cleanup.ts';
 import { buildAss } from './captions/ass.ts';
 import { resolveFont } from './captions/fonts.ts';
 
 /** Bump when parsing/moments change in a way saved projects should pick up. */
-const PROJECT_VERSION = 10;
+const PROJECT_VERSION = 12;
 
 export const DATA_DIR = resolve(process.env.CS2H_DATA ?? 'data');
 const PROJECTS_DIR = join(DATA_DIR, 'projects');
@@ -30,8 +33,13 @@ export const BUMPER_CACHE = join(BRANDING_DIR, 'cache');
 export interface Project {
   id: string;
   version?: number;
-  /** 'captions' / 'edit': a recording without a demo, used whole (to try captions or the editor out) */
-  mode?: 'match' | 'captions' | 'edit';
+  /**
+   * 'captions' / 'edit': a recording without a demo, used whole (to try captions or the editor out).
+   * 'clips': OBS replay clips without a demo, back to back on one timeline (`sources`);
+   * videoPath is the first clip and `video` describes the whole timeline.
+   */
+  mode?: 'match' | 'captions' | 'edit' | 'clips';
+  sources?: Source[];
   name: string;
   createdAt: string;
   videoPath: string;
@@ -92,7 +100,11 @@ export function getProject(id: string): Project | null {
  */
 function upgradeProject(p: Project) {
   p.settings = withDefaults(p.settings);
-  if (existsSync(p.videoPath)) p.video = probe(p.videoPath); // newer probes read the encoding settings
+  // newer probes read the encoding settings
+  if (clipsMode(p)) {
+    placeSources(p, p.sources!.map((s) => (existsSync(s.path) ? { ...s, info: probe(s.path) } : s)));
+    buildClipMoments(p);
+  } else if (existsSync(p.videoPath)) p.video = probe(p.videoPath);
   if (existsSync(p.demoPath)) {
     p.match = parseDemo(p.demoPath);
     if (hasPlayer(p)) analyzePlayer(p);
@@ -153,6 +165,111 @@ export function createRecordingTest(videoPath: string, mode: 'captions' | 'edit'
   };
   saveProject(p);
   return p;
+}
+
+export const clipsMode = (p: Pick<Project, 'mode'>) => p.mode === 'clips';
+
+/** Lays the clips back to back: offsets, and `video` as the whole timeline (the first clip's format). */
+function placeSources(p: Project, sources: Source[]) {
+  let offset = 0;
+  p.sources = sources.map((s) => {
+    const placed = { ...s, offset };
+    offset += s.info.duration;
+    return placed;
+  });
+  p.video = { ...p.sources[0].info, duration: offset };
+}
+
+/** The clip playing at a timeline time. */
+export function sourceAt(p: Project, t: number): Source {
+  const all = p.sources ?? [];
+  return all.filter((s) => s.offset <= t + 1e-6).at(-1) ?? all[0];
+}
+
+/** OBS replay clips without a demo, in the order given (oldest first). */
+export function createClipsProject(paths: string[]): Project {
+  if (paths.length === 0) throw new Error('Pick at least one clip');
+  for (const f of paths) if (!existsSync(f)) throw new Error(`File not found: ${f}`);
+  const settings = loadSettings();
+  const p: Project = {
+    id: randomUUID().slice(0, 8),
+    version: PROJECT_VERSION,
+    mode: 'clips',
+    name: `Clips · ${basename(dirname(paths[0]))} (${paths.length})`,
+    createdAt: new Date().toISOString(),
+    videoPath: paths[0],
+    demoPath: '',
+    video: probe(paths[0]),
+    settings: { ...settings, steamId: '', voiceTracks: null },
+    match: { demoPath: '', map: '', tickrate: 64, players: [], rounds: [], kills: [], bombs: [], combat: [] },
+    moments: [],
+    sync: null,
+    killfeedEvents: null,
+    outputPath: null,
+  };
+  placeSources(
+    p,
+    paths.map((path) => ({ id: randomUUID().slice(0, 6), path, name: basename(path, extname(path)), info: probe(path), offset: 0, analysis: null })),
+  );
+  saveProject(p);
+  return p;
+}
+
+/** Moments from every analysed clip. Keeps toggles/trims of moments that still exist. */
+export function buildClipMoments(p: Project) {
+  // round starts come from the saved HUD readings, so a better rule needs no new reading
+  for (const s of p.sources ?? []) if (s.analysis) s.analysis.roundStarts = roundStartsFrom(s.analysis.hud);
+  const old = new Map(p.moments.map((m) => [m.id, m]));
+  p.moments = (p.sources ?? []).flatMap((s, i) =>
+    clipMoments(s, i, p.settings).map((m) => {
+      const prev = old.get(m.id);
+      return prev ? { ...m, enabled: prev.enabled, trimStart: prev.trimStart, trimEnd: prev.trimEnd } : m;
+    }),
+  );
+}
+
+/**
+ * Reads every clip that hasn't been read yet, all of them again (`'all'`), or
+ * just the clips with the given ids. Each clip's result is saved as soon as
+ * it's done, so a cancelled run keeps what it paid for. `save` gets each finished clip.
+ */
+export async function analyzeClips(
+  p: Project,
+  which: 'unread' | 'all' | string[],
+  save: (src: Source) => void,
+  onProgress?: (f: number) => void,
+  signal?: AbortSignal,
+) {
+  const todo = (p.sources ?? []).filter((s) => (which === 'all' ? true : which === 'unread' ? !s.analysis : which.includes(s.id)));
+  for (const [i, s] of todo.entries()) {
+    const step = (f: number) => onProgress?.((i + f) / todo.length);
+    try {
+      s.analysis = await analyzeClip(s.path, s.info, p.settings, join(DATA_DIR, 'work', p.id, 'read'), step, signal);
+      s.error = undefined;
+      const u = s.analysis.usage;
+      if (u.input) console.log(`read ${s.name}: ${u.input} input + ${u.output} output tokens`);
+    } catch (e: any) {
+      if (signal?.aborted) throw e;
+      s.error = String(e?.message ?? e);
+    }
+    save(s);
+  }
+  return todo.length;
+}
+
+/** The editor's waveform for clips: each clip's peaks placed at its offset. */
+export async function clipsPeaks(p: Project, outFile: string, onProgress?: (f: number) => void, signal?: AbortSignal) {
+  const all = new Uint8Array(Math.ceil(p.video.duration * PEAKS_PER_SEC));
+  const sources = p.sources ?? [];
+  for (const [i, s] of sources.entries()) {
+    const tmp = `${outFile}.${i}`;
+    await computePeaks(s.path, s.info, tmp, (f) => onProgress?.((i + f) / sources.length), signal);
+    const part = readPeaks(tmp)!;
+    all.set(part.subarray(0, all.length - Math.round(s.offset * PEAKS_PER_SEC)), Math.round(s.offset * PEAKS_PER_SEC));
+    rmSync(tmp, { force: true });
+  }
+  writeFileSync(outFile, all);
+  return all.length;
 }
 
 export function createProject(videoPath: string, demoPath: string): Project {
@@ -220,6 +337,7 @@ export function baseClipsFor(p: Project): Clip[] {
   if (recordingOnly(p)) {
     return [{ round: 0, start: 0, end: p.video.duration, momentIds: [], label: 'Full recording' }];
   }
+  if (clipsMode(p)) return planSourceClips(p.moments, p.sources ?? [], p.settings);
   if (!p.sync) return [];
   return planClips(p.moments, p.sync, p.settings, p.video.duration, p.speech);
 }
@@ -297,17 +415,20 @@ export function clipCaptions(p: Project) {
 }
 
 export function defaultOutputPath(p: Project) {
+  if (clipsMode(p)) return join(dirname(p.videoPath), `${basename(dirname(p.videoPath))}_highlights.mp4`);
   const suffix = p.mode === 'captions' ? '_captions' : p.mode === 'edit' ? '_edited' : '_highlights';
   return join(dirname(p.videoPath), `${basename(p.videoPath, extname(p.videoPath))}${suffix}.mp4`);
 }
 
 export async function renderProject(p: Project, onProgress?: (f: number) => void, signal?: AbortSignal): Promise<string> {
-  if (!p.sync && !recordingOnly(p)) throw new Error('Sync the recording first');
+  if (!p.sync && !recordingOnly(p) && !clipsMode(p)) throw new Error('Sync the recording first');
   const clips = clipsFor(p);
   if (clips.length === 0) throw new Error('No clips enabled');
   const cards = new Map<number, { title: string; subtitle: string }>();
   if (p.settings.titleCards && !recordingOnly(p)) {
-    for (const c of clips) cards.set(c.round, roundCardText(p.match, c.round, p.moments));
+    for (const c of clips) {
+      cards.set(c.round, clipsMode(p) ? clipCardText(p.sources![c.round - 1], c.round - 1, p.moments) : roundCardText(p.match, c.round, p.moments));
+    }
   }
   const outPath = p.outputPath ?? defaultOutputPath(p);
   const b = p.settings.branding;
@@ -318,6 +439,7 @@ export async function renderProject(p: Project, onProgress?: (f: number) => void
   await renderReel(
     {
       videoPath: p.videoPath, info: p.video, clips, cards, outPath, workDir: join(DATA_DIR, 'work', p.id), captions: clipCaptions(p),
+      sourceOf: clipsMode(p) ? (c) => sourceAt(p, c.start) : undefined,
       intro: branded && b.intro ? bookend('intro') : undefined,
       outro: branded && b.outro ? bookend('outro') : undefined,
     },

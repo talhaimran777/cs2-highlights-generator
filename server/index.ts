@@ -6,7 +6,9 @@ import { cancelJob, getJob, latestJob, startJob } from './jobs.ts';
 import {
   alignProject, analyzeSpeech, autoSync, cleanupProject, baseClipsFor, clipsFor, createProject, createRecordingTest, defaultOutputPath, editCaption, editsOf, getProject, hasPlayer, listProjects,
   BUMPER_CACHE, loadSettings, peaksFile, reelCaptions, renderProject, saveProject, saveSettings, setPlayer, syncAnchors, transcribeProject, type Project,
+  analyzeClips, buildClipMoments, clipsMode, clipsPeaks, createClipsProject,
 } from './project.ts';
+import { readerAvailable } from './clips/read.ts';
 import { captionsReady } from './captions/transcribe.ts';
 import { cleanupAvailable } from './captions/cleanup.ts';
 import { availableFonts, fontFile } from './captions/fonts.ts';
@@ -58,6 +60,8 @@ function view(p: Project) {
     cleanupJob: latestJob(p.id, 'cleanup'),
     alignJob: latestJob(p.id, 'align'),
     peaksJob: latestJob(p.id, 'peaks'),
+    analyzeJob: latestJob(p.id, 'analyze'),
+    readerAvailable: readerAvailable(),
     reelCaptions: reelCaptions(p, clips),
     anchors: hasPlayer(p) ? syncAnchors(p) : [],
   };
@@ -188,6 +192,7 @@ app.post<{ Params: { id: string } }>('/api/projects/:id/speech', async (req) => 
 function startPeaksJob(id: string) {
   return startJob('peaks', id, async (progress, signal) => {
     const p = load(id);
+    if (clipsMode(p)) return clipsPeaks(p, peaksFile(p), progress, signal);
     return computePeaks(p.videoPath, p.video, peaksFile(p), progress, signal);
   });
 }
@@ -215,6 +220,36 @@ app.post<{ Body: { videoPath: string } }>('/api/projects/edit-test', async (req)
   startSpeechJob(p.id);
   startPeaksJob(p.id);
   return view(p);
+});
+
+/** OBS replay clips, no demo: each clip's last round with kills goes into one video. */
+app.post<{ Body: { paths: string[]; playerName?: string } }>('/api/projects/clips', async (req) => {
+  if (req.body.playerName !== undefined) saveSettings({ ...loadSettings(), playerName: req.body.playerName.trim() });
+  const p = createClipsProject(req.body.paths ?? []);
+  startPeaksJob(p.id);
+  return view(p);
+});
+
+/** Reads the clips (kill feed and round timer): the unread ones, all `again`, or just the clips `ids`. */
+app.post<{ Params: { id: string }; Body: { again?: boolean; ids?: string[] } }>('/api/projects/:id/analyze', async (req) => {
+  const id = load(req.params.id).id;
+  if (!readerAvailable()) throw Object.assign(new Error('Set ANTHROPIC_API_KEY and restart the app to read clips'), { statusCode: 400 });
+  return startJob('analyze', id, async (progress, signal) => {
+    const working = load(id);
+    return analyzeClips(
+      working,
+      req.body?.ids?.length ? req.body.ids : req.body?.again ? 'all' : 'unread',
+      (src) => {
+        // save each clip as it finishes, keeping changes made meanwhile
+        const p = load(id);
+        p.sources = p.sources!.map((s) => (s.id === src.id ? { ...s, analysis: src.analysis, error: src.error } : s));
+        buildClipMoments(p);
+        saveProject(p);
+      },
+      progress,
+      signal,
+    );
+  });
 });
 
 app.get<{ Params: { id: string } }>('/api/projects/:id', async (req) => view(load(req.params.id)));
@@ -253,6 +288,7 @@ app.patch<{
       p.speech = null;
       p.transcript = (p.transcript ?? []).filter((l) => l.edited);
     }
+    if (clipsMode(p)) buildClipMoments(p); // the burst gap splits kills differently
   }
   for (const [id, patch] of Object.entries(moments ?? {})) {
     const m = p.moments.find((x) => x.id === id);
@@ -368,9 +404,12 @@ app.get<{ Querystring: { path?: string } }>('/api/image', (req, reply) => {
   return reply.send(createReadStream(path));
 });
 
-app.get<{ Params: { id: string } }>('/api/projects/:id/media', (req, reply) =>
-  streamFile(load(req.params.id).videoPath, req.headers.range, reply),
-);
+/** The recording; in clips mode, the clip `source` (default: the first). */
+app.get<{ Params: { id: string }; Querystring: { source?: string } }>('/api/projects/:id/media', (req, reply) => {
+  const p = load(req.params.id);
+  const src = p.sources?.find((s) => s.id === req.query.source);
+  return streamFile(src?.path ?? p.videoPath, req.headers.range, reply);
+});
 app.get<{ Params: { id: string } }>('/api/projects/:id/output', (req, reply) => {
   const p = load(req.params.id);
   if (!p.outputPath || !existsSync(p.outputPath)) return reply.code(404).send({ error: 'Not rendered yet' });

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, type MutableRefObject } from 'react';
-import type { CaptionLine, CaptionWord, ProjectView } from './api.ts';
+import { locator, type CaptionLine, type CaptionWord, type ProjectView } from './api.ts';
 import { captionChars, chunkWords } from '../../server/captions/ass.ts';
 import { buildSegments, parseFps, PlayerControls, recToReel, ReelStage, useReelPlayer } from './reel.tsx';
 
@@ -17,7 +17,7 @@ export interface CaptionPreviewControl {
 export function CaptionPreview({ p, control }: { p: ProjectView; control: MutableRefObject<CaptionPreviewControl | null> }) {
   const sig = JSON.stringify(p.clips.map((c) => [c.start, c.end]));
   const segments = useMemo(() => buildSegments(p.clips), [sig]); // eslint-disable-line react-hooks/exhaustive-deps
-  const player = useReelPlayer(segments, parseFps(p.video.fps));
+  const player = useReelPlayer(segments, parseFps(p.video.fps), locator(p));
 
   useEffect(() => {
     control.current = {
@@ -36,7 +36,7 @@ export function CaptionPreview({ p, control }: { p: ProjectView; control: Mutabl
 
   return (
     <div className="caption-player">
-      <ReelStage player={player} src={`/api/projects/${p.id}/media`}>
+      <ReelStage player={player}>
         {shown && (
           <div className="caption-overlay" style={{ ['--pos' as string]: `${caps.positionPct}%`, ['--size' as string]: `${caps.sizePct * 0.5625}cqw` }}>
             <div className={`caption-sample style-${caps.style}`} style={{ fontFamily: `'${caps.font}', 'Arial Black', sans-serif` }}>

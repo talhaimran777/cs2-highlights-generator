@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api, fmtTime, videoTime, waitJob, type CaptionSettings, type Job, type Moment, type ProjectView } from './api.ts';
+import { api, fmtTime, locator, videoTime, waitJob, type CaptionSettings, type Job, type Moment, type ProjectView } from './api.ts';
 import { FilePicker } from './FilePicker.tsx';
+import { AnalyzeStep, ClipsForm, ClipsHighlightsStep } from './Clips.tsx';
+import { Progress } from './ui.tsx';
 import { Editor } from './Editor.tsx';
 import { BrandingSection } from './Branding.tsx';
 import { CaptionPreview, type CaptionPreviewControl } from './CaptionPreview.tsx';
 
-type Step = 'player' | 'sync' | 'highlights' | 'edit' | 'captions' | 'export';
+type Step = 'player' | 'sync' | 'analyze' | 'highlights' | 'edit' | 'captions' | 'export';
 const STEPS: { id: Step; label: string }[] = [
   { id: 'player', label: '1 · Player' },
   { id: 'sync', label: '2 · Sync' },
@@ -19,6 +21,13 @@ const TEST_STEPS: Record<'captions' | 'edit', { id: Step; label: string }[]> = {
   captions: [{ id: 'captions', label: '1 · Captions' }, { id: 'export', label: '2 · Export' }],
   edit: [{ id: 'edit', label: '1 · Edit' }, { id: 'export', label: '2 · Export' }],
 };
+// replay clips without a demo: read them, then the usual highlights / edit / export
+const CLIPS_STEPS: { id: Step; label: string }[] = [
+  { id: 'analyze', label: '1 · Read clips' },
+  { id: 'highlights', label: '2 · Highlights' },
+  { id: 'edit', label: '3 · Edit' },
+  { id: 'export', label: '4 · Export' },
+];
 const recordingOnly = (p: Pick<ProjectView, 'mode'>) => p.mode === 'captions' || p.mode === 'edit';
 
 const KIND_LABEL: Record<Moment['kind'], string> = {
@@ -63,7 +72,7 @@ function Health() {
 function Home() {
   const [video, setVideo] = useState('');
   const [demo, setDemo] = useState('');
-  const [mode, setMode] = useState<'match' | 'captions' | 'edit'>('match');
+  const [mode, setMode] = useState<'match' | 'captions' | 'edit' | 'clips'>('match');
   const captionsOnly = mode === 'captions';
   const recordingTest = mode !== 'match';
   const [busy, setBusy] = useState(false);
@@ -72,6 +81,7 @@ function Home() {
   useEffect(() => void api.projects().then(setRecent).catch(() => {}), []);
 
   const create = async () => {
+    if (mode === 'clips') return; // the clips form creates its own project
     setBusy(true);
     setError('');
     try {
@@ -93,10 +103,13 @@ function Home() {
     <main className="home">
       <section className="card">
         <div className="row spread">
-          <h1>{captionsOnly ? 'Captions test' : mode === 'edit' ? 'Editing test' : 'New match'}</h1>
+          <h1>{captionsOnly ? 'Captions test' : mode === 'edit' ? 'Editing test' : mode === 'clips' ? 'Replay clips' : 'New match'}</h1>
           <div className="steps">
             <button className={`step ${mode === 'match' ? 'active' : ''}`} onClick={() => setMode('match')}>
               Match + demo
+            </button>
+            <button className={`step ${mode === 'clips' ? 'active' : ''}`} onClick={() => setMode('clips')}>
+              Replay clips
             </button>
             <button className={`step ${captionsOnly ? 'active' : ''}`} onClick={() => setMode('captions')}>
               Captions test
@@ -106,6 +119,16 @@ function Home() {
             </button>
           </div>
         </div>
+        {mode === 'clips' ? (
+          <>
+            <p className="muted">
+              Pick the folder with your OBS replay clips, no demo needed. From each clip the last round with your kills is kept, and all clips
+              become one video. Files are read where they are; Claude only sees a few small screenshots of the kill feed and round timer.
+            </p>
+            <ClipsForm />
+          </>
+        ) : (
+        <>
         <p className="muted">
           {captionsOnly
             ? 'Pick any recording, no demo needed. The whole clip gets captioned so you can check how accurate the captions are. Files are read where they are and nothing is uploaded.'
@@ -135,6 +158,8 @@ function Home() {
               ? 'Parsing demo…'
               : 'Analyze match'}
         </button>
+        </>
+        )}
       </section>
       {recent.length > 0 && (
         <section className="card">
@@ -157,9 +182,11 @@ function Home() {
 function usePreview() {
   const ref = useRef<HTMLVideoElement>(null);
   const stopAt = useRef<number | null>(null);
-  const play = useCallback((from: number, to?: number) => {
+  /** plays [from, to] of the recording, or of the file `src` (a replay clip) */
+  const play = useCallback((from: number, to?: number, src?: string) => {
     const v = ref.current;
     if (!v) return;
+    if (src && v.getAttribute('src') !== src) v.src = src;
     stopAt.current = to ?? null;
     v.currentTime = Math.max(0, from);
     void v.play();
@@ -186,7 +213,21 @@ function ProjectScreen({ id }: { id: string }) {
       .get(id)
       .then((proj) => {
         setP(proj);
-        setStep(proj.mode === 'captions' ? 'captions' : proj.mode === 'edit' ? 'edit' : !proj.hasPlayer ? 'player' : !proj.sync ? 'sync' : 'highlights');
+        setStep(
+          proj.mode === 'captions'
+            ? 'captions'
+            : proj.mode === 'edit'
+              ? 'edit'
+              : proj.mode === 'clips'
+                ? proj.moments.length
+                  ? 'highlights'
+                  : 'analyze'
+                : !proj.hasPlayer
+                  ? 'player'
+                  : !proj.sync
+                    ? 'sync'
+                    : 'highlights',
+        );
       })
       .catch((e) => setError(e.message));
   }, [id]);
@@ -216,8 +257,15 @@ function ProjectScreen({ id }: { id: string }) {
   if (!p) return <main className="home">{error ? <div className="error">{error}</div> : <div className="muted">Loading…</div>}</main>;
 
   const testMode = p.mode === 'captions' || p.mode === 'edit' ? p.mode : null;
-  const steps = testMode ? TEST_STEPS[testMode] : STEPS;
-  const enabled = (s: Step) => !!testMode || s === 'player' || (p.hasPlayer && (s === 'sync' || !!p.sync));
+  const clips = p.mode === 'clips';
+  const steps = testMode ? TEST_STEPS[testMode] : clips ? CLIPS_STEPS : STEPS;
+  const enabled = (s: Step) => !!testMode || clips || s === 'player' || (p.hasPlayer && (s === 'sync' || !!p.sync));
+  const locate = locator(p);
+  /** plays timeline seconds in the preview (in clips mode, from the clip that holds them) */
+  const playRange = (from: number, to: number) => {
+    const at = locate(from);
+    preview.play(from - at.offset, to - at.offset, at.src);
+  };
 
   return (
     <main className="project">
@@ -225,7 +273,8 @@ function ProjectScreen({ id }: { id: string }) {
         <div>
           <h1>{p.name}</h1>
           <div className="muted">
-            {testMode ? 'No demo' : `${p.match.rounds.length} rounds`} · recording {fmtTime(p.video.duration)} · {p.video.width}×{p.video.height}
+            {clips ? `${p.sources?.length ?? 0} clips` : testMode ? 'No demo' : `${p.match.rounds.length} rounds`} · {clips ? 'footage' : 'recording'}{' '}
+            {fmtTime(p.video.duration)} · {p.video.width}×{p.video.height}
             {p.video.audio.length > 1 && ` · ${p.video.audio.length} audio tracks`}
           </div>
         </div>
@@ -243,8 +292,8 @@ function ProjectScreen({ id }: { id: string }) {
         <Editor
           p={p}
           update={update}
-          nextLabel={testMode === 'edit' ? 'Export' : 'Captions'}
-          onNext={() => setStep(testMode === 'edit' ? 'export' : 'captions')}
+          nextLabel={testMode === 'edit' || clips ? 'Export' : 'Captions'}
+          onNext={() => setStep(testMode === 'edit' || clips ? 'export' : 'captions')}
         />
       ) : (
       <div className="split">
@@ -253,7 +302,13 @@ function ProjectScreen({ id }: { id: string }) {
             <PlayerStep p={p} onPick={(steamId) => update(() => api.patch(p.id, { steamId })).then(() => setStep('sync'))} />
           )}
           {step === 'sync' && <SyncStep p={p} setP={setP} update={update} preview={preview} onNext={() => setStep('highlights')} />}
-          {step === 'highlights' && <HighlightsStep p={p} update={update} preview={preview} onNext={() => setStep('edit')} />}
+          {step === 'analyze' && <AnalyzeStep p={p} setP={setP} update={update} onNext={() => setStep('highlights')} />}
+          {step === 'highlights' &&
+            (clips ? (
+              <ClipsHighlightsStep p={p} update={update} play={playRange} onNext={() => setStep('edit')} />
+            ) : (
+              <HighlightsStep p={p} update={update} preview={preview} onNext={() => setStep('edit')} />
+            ))}
           {step === 'captions' && (
             <CaptionsStep p={p} update={update} playLine={(a, b) => captionPreview.current?.playLine(a, b)} onNext={() => setStep('export')} />
           )}
@@ -266,7 +321,7 @@ function ProjectScreen({ id }: { id: string }) {
           <>
           <video
             ref={preview.ref}
-            src={`/api/projects/${p.id}/media`}
+            src={locate(0).src}
             controls
             preload="metadata"
             onTimeUpdate={preview.onTimeUpdate}
@@ -577,6 +632,7 @@ function ExportStep({ p, setP, update }: { p: ProjectView; setP: (p: ProjectView
             <span>Seconds after each moment</span>
             <input className="input" type="number" step={0.5} min={0} value={st.postRoll} onChange={(e) => setting({ postRoll: Number(e.target.value) })} />
           </label>
+          {p.mode !== 'clips' && (
           <label className="field">
             <span>Seconds before a clutch</span>
             <input
@@ -588,14 +644,15 @@ function ExportStep({ p, setP, update }: { p: ProjectView; setP: (p: ProjectView
               onChange={(e) => setting({ clutchPreRoll: Number(e.target.value) })}
             />
           </label>
+          )}
           <label className="field check">
             <input type="checkbox" checked={st.titleCards} onChange={(e) => setting({ titleCards: e.target.checked })} />
             <span>Round title cards (ROUND 7 · 4–2 · 3K)</span>
           </label>
         </div>
         )}
-        {/* a captions test has no cuts to protect; its voice tracks are chosen on the Captions page */}
-        {!recordingOnly(p) && <SpeechProtection p={p} setting={setting} update={update} />}
+        {/* a captions test has no cuts to protect; its voice tracks are chosen on the Captions page; clips have no speech detection yet */}
+        {!recordingOnly(p) && p.mode !== 'clips' && <SpeechProtection p={p} setting={setting} update={update} />}
         {p.mode !== 'captions' && <BrandingSection p={p} setting={setting} />}
         <QualityMatch p={p} />
         <label className="field">
@@ -1096,14 +1153,5 @@ function QualityMatch({ p }: { p: ProjectView }) {
         </tbody>
       </table>
     </div>
-  );
-}
-
-function Progress({ value }: { value: number }) {
-  return (
-    <span className="progress">
-      <span style={{ width: `${Math.round(value * 100)}%` }} />
-      <em>{Math.round(value * 100)}%</em>
-    </span>
   );
 }

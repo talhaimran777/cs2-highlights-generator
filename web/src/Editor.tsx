@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { api, fmtTime, type Clip, type Edits, type Moment, type ProjectView } from './api.ts';
+import { api, fmtTime, locator, type Clip, type Edits, type Moment, type ProjectView } from './api.ts';
 import { applyEdits, subtractRange } from '../../server/edit/edits.ts';
 import { buildSegments, parseFps, PlayerControls, ReelStage, segIndexAt, useReelPlayer } from './reel.tsx';
 
@@ -72,7 +72,7 @@ export function Editor({ p, update, onNext, nextLabel }: { p: ProjectView; updat
   const kindOf = useMemo(() => new Map<string, Moment['kind']>(p.moments.map((m) => [m.id, m.kind])), [p.moments]);
 
   // --- player -------------------------------------------------------------
-  const player = useReelPlayer(segments, fps);
+  const player = useReelPlayer(segments, fps, locator(p));
   const { time, playing, total, seekTo, togglePlay } = player;
 
   // --- edit operations (all in recording time) ----------------------------
@@ -114,9 +114,11 @@ export function Editor({ p, update, onNext, nextLabel }: { p: ProjectView; updat
   const [drag, setDrag] = useState<{ i: number; side: 'start' | 'end'; x0: number; orig: number; rec: number } | null>(null);
   const edgeLimits = (i: number, side: 'start' | 'end') => {
     const s = segments[i];
+    // in clips mode a piece can't grow past the end of the clip file it comes from
+    const [lo, hi] = s.clip.bounds ?? [0, p.video.duration];
     return side === 'start'
-      ? { min: segments[i - 1]?.recEnd ?? 0, max: s.recEnd - MIN_PIECE_S }
-      : { min: s.recStart + MIN_PIECE_S, max: segments[i + 1]?.recStart ?? p.video.duration };
+      ? { min: Math.max(lo, segments[i - 1]?.recEnd ?? 0), max: s.recEnd - MIN_PIECE_S }
+      : { min: s.recStart + MIN_PIECE_S, max: Math.min(hi, segments[i + 1]?.recStart ?? p.video.duration) };
   };
   const onEdgeDown = (e: React.PointerEvent, i: number, side: 'start' | 'end') => {
     if (e.button !== 0) return;
@@ -372,7 +374,7 @@ export function Editor({ p, update, onNext, nextLabel }: { p: ProjectView; updat
         </div>
       </div>
 
-      <ReelStage player={player} src={`/api/projects/${p.id}/media`}>
+      <ReelStage player={player}>
         {cur && <div className="editor-badge">{label(cur.clip)}</div>}
       </ReelStage>
       {player.videoError && (

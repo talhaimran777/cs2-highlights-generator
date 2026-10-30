@@ -115,3 +115,42 @@ describe.skipIf(!checkFfmpeg().ok)('render', () => {
     expect(out.encoding.bitRate! / src.encoding.bitRate!).toBeLessThan(1.3);
   }, 300_000);
 });
+
+describe.skipIf(!checkFfmpeg().ok)('render from several clips (clips mode)', () => {
+  /** a short replay clip with one audio track */
+  async function makeClip(name: string, size: string, fps: number) {
+    const out = join(dir, name);
+    await runFfmpeg([
+      '-f', 'lavfi', '-i', `testsrc2=s=${size}:r=${fps}:d=6`,
+      '-f', 'lavfi', '-i', 'sine=f=440:d=6:sample_rate=48000',
+      '-map', '0:v', '-map', '1:a', '-ac', '2', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', out,
+    ]);
+    return out;
+  }
+
+  it('takes each piece from its own file and conforms a clip of another size and frame rate', async () => {
+    const a = await makeClip('clip-a.mp4', '1280x720', 60);
+    const b = await makeClip('clip-b.mp4', '640x360', 30);
+    const sources = [
+      { path: a, info: probe(a), offset: 0 },
+      { path: b, info: probe(b), offset: probe(a).duration },
+    ];
+    const out = join(dir, 'reel-clips.mp4');
+    const info = { ...sources[0].info, duration: sources[0].info.duration + sources[1].info.duration };
+    await renderReel({
+      videoPath: a,
+      info,
+      clips: [
+        { round: 1, start: 1, end: 4, momentIds: [], label: '' },
+        { round: 2, start: sources[1].offset + 2, end: sources[1].offset + 5, momentIds: [], label: '' },
+      ],
+      cards: new Map([[2, { title: 'ROUND 9', subtitle: '4 – 4' }]]),
+      outPath: out,
+      workDir: join(dir, 'work-clips'),
+      sourceOf: (c) => sources.filter((s) => s.offset <= c.start + 1e-6).at(-1)!,
+    });
+    const r = probe(out);
+    expect([r.width, r.height, r.fps]).toEqual([1280, 720, '60/1']);
+    expect(Math.abs(r.duration - (3 + 1.5 + 3))).toBeLessThan(0.3);
+  }, 300_000);
+});

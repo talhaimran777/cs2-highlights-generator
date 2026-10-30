@@ -1,14 +1,19 @@
-import type { CaptionLine, CaptionSettings, CaptionWord, Clip, Edits, Kill, MatchData, Moment, Settings, SyncModel } from '../../server/types.ts';
+import type { CaptionLine, CaptionSettings, CaptionWord, Clip, Edits, Kill, MatchData, Moment, Settings, Source, SyncModel } from '../../server/types.ts';
 import type { VideoInfo } from '../../server/util/ffmpeg.ts';
 import type { Job } from '../../server/jobs.ts';
 import type { ExportSettings } from '../../server/edit/render.ts';
 
-export type { CaptionLine, CaptionSettings, CaptionWord, Clip, Edits, Kill, Moment, Settings, SyncModel, Job, ExportSettings };
+export type { CaptionLine, CaptionSettings, CaptionWord, Clip, Edits, Kill, Moment, Settings, Source, SyncModel, Job, ExportSettings };
 
 export interface ProjectView {
   id: string;
-  /** 'captions' / 'edit': a recording without a demo, used whole */
-  mode?: 'match' | 'captions' | 'edit';
+  /** 'captions' / 'edit': a recording without a demo, used whole; 'clips': OBS replay clips back to back */
+  mode?: 'match' | 'captions' | 'edit' | 'clips';
+  /** clips mode: the clips, in timeline order */
+  sources?: Source[];
+  analyzeJob: Job | null;
+  /** clips can be read (an Anthropic key is set) */
+  readerAvailable: boolean;
   name: string;
   videoPath: string;
   demoPath: string;
@@ -68,6 +73,9 @@ export const api = {
   create: (videoPath: string, demoPath: string) => req<ProjectView>('POST', '/api/projects', { videoPath, demoPath }),
   createCaptionTest: (videoPath: string) => req<ProjectView>('POST', '/api/projects/captions-test', { videoPath }),
   createEditTest: (videoPath: string) => req<ProjectView>('POST', '/api/projects/edit-test', { videoPath }),
+  createClips: (paths: string[], playerName: string) => req<ProjectView>('POST', '/api/projects/clips', { paths, playerName }),
+  /** reads the unread clips, all of them `again`, or just the clips `ids` */
+  analyze: (id: string, again = false, ids?: string[]) => req<Job>('POST', `/api/projects/${id}/analyze`, { again, ids }),
   get: (id: string) => req<ProjectView>('GET', `/api/projects/${id}`),
   patch: (id: string, body: object) => req<ProjectView>('PATCH', `/api/projects/${id}`, body),
   autoSync: (id: string) => req<Job>('POST', `/api/projects/${id}/sync/auto`),
@@ -92,6 +100,23 @@ export const api = {
 
 export function videoTime(sync: SyncModel, tick: number, round: number) {
   return (sync.roundOffsets[round] ?? sync.offset) + sync.scale * (tick / sync.tickrate);
+}
+
+/** Where a timeline time plays: which file, and how far into it. */
+export interface Located {
+  src: string;
+  /** timeline time where that file starts */
+  offset: number;
+}
+
+/** The project's media for a timeline time: the recording, or in clips mode the clip playing then. */
+export function locator(p: Pick<ProjectView, 'id' | 'sources'>) {
+  const whole = { src: `/api/projects/${p.id}/media`, offset: 0 };
+  const sources = p.sources ?? [];
+  return (t: number): Located => {
+    const s = sources.filter((x) => x.offset <= t + 1e-6).at(-1) ?? sources[0];
+    return s ? { src: `/api/projects/${p.id}/media?source=${s.id}`, offset: s.offset } : whole;
+  };
 }
 
 export function fmtTime(sec: number) {

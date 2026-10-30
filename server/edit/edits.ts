@@ -35,13 +35,13 @@ export function applyEdits(clips: Clip[], edits: Edits | null | undefined): Clip
 
 const TOUCH_S = 1e-3;
 
-/** Grows each clip over the added ranges touching its edges, up to the neighbouring clips. */
+/** Grows each clip over the added ranges touching its edges, up to the neighbouring clips (and its source clip's ends). */
 function extendClips(clips: Clip[], adds: [number, number][]): Clip[] {
   if (adds.length === 0) return clips;
   const out: Clip[] = [];
   clips.forEach((c, i) => {
-    const lo = out.at(-1)?.end ?? 0; // the previous clip, as extended
-    const hi = clips[i + 1]?.start ?? Infinity;
+    const lo = Math.max(out.at(-1)?.end ?? 0, c.bounds?.[0] ?? 0); // the previous clip, as extended
+    const hi = Math.min(clips[i + 1]?.start ?? Infinity, c.bounds?.[1] ?? Infinity);
     let { start, end } = c;
     for (const [a, b] of adds) {
       if (a < start && b >= start - TOUCH_S) start = Math.max(lo, a);

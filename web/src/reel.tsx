@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
-import { fmtTime, type Clip } from './api.ts';
+import { fmtTime, type Clip, type Located } from './api.ts';
 
 // The edited reel played straight from the recording, without rendering:
 // two <video>s take turns, so the jump over a cut (or between clips) doesn't
-// stall. Used by the Edit and Captions steps.
+// stall. Used by the Edit and Captions steps. In clips mode the "recording"
+// is several files back to back; `locate` says which file plays a time.
 
 /** A piece of the reel between two edit points (clip edges, cuts, splits). */
 export interface Segment {
@@ -54,10 +55,27 @@ export const parseFps = (fps: string) => {
 export type ReelPlayer = ReturnType<typeof useReelPlayer>;
 
 /** Playback of the segments: a clock in reel time, seeking, play/pause and preview volume. */
-export function useReelPlayer(segments: Segment[], fps: number) {
+export function useReelPlayer(segments: Segment[], fps: number, locate: (rec: number) => Located) {
   const vidA = useRef<HTMLVideoElement>(null);
   const vidB = useRef<HTMLVideoElement>(null);
   const vid = (i: number) => (i === 0 ? vidA.current : vidB.current);
+  const locateRef = useRef(locate);
+  locateRef.current = locate;
+  /** Shows recording time `rec` in a video, loading the file it's in first if needed. */
+  const place = (v: HTMLVideoElement, rec: number) => {
+    const at = locateRef.current(rec);
+    if (v.dataset.src !== at.src) {
+      v.dataset.src = at.src;
+      v.dataset.offset = String(at.offset);
+      v.src = at.src;
+    }
+    if (Math.abs(v.currentTime - (rec - at.offset)) > 0.02) v.currentTime = rec - at.offset;
+  };
+  /** The recording time a video is at. */
+  const recOf = (v: HTMLVideoElement) => Number(v.dataset.offset ?? 0) + v.currentTime;
+  /** a then b plays on in the same file without a seek */
+  const flows = (a: Segment | undefined, b: Segment | undefined) =>
+    continuous(a, b) && locateRef.current(a!.recStart).src === locateRef.current(b!.recStart).src;
   const active = useRef(0);
   const [activeVid, setActiveVid] = useState(0);
   const segIdx = useRef(0);
@@ -99,9 +117,9 @@ export function useReelPlayer(segments: Segment[], fps: number) {
   const prepare = (from: number) => {
     const segs = segsRef.current;
     let j = from + 1;
-    while (j < segs.length && continuous(segs[j - 1], segs[j])) j++;
+    while (j < segs.length && flows(segs[j - 1], segs[j])) j++;
     const hidden = vid(1 - active.current);
-    if (hidden && segs[j] && Math.abs(hidden.currentTime - segs[j].recStart) > 0.02) hidden.currentTime = segs[j].recStart;
+    if (hidden && segs[j]) place(hidden, segs[j].recStart);
   };
 
   const seekTo = (t: number) => {
@@ -111,7 +129,7 @@ export function useReelPlayer(segments: Segment[], fps: number) {
     const end = segs.at(-1)!.reelEnd;
     t = Math.min(end, Math.max(0, t));
     const i = segIndexAt(segs, t);
-    v.currentTime = segs[i].recStart + (t - segs[i].reelStart);
+    place(v, segs[i].recStart + (t - segs[i].reelStart));
     segIdx.current = i;
     timeRef.current = t;
     setTime(t);
@@ -121,13 +139,13 @@ export function useReelPlayer(segments: Segment[], fps: number) {
   /** Moves playback on to segment i: same video if it's contiguous, otherwise swap to the parked one. */
   const advance = (i: number) => {
     const segs = segsRef.current;
-    if (continuous(segs[segIdx.current], segs[i])) {
+    if (flows(segs[segIdx.current], segs[i])) {
       segIdx.current = i;
       return;
     }
     const cur = vid(active.current)!;
     const next = vid(1 - active.current)!;
-    if (Math.abs(next.currentTime - segs[i].recStart) > 0.02) next.currentTime = segs[i].recStart;
+    place(next, segs[i].recStart);
     next.muted = false;
     cur.muted = true;
     void next.play();
@@ -178,7 +196,7 @@ export function useReelPlayer(segments: Segment[], fps: number) {
       }
       if (playingRef.current) {
         // a frame early: the next check is one animation frame (~16 ms) away
-        if (v.currentTime >= seg.recEnd - Math.max(0.5 / fps, 0.017)) {
+        if (recOf(v) >= seg.recEnd - Math.max(0.5 / fps, 0.017)) {
           if (segIdx.current + 1 >= segs.length) {
             v.pause();
             setPlay(false);
@@ -189,9 +207,9 @@ export function useReelPlayer(segments: Segment[], fps: number) {
           advance(segIdx.current + 1);
           return;
         }
-        if (v.currentTime < seg.recStart - 0.25) return; // still seeking
+        if (recOf(v) < seg.recStart - 0.25) return; // still seeking
       }
-      const t = seg.reelStart + Math.min(seg.recEnd, Math.max(seg.recStart, v.currentTime)) - seg.recStart;
+      const t = seg.reelStart + Math.min(seg.recEnd, Math.max(seg.recStart, recOf(v))) - seg.recStart;
       if (Math.abs(t - timeRef.current) > 1e-4 && (playingRef.current || !v.seeking)) {
         timeRef.current = t;
         setTime(t);
@@ -221,7 +239,7 @@ export function useReelPlayer(segments: Segment[], fps: number) {
     if (playingRef.current) pause();
     peeking.current = true;
     const v = vid(active.current);
-    if (v) v.currentTime = rec;
+    if (v) place(v, rec);
   };
 
   return {
@@ -230,8 +248,11 @@ export function useReelPlayer(segments: Segment[], fps: number) {
   };
 }
 
-/** The two videos stacked, the visible one on top; children are drawn over the picture. */
-export function ReelStage({ player, src, children }: { player: ReelPlayer; src: string; children?: ReactNode }) {
+/**
+ * The two videos stacked, the visible one on top; children are drawn over the picture.
+ * The player loads each video's file (several in clips mode), so no src here.
+ */
+export function ReelStage({ player, children }: { player: ReelPlayer; children?: ReactNode }) {
   return (
     <div className="editor-stage">
       {[player.vidA, player.vidB].map((ref, i) => (
@@ -239,7 +260,6 @@ export function ReelStage({ player, src, children }: { player: ReelPlayer; src: 
           key={i}
           ref={ref}
           className={player.activeVid === i ? 'on' : ''}
-          src={src}
           preload="auto"
           muted={i !== 0}
           playsInline

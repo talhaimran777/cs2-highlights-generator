@@ -1,6 +1,8 @@
 // Shared data model. Everything time-related in the demo is in ticks;
 // everything in the recording is in seconds. sync/ converts between them.
 
+import type { VideoInfo } from './util/ffmpeg.ts';
+
 export type Side = 'T' | 'CT';
 
 export interface Player {
@@ -87,6 +89,10 @@ export interface Moment {
   endTick: number;
   /** played pieces with cuts between them (the intro); default [[startTick, endTick]] */
   segments?: [number, number][];
+  /** clips mode (no demo): first and last kill in timeline seconds, used instead of the ticks */
+  at?: [number, number];
+  /** clips mode: the piece stays inside this timeline range (the round, up to just after my death) */
+  limits?: [number, number];
   enabled: boolean;
   /** manual trim adjustments in seconds, applied after pre/post-roll */
   trimStart: number;
@@ -115,6 +121,51 @@ export interface Clip {
   label: string;
   /** seconds added to keep speech whole: start moved earlier / end moved later */
   speech?: { start: number; end: number };
+  /** clips mode: the source clip's range on the timeline; added footage never crosses it */
+  bounds?: [number, number];
+}
+
+/** One red-outlined kill-feed entry (it involves me), as read from a replay clip. */
+export interface FeedEntry {
+  t: number; // seconds into the source clip
+  kind: 'kill' | 'death' | 'assist';
+  attacker: string;
+  /** the teammate after the "+" (or me, when it's my assist) */
+  assister?: string;
+  victim: string;
+  weapon: string;
+  headshot: boolean;
+}
+
+/** The round timer and score at the top of the HUD at one moment. */
+export interface HudSample {
+  t: number;
+  /** seconds on the round timer; null when it's hidden (bomb planted, round over) or unreadable */
+  timer: number | null;
+  left: number | null;
+  right: number | null;
+}
+
+/** What was read from one replay clip. */
+export interface ClipAnalysis {
+  entries: FeedEntry[];
+  hud: HudSample[];
+  /** source seconds where a new round begins (the score changed or the timer reset) */
+  roundStarts: number[];
+  /** tokens used to read this clip, to keep an eye on the cost */
+  usage: { input: number; output: number };
+}
+
+/** One OBS replay clip of a clips project. The clips play back to back on one timeline. */
+export interface Source {
+  id: string;
+  path: string;
+  name: string;
+  info: VideoInfo;
+  /** where the clip starts on the timeline */
+  offset: number;
+  analysis?: ClipAnalysis | null;
+  error?: string;
 }
 
 /** Cuts made in the editor. Recording seconds, so they survive re-planning the clips. */
@@ -205,6 +256,12 @@ export interface Settings {
   branding: Branding;
   /** kill-feed region as fractions of frame size */
   killfeed: { x: number; y: number; w: number; h: number };
+  /** clips mode: your in-game name, so your kills can be told from your death */
+  playerName: string;
+  /** clips mode: the round timer and score at the top of the HUD, as fractions of frame size */
+  hud: { x: number; y: number; w: number; h: number };
+  /** clips mode: kills further apart than this (seconds) become separate pieces */
+  burstGap: number;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -229,4 +286,7 @@ export const DEFAULT_SETTINGS: Settings = {
     accent: '#9146ff', // Twitch purple
   },
   killfeed: { x: 0.7, y: 0.04, w: 0.3, h: 0.3 },
+  playerName: '',
+  hud: { x: 0.38, y: 0, w: 0.24, h: 0.08 },
+  burstGap: 8,
 };
