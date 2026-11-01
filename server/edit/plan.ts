@@ -93,8 +93,9 @@ export function protectSpeech(
   };
 
   const moved = clips.map((c) => {
-    const start = Math.max(0, moveStart(c.start));
-    const end = Math.min(videoDuration, moveEnd(c.end));
+    // in clips mode a sentence can only finish inside the clip's own file
+    const start = Math.max(0, c.bounds?.[0] ?? 0, moveStart(c.start));
+    const end = Math.min(videoDuration, c.bounds?.[1] ?? Infinity, moveEnd(c.end));
     return { ...c, start, end, speech: { start: c.start - start, end: end - c.end } };
   });
 

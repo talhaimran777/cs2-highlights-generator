@@ -651,8 +651,9 @@ function ExportStep({ p, setP, update }: { p: ProjectView; setP: (p: ProjectView
           </label>
         </div>
         )}
-        {/* a captions test has no cuts to protect; its voice tracks are chosen on the Captions page; clips have no speech detection yet */}
-        {!recordingOnly(p) && p.mode !== 'clips' && <SpeechProtection p={p} setting={setting} update={update} />}
+        {/* a captions test has no cuts to protect; its voice tracks are chosen on the Captions page */}
+        {!recordingOnly(p) && <SpeechProtection p={p} setting={setting} update={update} />}
+        {p.extras && <Engaging p={p} setting={setting} />}
         {p.mode !== 'captions' && <BrandingSection p={p} setting={setting} />}
         <QualityMatch p={p} />
         <label className="field">
@@ -667,7 +668,7 @@ function ExportStep({ p, setP, update }: { p: ProjectView; setP: (p: ProjectView
                 ? `Render with captions (${fmtTime(p.reelDuration)})`
                 : p.mode === 'edit'
                   ? `Render edit (${fmtTime(p.reelDuration)})`
-                : `Render ${p.clips.length} clips (${fmtTime(p.reelDuration)})`}
+                : `Render ${p.clips.length} clips (${fmtTime(p.reelDuration + (p.extras?.seconds ?? 0))})`}
           </button>
           {job?.status === 'running' && (
             <>
@@ -1098,6 +1099,64 @@ function SpeechProtection({
           </button>
         )}
       </div>
+    </div>
+  );
+}
+
+const OVERLAY_SPOTS: { id: ProjectView['settings']['overlayCorner']; label: string }[] = [
+  { id: 'hud', label: 'Beside game score' },
+  { id: 'below', label: 'Under game score' },
+  { id: 'bl', label: 'Bottom left' },
+  { id: 'br', label: 'Bottom right' },
+];
+
+/** Match extras added on export: cold open, score graphic, halftime card, replays, final scoreboard. */
+function Engaging({ p, setting }: { p: ProjectView; setting: (patch: Partial<ProjectView['settings']>) => Promise<void> }) {
+  const st = p.settings;
+  const x = p.extras!;
+  const toggle = (key: 'coldOpen' | 'scoreOverlay' | 'halftimeCard' | 'replays' | 'finalScoreboard', label: string, detail: string) => (
+    <label className="field check">
+      <input type="checkbox" checked={st[key]} onChange={(e) => setting({ [key]: e.target.checked })} />
+      <span>
+        {label} <span className="muted small">{detail}</span>
+      </span>
+    </label>
+  );
+  const s = x.stats;
+  return (
+    <div className="quality">
+      <div className="quality-head">
+        <strong>Make it engaging</strong>
+        <span className="muted small">Added on export{x.seconds > 0 && ` · +${fmtTime(x.seconds)}`}</span>
+      </div>
+      {toggle(
+        'coldOpen',
+        'Cold open',
+        x.coldOpen.length ? `· opens with ${x.coldOpen.map((c) => `R${c.round} ${c.label}`).join(' · ')}` : st.coldOpen ? '· no big moment outside the last round' : '',
+      )}
+      <div className="row wrap">
+        {toggle('scoreOverlay', 'Score graphic', '· map, round and score on the gameplay')}
+        {st.scoreOverlay && (
+          <select className="input narrow" value={st.overlayCorner} onChange={(e) => setting({ overlayCorner: e.target.value as typeof st.overlayCorner })}>
+            {OVERLAY_SPOTS.map((o) => (
+              <option key={o.id} value={o.id}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+        )}
+      </div>
+      {toggle(
+        'halftimeCard',
+        'Half-time card',
+        x.breaks.length ? `· before ${x.breaks.map((b) => `round ${b.round}${b.title === 'OVERTIME' ? ' (overtime)' : ''}`).join(', ')}` : '',
+      )}
+      {toggle('replays', 'Replays', x.replays.length ? `· after ${x.replays.map((r) => `round ${r}`).join(', ')}` : st.replays ? '· no clutch or 4K+ round in the reel' : '')}
+      {toggle(
+        'finalScoreboard',
+        'Final scoreboard',
+        s ? `· ${s.result} ${s.us}–${s.them} · ${s.kills}/${s.deaths}/${s.assists} · ${s.hsPct}% HS` : '',
+      )}
     </div>
   );
 }

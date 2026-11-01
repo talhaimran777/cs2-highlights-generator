@@ -2,7 +2,8 @@ import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, renameSync, rmSync, statSync } from 'node:fs';
 import { join } from 'node:path';
-import { createCanvas, GlobalFonts, loadImage, type Image } from '@napi-rs/canvas';
+import { createCanvas, GlobalFonts, loadImage, type Image, type SKRSContext2D } from '@napi-rs/canvas';
+import type { Mix } from './sfx.ts';
 import { FFMPEG, type VideoInfo } from '../util/ffmpeg.ts';
 import { CAPTION_FONTS, FONTS_DIR } from '../captions/fonts.ts';
 import type { Branding } from '../types.ts';
@@ -16,7 +17,7 @@ const BUMPER_VERSION = 1;
 export const bumperSeconds = (kind: BumperKind) => (kind === 'intro' ? INTRO_SECONDS : OUTRO_SECONDS);
 
 let fontsLoaded = false;
-function loadFonts() {
+export function loadFonts() {
   if (fontsLoaded) return;
   for (const [family, file] of Object.entries(CAPTION_FONTS)) {
     const path = join(FONTS_DIR, file);
@@ -78,27 +79,45 @@ export async function bumperFile(kind: BumperKind, b: Branding, target: BumperTa
 }
 
 async function renderBumper(kind: BumperKind, b: Branding, target: BumperTarget, out: string, signal?: AbortSignal) {
-  loadFonts();
-  const { width: W, height: H } = target;
-  const [num, den] = target.fps.split('/').map(Number);
-  const fps = den ? num / den : num;
-  const seconds = bumperSeconds(kind);
-  const frames = Math.round(seconds * fps);
-
   let avatar: Image | null = null;
   if (kind === 'outro' && b.avatarPath && existsSync(b.avatarPath)) {
     avatar = await loadImage(b.avatarPath).catch(() => null);
   }
+  await renderAnimation(
+    kind === 'intro' ? (g, t, W, H) => drawIntro(g, t, W, H, b) : (g, t, W, H) => drawOutro(g, t, W, H, b, avatar),
+    bumperSeconds(kind),
+    (sampleRate) => (kind === 'intro' ? introSound : outroSound)(sampleRate),
+    target,
+    out,
+    signal,
+  );
+}
+
+/**
+ * Renders a canvas animation into a segment that joins the reel losslessly:
+ * `draw` paints frame time t, `sound` (if any) goes on the first audio track
+ * and the other tracks are silent.
+ */
+export async function renderAnimation(
+  draw: (g: SKRSContext2D, t: number, W: number, H: number) => void,
+  seconds: number,
+  sound: ((sampleRate: number) => Mix) | null,
+  target: BumperTarget,
+  out: string,
+  signal?: AbortSignal,
+) {
+  loadFonts();
+  const { width: W, height: H } = target;
+  const [num, den] = target.fps.split('/').map(Number);
+  const fps = den ? num / den : num;
+  const frames = Math.round(seconds * fps);
 
   // sound effects on the first track (the main mix), silence on the others
   const wav = out.replace(/\.mp4$/, '.wav');
   const first = target.audio[0];
-  if (first) (kind === 'intro' ? introSound : outroSound)(first.sampleRate).writeWav(wav, Math.min(2, first.channels));
-  const audioInputs = target.audio.flatMap((a, i) =>
-    i === 0
-      ? ['-i', wav]
-      : ['-f', 'lavfi', '-i', `anullsrc=r=${a.sampleRate}:cl=${a.channels === 1 ? 'mono' : a.channels === 6 ? '5.1' : 'stereo'}`],
-  );
+  if (first && sound) sound(first.sampleRate).writeWav(wav, Math.min(2, first.channels));
+  const silence = (a: BumperTarget['audio'][number]) => ['-f', 'lavfi', '-i', `anullsrc=r=${a.sampleRate}:cl=${a.channels === 1 ? 'mono' : a.channels === 6 ? '5.1' : 'stereo'}`];
+  const audioInputs = target.audio.flatMap((a, i) => (i === 0 && sound ? ['-i', wav] : silence(a)));
   const maps = ['-map', '0:v', ...target.audio.flatMap((_, i) => ['-map', `${i + 1}:a`])];
   const channels = target.audio.flatMap((a, i) => [`-ac:a:${i}`, String(a.channels)]);
 
@@ -131,12 +150,12 @@ async function renderBumper(kind: BumperKind, b: Branding, target: BumperTarget,
   for (let i = 0; i < frames && !signal?.aborted; i++) {
     const t = i / fps;
     g.setTransform(1, 0, 0, 1, 0, 0);
-    if (kind === 'intro') drawIntro(g, t, W, H, b);
-    else drawOutro(g, t, W, H, b, avatar);
+    draw(g, t, W, H);
     if (!ff.stdin.write(canvas.data())) await Promise.race([new Promise((r) => ff.stdin.once('drain', r)), exited]);
     if (ff.exitCode !== null) break;
   }
   ff.stdin.end();
   const code = await exited;
-  if (code !== 0) throw new Error(`${kind} render failed (${code}): ${stderr.trim()}`);
+  rmSync(wav, { force: true });
+  if (code !== 0) throw new Error(`animation render failed (${code}): ${stderr.trim()}`);
 }

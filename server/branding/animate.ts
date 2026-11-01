@@ -8,24 +8,24 @@ import { Mix } from './sfx.ts';
 export const INTRO_SECONDS = 3.6;
 export const OUTRO_SECONDS = 4.6;
 
-const TITLE_FONT = 'Anton, "Arial Black", sans-serif';
-const ROUND_FONT = '"Poppins ExtraBold", "Arial Black", sans-serif';
+export const TITLE_FONT = 'Anton, "Arial Black", sans-serif';
+export const ROUND_FONT = '"Poppins ExtraBold", "Arial Black", sans-serif';
 
 const clamp = (x: number) => Math.min(1, Math.max(0, x));
-const lerp = (a: number, b: number, x: number) => a + (b - a) * x;
-const easeOutCubic = (x: number) => 1 - (1 - x) ** 3;
+export const lerp = (a: number, b: number, x: number) => a + (b - a) * x;
+export const easeOutCubic = (x: number) => 1 - (1 - x) ** 3;
 const easeInCubic = (x: number) => x ** 3;
 const easeInOut = (x: number) => (x < 0.5 ? 4 * x ** 3 : 1 - (-2 * x + 2) ** 3 / 2);
-const easeOutBack = (x: number, s = 1.7) => 1 + (s + 1) * (x - 1) ** 3 + s * (x - 1) ** 2;
+export const easeOutBack = (x: number, s = 1.7) => 1 + (s + 1) * (x - 1) ** 3 + s * (x - 1) ** 2;
 /** 0 before `from`, 1 after `from + len`. */
-const phase = (t: number, from: number, len: number) => clamp((t - from) / len);
+export const phase = (t: number, from: number, len: number) => clamp((t - from) / len);
 /** Stable pseudo-random numbers for particles, so frames don't flicker. */
 const rand = (i: number) => {
   const x = Math.sin(i * 127.1 + 311.7) * 43758.5453;
   return x - Math.floor(x);
 };
 
-const rgba = (hex: string, a: number) => {
+export const rgba = (hex: string, a: number) => {
   const n = parseInt(hex.replace('#', ''), 16);
   return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${a})`;
 };
@@ -427,7 +427,7 @@ export function drawOutro(g: SKRSContext2D, t: number, W: number, H: number, b: 
   g.restore();
 }
 
-function roundRect(g: SKRSContext2D, x: number, y: number, w: number, h: number, r: number) {
+export function roundRect(g: SKRSContext2D, x: number, y: number, w: number, h: number, r: number) {
   g.beginPath();
   g.moveTo(x + r, y);
   g.arcTo(x + w, y, x + w, y + h, r);

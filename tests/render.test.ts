@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { encodeArgs, exportSettings, renderReel } from '../server/edit/render.ts';
 import { checkFfmpeg, FFPROBE, hasEncoder, probe, runFfmpeg } from '../server/util/ffmpeg.ts';
+import { reelTarget } from '../server/branding/bumper.ts';
+import { SCOREBOARD_SECONDS, scoreboardFile, scoreOverlay } from '../server/branding/match.ts';
 
 const dir = mkdtempSync(join(tmpdir(), 'cs2h-'));
 
@@ -152,5 +154,41 @@ describe.skipIf(!checkFfmpeg().ok)('render from several clips (clips mode)', () 
     const r = probe(out);
     expect([r.width, r.height, r.fps]).toEqual([1280, 720, '60/1']);
     expect(Math.abs(r.duration - (3 + 1.5 + 3))).toBeLessThan(0.3);
+  }, 300_000);
+});
+
+describe.skipIf(!checkFfmpeg().ok)('match extras in the render', () => {
+  it('cold open, score graphic, replay, halftime card and final scoreboard all join into one reel', async () => {
+    const src = join(dir, 'extras-src.mp4');
+    await runFfmpeg([
+      '-f', 'lavfi', '-i', 'testsrc2=s=1280x720:r=30:d=12',
+      '-f', 'lavfi', '-i', 'sine=f=440:d=12:sample_rate=48000',
+      '-f', 'lavfi', '-i', 'sine=f=660:d=12:sample_rate=48000',
+      '-map', '0:v', '-map', '1:a', '-map', '2:a', '-ac', '2', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', src,
+    ]);
+    const info = probe(src);
+    const target = reelTarget(info, encodeArgs(info));
+    const stats = { map: 'ANCIENT', result: 'WIN' as const, us: 13, them: 9, kills: 24, deaths: 15, assists: 6, hsPct: 52, kd: 1.6, multiKillRounds: 4, aces: 1, clutches: 2 };
+    const out = join(dir, 'reel-extras.mp4');
+    await renderReel({
+      videoPath: src,
+      info,
+      clips: [
+        { round: 1, start: 1, end: 3, momentIds: [], label: '' },
+        { round: 2, start: 5, end: 8, momentIds: [], label: '' },
+      ],
+      cards: new Map(),
+      outPath: out,
+      workDir: join(dir, 'work-extras'),
+      coldOpen: [{ round: 2, start: 6, end: 8, momentIds: [], label: '' }],
+      replays: new Map([[2, { round: 2, start: 6.5, end: 8, momentIds: [], label: '' }]]),
+      breaks: new Map([[2, { title: 'HALF TIME', subtitle: 'SWITCHING SIDES' }]]),
+      overlay: (c) => scoreOverlay(`ANCIENT · ROUND ${c.round} · 0 – 0`, info.width, info.height, 'hud', '#9146ff', join(dir, 'overlay')),
+      ending: { dur: SCOREBOARD_SECONDS, file: (signal) => scoreboardFile(stats, '#9146ff', target, join(dir, 'board'), signal) },
+    });
+    const r = probe(out);
+    expect([r.width, r.height, r.fps, r.audio.length]).toEqual([1280, 720, '30/1', 2]);
+    // cold open 2 + clips 2 + 3 + replay 1.5 + half-time card 2.5 + scoreboard 5
+    expect(Math.abs(r.duration - 16)).toBeLessThan(0.4);
   }, 300_000);
 });

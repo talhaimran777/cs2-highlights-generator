@@ -307,6 +307,11 @@ export function ClipsHighlightsStep({
                     ))}
                   </span>
                   <span className="grow" />
+                  {clip?.speech && clip.speech.start + clip.speech.end >= 0.1 && (
+                    <span className="tag speech" title="Cut moved so nobody is cut off mid-sentence">
+                      🎙 +{(clip.speech.start + clip.speech.end).toFixed(1)}s
+                    </span>
+                  )}
                   {m.at && <span className="muted small mono">{fmtTime(m.at[0] - s.offset)}</span>}
                   <span className="trim">
                     <button className="btn btn-xs" title="Start earlier" onClick={() => patchMoments({ [m.id]: { trimStart: m.trimStart - 1 } })}>

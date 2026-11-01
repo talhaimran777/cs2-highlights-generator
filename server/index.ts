@@ -6,7 +6,7 @@ import { cancelJob, getJob, latestJob, startJob } from './jobs.ts';
 import {
   alignProject, analyzeSpeech, autoSync, cleanupProject, baseClipsFor, clipsFor, createProject, createRecordingTest, defaultOutputPath, editCaption, editsOf, getProject, hasPlayer, listProjects,
   BUMPER_CACHE, loadSettings, peaksFile, reelCaptions, renderProject, saveProject, saveSettings, setPlayer, syncAnchors, transcribeProject, type Project,
-  analyzeClips, buildClipMoments, clipsMode, clipsPeaks, createClipsProject,
+  analyzeClips, buildClipMoments, clipsMode, clipsPeaks, createClipsProject, extrasSeconds, matchExtras,
 } from './project.ts';
 import { readerAvailable } from './clips/read.ts';
 import { captionsReady } from './captions/transcribe.ts';
@@ -46,7 +46,17 @@ function load(id: string): Project {
 /** What the UI needs: the project minus heavy fields, plus derived clips. */
 function view(p: Project) {
   const clips = clipsFor(p);
+  const x = matchExtras(p, clips);
+  const inReel = new Set(clips.map((c) => c.round));
   return {
+    // what export adds to a match reel, so the Export page can say so
+    extras: x && {
+      coldOpen: x.coldOpen.map((c) => ({ round: c.round, label: c.label.replace(/^Cold open · /, '') })),
+      replays: [...x.replays.keys()].filter((r) => inReel.has(r)).sort((a, b) => a - b),
+      breaks: [...x.breaks].map(([round, card]) => ({ round, title: card.title })),
+      stats: x.stats,
+      seconds: extrasSeconds(x, clips),
+    },
     ...p,
     clips,
     baseClips: baseClipsFor(p),
@@ -226,6 +236,7 @@ app.post<{ Body: { videoPath: string } }>('/api/projects/edit-test', async (req)
 app.post<{ Body: { paths: string[]; playerName?: string } }>('/api/projects/clips', async (req) => {
   if (req.body.playerName !== undefined) saveSettings({ ...loadSettings(), playerName: req.body.playerName.trim() });
   const p = createClipsProject(req.body.paths ?? []);
+  startSpeechJob(p.id);
   startPeaksJob(p.id);
   return view(p);
 });

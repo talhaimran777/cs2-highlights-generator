@@ -5,9 +5,9 @@ import { findArrivals, parseDemo, scoreRounds } from './demo/parse.ts';
 import { buildMoments } from './demo/moments.ts';
 import { detectKillfeed } from './sync/killfeed.ts';
 import { fitSync, type Anchor } from './sync/align.ts';
-import { planClips, roundCardText } from './edit/plan.ts';
+import { planClips, protectSpeech, roundCardText } from './edit/plan.ts';
 import { applyEdits } from './edit/edits.ts';
-import { encodeArgs, renderReel, type Bookend } from './edit/render.ts';
+import { BREAK_SECONDS, encodeArgs, renderReel, type Bookend } from './edit/render.ts';
 import { bumperFile, bumperSeconds, reelTarget, type BumperKind } from './branding/bumper.ts';
 import { probe, type VideoInfo } from './util/ffmpeg.ts';
 import { detectSpeech, type Speech } from './audio/speech.ts';
@@ -15,6 +15,8 @@ import { DEFAULT_SETTINGS, NO_EDITS, type CaptionLine, type Edits, type Clip, ty
 import { computePeaks, PEAKS_PER_SEC, readPeaks } from './audio/peaks.ts';
 import { analyzeClip } from './clips/analyze.ts';
 import { clipCardText, clipMoments, planSourceClips, roundStartsFrom } from './clips/moments.ts';
+import { breakCards, coldOpenPieces, matchStats, overlayText, replays, sideSwitches } from './edit/extras.ts';
+import { SCOREBOARD_SECONDS, scoreboardFile, scoreOverlay } from './branding/match.ts';
 import { alignLines, transcribe } from './captions/transcribe.ts';
 import { cleanupCaptions, retime } from './captions/cleanup.ts';
 import { buildAss } from './captions/ass.ts';
@@ -337,7 +339,10 @@ export function baseClipsFor(p: Project): Clip[] {
   if (recordingOnly(p)) {
     return [{ round: 0, start: 0, end: p.video.duration, momentIds: [], label: 'Full recording' }];
   }
-  if (clipsMode(p)) return planSourceClips(p.moments, p.sources ?? [], p.settings);
+  if (clipsMode(p)) {
+    const clips = planSourceClips(p.moments, p.sources ?? [], p.settings);
+    return p.speech && p.settings.protectSpeech ? protectSpeech(clips, p.speech, p.settings, p.video.duration) : clips;
+  }
   if (!p.sync) return [];
   return planClips(p.moments, p.sync, p.settings, p.video.duration, p.speech);
 }
@@ -354,8 +359,22 @@ export const peaksFile = (p: Project) => join(DATA_DIR, 'peaks', `${p.id}.u8`);
 export const voiceTracks =(p: Project) => p.settings.voiceTracks ?? p.video.audio.map((_, i) => i);
 
 export async function analyzeSpeech(p: Project, onProgress?: (f: number) => void, signal?: AbortSignal): Promise<Speech> {
-  p.speech = await detectSpeech(p.videoPath, p.video, voiceTracks(p), onProgress, signal);
+  p.speech = clipsMode(p) ? await clipsSpeech(p, onProgress, signal) : await detectSpeech(p.videoPath, p.video, voiceTracks(p), onProgress, signal);
   return p.speech;
+}
+
+/** Speech in every clip, placed on the timeline at the clip's offset. A sentence never runs from one clip into the next. */
+async function clipsSpeech(p: Project, onProgress?: (f: number) => void, signal?: AbortSignal): Promise<Speech> {
+  const tracks = voiceTracks(p);
+  const sources = p.sources ?? [];
+  const out: Speech = { tracks, raw: [], utterances: [] };
+  for (const [i, s] of sources.entries()) {
+    const sp = await detectSpeech(s.path, s.info, tracks.filter((t) => t < s.info.audio.length), (f) => onProgress?.((i + f) / sources.length), signal);
+    const shift = ([a, b]: [number, number]): [number, number] => [a + s.offset, b + s.offset];
+    out.raw.push(...sp.raw.map(shift));
+    out.utterances.push(...sp.utterances.map(shift));
+  }
+  return out;
 }
 
 const overlaps = (a: [number, number], clips: Clip[]) => clips.some((c) => a[1] > c.start && a[0] < c.end);
@@ -420,6 +439,37 @@ export function defaultOutputPath(p: Project) {
   return join(dirname(p.videoPath), `${basename(p.videoPath, extname(p.videoPath))}${suffix}.mp4`);
 }
 
+/**
+ * The extras a match reel gets on export, by setting: cold open, replays,
+ * halftime cards and the final scoreboard. Null for recording tests and clips
+ * (no demo to take them from).
+ */
+export function matchExtras(p: Project, clips = clipsFor(p)) {
+  if (recordingOnly(p) || clipsMode(p) || !p.sync || !hasPlayer(p)) return null;
+  const st = p.settings;
+  const me = st.steamId;
+  const empty = new Map();
+  return {
+    coldOpen: st.coldOpen ? coldOpenPieces(p.moments, p.match, me, p.sync) : [],
+    replays: st.replays ? replays(p.moments, p.match, me, p.sync) : (empty as ReturnType<typeof replays>),
+    breaks: st.halftimeCard ? breakCards(sideSwitches(p.match, me), clips.map((c) => c.round)) : (empty as ReturnType<typeof breakCards>),
+    stats: st.finalScoreboard ? matchStats(p.match, me, p.moments) : null,
+  };
+}
+
+/** Seconds the extras add to the reel (shown with the reel length). */
+export function extrasSeconds(x: ReturnType<typeof matchExtras>, clips: Clip[]) {
+  if (!x) return 0;
+  const rounds = new Set(clips.map((c) => c.round));
+  const len = (c: Clip) => c.end - c.start;
+  return (
+    x.coldOpen.reduce((s, c) => s + len(c), 0) +
+    [...x.replays].filter(([r]) => rounds.has(r)).reduce((s, [, c]) => s + len(c), 0) +
+    x.breaks.size * BREAK_SECONDS +
+    (x.stats ? SCOREBOARD_SECONDS : 0)
+  );
+}
+
 export async function renderProject(p: Project, onProgress?: (f: number) => void, signal?: AbortSignal): Promise<string> {
   if (!p.sync && !recordingOnly(p) && !clipsMode(p)) throw new Error('Sync the recording first');
   const clips = clipsFor(p);
@@ -436,12 +486,23 @@ export async function renderProject(p: Project, onProgress?: (f: number) => void
   const branded = p.mode !== 'captions' && !!b.name.trim();
   const target = reelTarget(p.video, encodeArgs(p.video));
   const bookend = (kind: BumperKind): Bookend => ({ dur: bumperSeconds(kind), file: (signal) => bumperFile(kind, b, target, BUMPER_CACHE, signal) });
+  const x = matchExtras(p, clips);
+  const st = p.settings;
   await renderReel(
     {
       videoPath: p.videoPath, info: p.video, clips, cards, outPath, workDir: join(DATA_DIR, 'work', p.id), captions: clipCaptions(p),
       sourceOf: clipsMode(p) ? (c) => sourceAt(p, c.start) : undefined,
       intro: branded && b.intro ? bookend('intro') : undefined,
       outro: branded && b.outro ? bookend('outro') : undefined,
+      ...(x && {
+        coldOpen: x.coldOpen,
+        replays: x.replays,
+        breaks: x.breaks,
+        overlay: st.scoreOverlay
+          ? (c: Clip) => scoreOverlay(overlayText(p.match, c.round), p.video.width, p.video.height, st.overlayCorner, b.accent, join(BUMPER_CACHE, 'overlay'))
+          : undefined,
+        ending: x.stats ? { dur: SCOREBOARD_SECONDS, file: (signal) => scoreboardFile(x.stats!, b.accent, target, BUMPER_CACHE, signal) } : undefined,
+      }),
     },
     onProgress,
     signal,

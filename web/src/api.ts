@@ -2,6 +2,7 @@ import type { CaptionLine, CaptionSettings, CaptionWord, Clip, Edits, Kill, Matc
 import type { VideoInfo } from '../../server/util/ffmpeg.ts';
 import type { Job } from '../../server/jobs.ts';
 import type { ExportSettings } from '../../server/edit/render.ts';
+import type { MatchStats } from '../../server/edit/extras.ts';
 
 export type { CaptionLine, CaptionSettings, CaptionWord, Clip, Edits, Kill, Moment, Settings, Source, SyncModel, Job, ExportSettings };
 
@@ -12,6 +13,14 @@ export interface ProjectView {
   /** clips mode: the clips, in timeline order */
   sources?: Source[];
   analyzeJob: Job | null;
+  /** match reels: what export adds (cold open, replays, halftime, final scoreboard); null without a demo */
+  extras: {
+    coldOpen: { round: number; label: string }[];
+    replays: number[];
+    breaks: { round: number; title: string }[];
+    stats: MatchStats | null;
+    seconds: number;
+  } | null;
   /** clips can be read (an Anthropic key is set) */
   readerAvailable: boolean;
   name: string;

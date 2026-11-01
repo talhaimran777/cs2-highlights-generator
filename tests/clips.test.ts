@@ -3,6 +3,7 @@ import { bursts, clipCardText, clipMoments, lastRoundKills, planSourceClips, rou
 import { classify, newEntries, parseTimer, sameName, whoIsMe, type RawEntry } from '../server/clips/read.ts';
 import { feedShotTimes } from '../server/clips/analyze.ts';
 import { applyEdits } from '../server/edit/edits.ts';
+import { protectSpeech } from '../server/edit/plan.ts';
 import { DEFAULT_SETTINGS, type ClipAnalysis, type FeedEntry, type HudSample, type Source } from '../server/types.ts';
 
 const kill = (t: number, extra: Partial<FeedEntry> = {}): FeedEntry => ({ t, kind: 'kill', attacker: 'me', victim: `v${t}`, weapon: 'ak47', headshot: false, ...extra });
@@ -117,6 +118,17 @@ describe('clip moments and pieces', () => {
     expect(clips.map((c) => [c.round, c.start, c.end])).toEqual([[1, 115, 120], [2, 120, 123]]);
     const edited = applyEdits(clips, { cuts: [], splits: [], adds: [[100, 130]] });
     expect(edited.map((c) => [c.start, c.end])).toEqual([[100, 120], [120, 130]]);
+  });
+
+  it('cuts wait for a sentence to finish, but only inside the clip\'s own file', () => {
+    const first = source('a', 0, analysis([kill(50), kill(116)]), 120);
+    const second = source('b', 120, analysis([kill(3)]), 120);
+    const sources = [first, second];
+    const clips = planSourceClips(sources.flatMap((s, i) => clipMoments(s, i, settings)), sources, settings);
+    // talking over the end of the first piece, past the end of the first clip, and over the start of the second clip
+    const speech = { raw: [[50, 56], [115, 120], [120, 121]] as [number, number][], utterances: [[50, 56], [115, 120], [120, 121]] as [number, number][] };
+    const out = protectSpeech(clips, speech, { speechMaxWait: 8, mergeGap: 1.5 }, 240);
+    expect(out.map((c) => [c.start, c.end])).toEqual([[47, 56.25], [113, 120], [120, 125]]);
   });
 
   it('a disabled burst is left out', () => {

@@ -262,6 +262,19 @@ export interface Settings {
   hud: { x: number; y: number; w: number; h: number };
   /** clips mode: kills further apart than this (seconds) become separate pieces */
   burstGap: number;
+  // match reels: extras that keep viewers watching
+  /** open with ~15 s of the match's best moments, before the intro */
+  coldOpen: boolean;
+  /** small map / round / score graphic on the gameplay */
+  scoreOverlay: boolean;
+  /** where it sits: next to the game's scoreboard, under it, or a bottom corner */
+  overlayCorner: 'hud' | 'below' | 'bl' | 'br';
+  /** "HALF TIME · SWITCHING SIDES" card when sides switch */
+  halftimeCard: boolean;
+  /** zoomed replay after a won clutch or a 4K / ACE round */
+  replays: boolean;
+  /** my final scoreboard before the outro */
+  finalScoreboard: boolean;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -289,4 +302,10 @@ export const DEFAULT_SETTINGS: Settings = {
   playerName: '',
   hud: { x: 0.38, y: 0, w: 0.24, h: 0.08 },
   burstGap: 8,
+  coldOpen: true,
+  scoreOverlay: true,
+  overlayCorner: 'hud',
+  halftimeCard: true,
+  replays: true,
+  finalScoreboard: true,
 };
