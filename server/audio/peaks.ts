@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { FFMPEG, type VideoInfo } from '../util/ffmpeg.ts';
+import { audioTracksArgs, FFMPEG, type VideoInfo } from '../util/ffmpeg.ts';
 
 const SAMPLE_RATE = 8000;
 /** waveform buckets per second of recording */
@@ -23,10 +23,7 @@ export async function computePeaks(
   const total = Math.ceil(info.duration * PEAKS_PER_SEC);
   const peaks = new Uint8Array(total + PEAKS_PER_SEC);
   if (n > 0) {
-    const audio =
-      n === 1
-        ? ['-map', '0:a:0']
-        : ['-filter_complex', `${info.audio.map((_, i) => `[0:a:${i}]`).join('')}amix=inputs=${n}:normalize=0[a]`, '-map', '[a]'];
+    const audio = audioTracksArgs(info.audio.map((_, i) => i));
     const ff = spawn(
       FFMPEG,
       ['-hide_banner', '-loglevel', 'error', '-i', videoPath, '-vn', ...audio, '-ac', '1', '-ar', String(SAMPLE_RATE), '-f', 'f32le', '-'],
@@ -38,6 +35,8 @@ export async function computePeaks(
       ff.on('error', reject);
       ff.on('close', resolve);
     });
+    // a cancel rejects this while the samples are still being read; it's awaited after, so don't let it crash the server meanwhile
+    exited.catch(() => {});
 
     let i = 0; // bucket
     let inBucket = 0;

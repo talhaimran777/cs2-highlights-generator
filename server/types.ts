@@ -57,6 +57,18 @@ export interface Round {
   score: { us: number; them: number } | null;
 }
 
+export type UtilityKind = 'smoke' | 'flash' | 'he' | 'molotov' | 'decoy';
+
+/** A grenade thrown; for a flash, the enemies it blinded. */
+export interface UtilityThrow {
+  tick: number;
+  round: number;
+  player: string | null;
+  kind: UtilityKind;
+  /** enemies blinded for at least a second (flashes only) */
+  blinded: number;
+}
+
 export interface MatchData {
   demoPath: string;
   map: string;
@@ -66,6 +78,8 @@ export interface MatchData {
   kills: Kill[];
   bombs: BombEvent[];
   combat: CombatEvent[];
+  /** grenades thrown (missing in projects parsed before it was read) */
+  utility?: UtilityThrow[];
 }
 
 /** Where I ended up after leaving spawn, per round. */
@@ -75,7 +89,7 @@ export interface RoundIntro {
   place: string;
 }
 
-export type MomentKind = 'intro' | 'kills' | 'clutch' | 'bomb' | 'assist' | 'team' | 'decider' | 'death' | 'funny';
+export type MomentKind = 'intro' | 'kills' | 'clutch' | 'bomb' | 'assist' | 'team' | 'decider' | 'death' | 'funny' | 'fight' | 'utility';
 
 export interface Moment {
   id: string;
@@ -123,6 +137,8 @@ export interface Clip {
   speech?: { start: number; end: number };
   /** clips mode: the source clip's range on the timeline; added footage never crosses it */
   bounds?: [number, number];
+  /** a looping short's seam: this edge runs straight on in the recording, so its sound isn't faded there */
+  seamless?: 'start' | 'end';
 }
 
 /** One red-outlined kill-feed entry (it involves me), as read from a replay clip. */
@@ -179,6 +195,46 @@ export interface Edits {
 }
 
 export const NO_EDITS: Edits = { cuts: [], splits: [], adds: [] };
+
+/** A region of the frame, as fractions of its size. */
+export interface Rect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+/** Where a short's two bands come from: the facecam on top, gameplay below. */
+export interface ShortLayout {
+  camera: Rect;
+  gameplay: Rect;
+  /** the camera band's share of the short's height */
+  split: number;
+}
+
+/** One of my kills, for a short's own kill feed; `at` is timeline seconds. */
+export interface FeedKill {
+  at: number;
+  attacker: string;
+  victim: string;
+  weapon: string;
+  headshot: boolean;
+  wallbang?: boolean;
+  noscope?: boolean;
+  throughSmoke?: boolean;
+  attackerSide?: Side | null;
+  victimSide?: Side | null;
+}
+
+/** A vertical (9:16) short of one round, cut and edited on its own. */
+export interface Short {
+  id: string;
+  /** game round (demo) or clip number (clips mode), as in Clip.round */
+  round: number;
+  layout: ShortLayout;
+  edits: Edits;
+  outputPath: string | null;
+}
 
 /** A transcribed word, in recording seconds; `text` is what's shown (English or Roman Urdu). */
 export interface CaptionWord {
@@ -250,6 +306,8 @@ export interface Settings {
   protectSpeech: boolean;
   /** longest a cut waits for a sentence to finish before taking a breath pause */
   speechMaxWait: number;
+  /** a pause between words shorter than this (seconds) is still the same sentence */
+  sentenceGap: number;
   /** audio tracks that carry voice (mic / Discord); null = all tracks */
   voiceTracks: number[] | null;
   captions: CaptionSettings;
@@ -262,6 +320,43 @@ export interface Settings {
   hud: { x: number; y: number; w: number; h: number };
   /** clips mode: kills further apart than this (seconds) become separate pieces */
   burstGap: number;
+  /** the last layout used for a short; new shorts start from it (the facecam doesn't move between recordings) */
+  shortLayout: ShortLayout;
+  /** captions in a short: size and position in the vertical frame (the rest comes from `captions`) */
+  shortCaptions: Pick<CaptionSettings, 'sizePct' | 'positionPct'>;
+  /**
+   * a short's own kill feed: my kills listed as they happen, so they can be seen
+   * on a phone (the game's feed is cropped out). Top of the feed as % of the
+   * frame height; null = just under the camera.
+   */
+  shortKillfeed: {
+    enabled: boolean;
+    positionPct: number | null;
+    /** size against the default (1 = 100 %) */
+    scale: number;
+    /** which side of the short the rows line up on */
+    align: 'left' | 'center' | 'right';
+  };
+  /**
+   * a picture laid over every short (a "follow me" badge, a logo), placed by
+   * dragging it in the preview. x / y (its top-left corner) and w are fractions
+   * of the short's frame; its height follows the picture's own shape.
+   */
+  shortOverlay: {
+    enabled: boolean;
+    path: string;
+    x: number;
+    y: number;
+    w: number;
+    /** lined up on a side or exactly centred (kept while resizing); 'free' = where it was dragged (x) */
+    align: 'free' | 'left' | 'center' | 'right';
+  };
+  /**
+   * a short that loops: it's cut `lead` seconds before the final kill and the
+   * part from there to the end moved to the front, so it opens on the payoff
+   * and its end runs straight (same footage, no transition) into its start
+   */
+  shortLoop: { enabled: boolean; lead: number };
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -273,6 +368,7 @@ export const DEFAULT_SETTINGS: Settings = {
   titleCards: true,
   protectSpeech: true,
   speechMaxWait: 8,
+  sentenceGap: 1,
   voiceTracks: null,
   captions: { enabled: true, style: 'pop', font: 'Montserrat Black', sizePct: 7, positionPct: 70, uppercase: true, wordsPerCaption: 2, pauseS: 0.7, cleanup: true },
   branding: {
@@ -289,4 +385,15 @@ export const DEFAULT_SETTINGS: Settings = {
   playerName: '',
   hud: { x: 0.38, y: 0, w: 0.24, h: 0.08 },
   burstGap: 8,
+  // a bottom-left facecam and the middle of the frame, each at its band's aspect (1080x672 / 1080x1248 of a 1920x1080 source)
+  shortLayout: {
+    camera: { x: 0, y: 0.65, w: 0.3, h: 0.332 },
+    gameplay: { x: 0.256, y: 0, w: 0.487, h: 1 },
+    split: 0.35,
+  },
+  shortCaptions: { sizePct: 4, positionPct: 35 },
+  shortKillfeed: { enabled: true, positionPct: null, scale: 1, align: 'right' },
+  // near the bottom, most of the width: where a "follow me" badge usually sits
+  shortOverlay: { enabled: true, path: '', x: 0.1, y: 0.8, w: 0.8, align: 'center' },
+  shortLoop: { enabled: true, lead: 1 },
 };

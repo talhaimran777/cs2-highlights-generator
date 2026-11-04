@@ -15,13 +15,56 @@ export interface RenderInput {
   cards: Map<number, { title: string; subtitle: string }>;
   outPath: string;
   workDir: string;
-  /** ASS subtitles to burn into a clip (times relative to the clip), or null */
-  captions?: (clip: Clip) => string | null;
+  /** ASS subtitles to burn into a clip (times relative to the clip), or null; several are layered in order */
+  captions?: (clip: Clip) => string | null | (string | null)[];
   /** channel intro / outro, rendered with the same settings as the clips */
   intro?: Bookend;
   outro?: Bookend;
   /** several files on one timeline (clips mode): the file a clip comes from and where it starts */
   sourceOf?: (clip: Clip) => { path: string; info: VideoInfo; offset: number };
+  /**
+   * A different output frame (a vertical short): its size, and the filter graph
+   * that makes it from a source's video ([0:v] in, its last chain's output out).
+   */
+  frame?: { width: number; height: number; graph: (src: VideoInfo) => string; overlays?: (clip: Clip) => Overlay[] };
+}
+
+/** A picture laid over a clip from `from` seconds into it (sliding in when that's inside the clip), in output pixels. */
+export interface Overlay {
+  file: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  from: number;
+  /** where it slides in from: +1 the right (default), -1 the left, 0 it only fades in */
+  slide?: number;
+}
+
+const SLIDE_S = 0.18;
+
+/** The clip's sound faded in and out at its cuts; not at a seamless edge (a looping short's seam). */
+function afade(clip: Clip, dur: number, fade: number): string[] {
+  const parts = [
+    ...(clip.seamless === 'start' ? [] : [`afade=t=in:d=${fade}`]),
+    ...(clip.seamless === 'end' ? [] : [`afade=t=out:st=${(dur - fade).toFixed(3)}:d=${fade}`]),
+  ];
+  return parts.length ? ['-af', parts.join(',')] : [];
+}
+
+/** ffmpeg inputs and graph that lay the overlays (inputs 1..n) over `[in]`, ending in `[out]`. */
+export function overlayGraph(overlays: Overlay[], fps: string): { inputs: string[]; graph: string } {
+  const inputs = overlays.flatMap((o) => ['-loop', '1', '-framerate', fps, '-i', o.file]);
+  const steps = overlays.map((o, n) => {
+    const from = Math.max(0, o.from).toFixed(3);
+    const slides = o.from > 0;
+    const pic = `[${n + 1}:v]scale=${o.w}:${o.h}:flags=lanczos,format=rgba${slides ? `,fade=t=in:st=${from}:d=${SLIDE_S}:alpha=1` : ''}[p${n}]`;
+    const dist = Math.round(o.h * 1.2) * (o.slide ?? 1);
+    const x = slides && dist ? `'${o.x}+max(0\\,${from}+${SLIDE_S}-t)/${SLIDE_S}*(${dist})'` : String(o.x);
+    const lay = `[${n ? `o${n - 1}` : 'in'}][p${n}]overlay=x=${x}:y=${o.y}:enable='gte(t\\,${from})'${n === overlays.length - 1 ? '[out]' : `[o${n}]`}`;
+    return `${pic};${lay}`;
+  });
+  return { inputs, graph: steps.join(';') };
 }
 
 /** A ready-made segment added before or after the reel. */
@@ -142,7 +185,9 @@ export async function renderReel(
   onProgress?: (fraction: number) => void,
   signal?: AbortSignal,
 ): Promise<string> {
-  const { info, clips, workDir } = input;
+  const { clips, workDir, frame } = input;
+  // the output: the source's settings, at the frame's size when there is one
+  const info = frame ? { ...input.info, width: frame.width, height: frame.height } : input.info;
   rmSync(workDir, { recursive: true, force: true });
   mkdirSync(workDir, { recursive: true });
 
@@ -164,30 +209,40 @@ export async function renderReel(
     }
     const dur = clip.end - clip.start;
     const fade = Math.min(0.1, dur / 4);
-    const ass = input.captions?.(clip) ?? null;
+    const subs = [input.captions?.(clip) ?? null].flat().filter((s): s is string => !!s);
     plan.push({
       kind: 'clip',
       dur,
       run: (out, prog) => {
-        const src = input.sourceOf?.(clip) ?? { path: input.videoPath, info, offset: 0 };
+        const src = input.sourceOf?.(clip) ?? { path: input.videoPath, info: input.info, offset: 0 };
         const filters: string[] = [];
         // a clip recorded at another size or frame rate is conformed, so the lossless join still works
-        if (src.info.width !== info.width || src.info.height !== info.height) {
+        if (!frame && (src.info.width !== info.width || src.info.height !== info.height)) {
           filters.push(`scale=${info.width}:${info.height}:force_original_aspect_ratio=decrease`, `pad=${info.width}:${info.height}:(ow-iw)/2:(oh-ih)/2`, 'setsar=1');
         }
         if (src.info.fps !== info.fps) filters.push(`fps=${info.fps}`);
         // captions are burned in while the clip is encoded anyway
-        if (ass) {
-          const assFile = out.replace(/\.mp4$/, '.ass');
+        subs.forEach((ass, n) => {
+          const assFile = out.replace(/\.mp4$/, n ? `.${n}.ass` : '.ass');
           writeFileSync(assFile, ass);
           filters.push(`ass='${filterPath(assFile)}':fontsdir='${filterPath(FONTS_DIR)}'`);
-        }
+        });
+        // pictures over the frame (a short's kill-feed entries), under the captions
+        const over = frame?.overlays?.(clip) ?? [];
+        const lay = over.length ? overlayGraph(over, info.fps) : null;
+        const tail = `${filters.map((f, i) => `${i ? ',' : ''}${f}`).join('') || 'null'}[v]`;
         return runFfmpeg(
           [
-            '-ss', (clip.start - src.offset).toFixed(3), '-i', src.path, '-t', dur.toFixed(3),
-            '-map', '0:v:0', '-map', '0:a?',
-            ...(filters.length ? ['-vf', filters.join(',')] : []),
-            '-af', `afade=t=in:d=${fade},afade=t=out:st=${(dur - fade).toFixed(3)}:d=${fade}`,
+            '-ss', (clip.start - src.offset).toFixed(3), '-i', src.path, ...(lay?.inputs ?? []), '-t', dur.toFixed(3),
+            ...(frame
+              ? [
+                  '-filter_complex',
+                  lay ? `${frame.graph(src.info)}[in];${lay.graph};[out]${tail}` : `${frame.graph(src.info)},${tail}`,
+                  '-map', '[v]', '-map', '0:a?',
+                ]
+              : ['-map', '0:v:0', '-map', '0:a?', ...(filters.length ? ['-vf', filters.join(',')] : [])]),
+            // a short fade at each cut, except where a looping short's seam runs straight on
+            ...afade(clip, dur, fade),
             ...common, out,
           ],
           prog,

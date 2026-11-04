@@ -188,6 +188,116 @@ describe('round intro', () => {
     expect(m.map((x) => x.kind)).toEqual(['decider']);
   });
 
+  it('no kill, death or plant of mine: my damage fights still count, with an opening', () => {
+    const m = buildMoments(
+      {
+        ...match([kill(s(170), 1, 'm2', 'e2')]),
+        players: [{ steamId: 'e1', name: 'Enemy' }],
+        combat: [
+          { tick: s(120), attacker: ME, victim: 'm2' }, // a teammate (a nade): not a fight
+          { tick: s(139), attacker: ME, victim: null }, // shooting first
+          { tick: s(140), attacker: ME, victim: 'e1' },
+          { tick: s(141), attacker: 'e1', victim: ME },
+          { tick: s(142), attacker: 'e1', victim: ME },
+        ],
+      },
+      ME,
+    );
+    expect(m.map((x) => [x.kind, x.label, x.startTick, x.endTick])).toEqual([
+      ['intro', 'Round start', s(100), s(139)],
+      ['fight', 'Fight vs Enemy · 1 hit, took 2', s(139), s(143)],
+      // after my fight, my teammates' fights are told
+      ['team', 'Teammates · m2 killed e2', s(170), s(170)],
+    ]);
+  });
+
+  it('a round with my kill still shows an exchange where nobody died', () => {
+    const m = buildMoments(
+      {
+        ...match([kill(s(160), 1, ME, 'e2')]),
+        players: [{ steamId: 'e1', name: 'Enemy' }],
+        combat: [
+          { tick: s(130), attacker: ME, victim: 'e1' }, // traded shots, both walked away
+          { tick: s(131), attacker: 'e1', victim: ME },
+          { tick: s(156), attacker: ME, victim: 'e2' }, // part of the kill: shown there
+          { tick: s(159), attacker: ME, victim: 'e2' },
+        ],
+      },
+      ME,
+    );
+    expect(m.filter((x) => x.kind === 'fight').map((x) => [x.label, x.startTick, x.endTick])).toEqual([
+      ['Fight vs Enemy · 1 hit, took 1', s(130), s(132)],
+    ]);
+    // the opening now leads into that first fight
+    expect(m[0]).toMatchObject({ kind: 'intro', endTick: s(130) });
+  });
+
+  it('fights whose lead-in reaches back into the one before are one fight', () => {
+    const m = buildMoments(
+      {
+        ...match([]),
+        combat: [
+          { tick: s(140), attacker: ME, victim: null },
+          { tick: s(143), attacker: ME, victim: 'e1' },
+          { tick: s(146), attacker: ME, victim: null }, // still shooting
+          { tick: s(149), attacker: 'e2', victim: ME }, // 6 s after the hit, but the shots join them
+        ],
+      },
+      ME,
+    );
+    expect(m.filter((x) => x.kind === 'fight').map((x) => [x.label, x.startTick, x.endTick])).toEqual([
+      ['Fight vs someone, someone · 1 hit, took 1', s(140), s(150)],
+    ]);
+  });
+
+  it('my grenades: close throws are one piece, flashes count who they blinded, the opening leads in', () => {
+    const u = (sec: number, kind: 'smoke' | 'flash' | 'he' | 'molotov' | 'decoy', blinded = 0, player = ME) => ({ tick: s(sec), round: 1, player, kind, blinded });
+    const m = buildMoments(
+      {
+        ...match([kill(s(170), 1, ME, 'e1')]),
+        utility: [
+          u(120, 'smoke'),
+          u(123, 'flash', 2),
+          u(126, 'flash', 0),
+          u(140, 'molotov'),
+          u(141, 'smoke', 0, 'm2'), // a teammate's
+        ],
+      },
+      ME,
+    );
+    expect(m.map((x) => [x.kind, x.label, x.startTick, x.endTick])).toEqual([
+      ['intro', 'Round start', s(100), s(120)],
+      ['utility', 'Smoke + 2 Flashes · blinded 2', s(120), s(128)],
+      ['utility', 'Molotov', s(140), s(142)],
+      ['kills', 'Kill · ak47', s(170), s(170)],
+    ]);
+  });
+
+  it('grenades after I die are not mine to show', () => {
+    const m = buildMoments(
+      { ...match([kill(s(150), 1, 'e1', ME)]), utility: [{ tick: s(160), round: 1, player: ME, kind: 'he', blinded: 0 }] },
+      ME,
+    );
+    expect(m.some((x) => x.kind === 'utility')).toBe(false);
+  });
+
+  it('a round of only grenades still shows my fights', () => {
+    const m = buildMoments(
+      {
+        ...match([]),
+        utility: [{ tick: s(120), round: 1, player: ME, kind: 'smoke', blinded: 0 }],
+        combat: [{ tick: s(150), attacker: ME, victim: 'e1' }],
+      },
+      ME,
+    );
+    expect(m.map((x) => x.kind)).toEqual(['intro', 'utility', 'fight']);
+  });
+
+  it('only team damage: the round stays quiet', () => {
+    const m = buildMoments({ ...match([]), combat: [{ tick: s(120), attacker: ME, victim: 'm2' }] }, ME);
+    expect(m).toEqual([]);
+  });
+
   it('after I die: teammates fights, grouped by 5 s', () => {
     const m = buildMoments(
       match([
@@ -234,7 +344,7 @@ describe('round intro', () => {
     expect(m.filter((x) => x.kind === 'team')).toEqual([]);
   });
 
-  it('when I survive: no teammate clips; others bomb plays only after my last action', () => {
+  it('when I survive: teammates fights after my last action; others bomb plays only after it', () => {
     const m = buildMoments(
       {
         ...match([kill(s(130), 1, ME, 'e1'), kill(s(150), 1, 'm2', 'e2')]),
@@ -249,8 +359,31 @@ describe('round intro', () => {
     expect(m.map((x) => [x.kind, x.label])).toEqual([
       ['intro', 'Round start'],
       ['kills', 'Kill · ak47'],
+      ['team', 'Teammates · m2 killed e2'],
       // the defuse is the round end, so no separate round-end clip
       ['bomb', 'Defused · Buddy'],
+    ]);
+  });
+
+  it('my plant, then I survive: teammates fights and the explosion end the round', () => {
+    const m = buildMoments(
+      {
+        ...match([kill(s(110), 1, 'm2', 'e1'), kill(s(150), 1, 'm3', 'e2'), kill(s(160), 1, 'e3', 'm3')]),
+        rounds: [round(1, 100, 200, 'CT')],
+        bombs: [
+          { tick: s(130), round: 1, kind: 'planted', player: ME, site: 'A' },
+          // the demo credits the explosion to the planter
+          { tick: s(200), round: 1, kind: 'exploded', player: ME, site: '' },
+        ],
+      },
+      ME,
+    );
+    expect(m.map((x) => [x.kind, x.label])).toEqual([
+      ['intro', 'Round start'],
+      ['bomb', 'Plant (A)'], // m2's kill before it isn't mine to follow
+      ['team', 'Teammates · m3 killed e2'],
+      ['team', 'Teammates · e3 killed m3'],
+      ['decider', 'Bomb exploded'],
     ]);
   });
 

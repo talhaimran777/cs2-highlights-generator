@@ -124,6 +124,7 @@ async function renderBumper(kind: BumperKind, b: Branding, target: BumperTarget,
     ff.on('error', reject);
     ff.on('close', resolve);
   });
+  exited.catch(() => {}); // a cancel rejects this mid-loop; it's awaited after, so don't let it crash the server meanwhile
   ff.stdin.on('error', () => {}); // ffmpeg failing early closes the pipe; the exit code reports it
 
   const canvas = createCanvas(W, H);

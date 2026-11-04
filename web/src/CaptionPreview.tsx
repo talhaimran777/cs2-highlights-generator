@@ -62,7 +62,7 @@ export function CaptionPreview({ p, control }: { p: ProjectView; control: Mutabl
 }
 
 /** The on-screen captions over time (recording seconds), grouped exactly like the export. */
-function captionChunks(lines: CaptionLine[], maxWords: number, maxChars: number, pauseS: number) {
+export function captionChunks(lines: CaptionLine[], maxWords: number, maxChars: number, pauseS: number) {
   const chunks = [...lines]
     .sort((a, b) => a.start - b.start)
     .flatMap((l) => chunkWords(l.words.filter((w) => w.text.trim()), maxWords, maxChars, pauseS));
@@ -73,7 +73,7 @@ function captionChunks(lines: CaptionLine[], maxWords: number, maxChars: number,
 }
 
 /** Word pop: only the word being said is lit. Karaoke: everything said so far. Clean: nothing. */
-function wordClass(style: string, w: CaptionWord, words: CaptionWord[], rec: number) {
+export function wordClass(style: string, w: CaptionWord, words: CaptionWord[], rec: number) {
   if (style === 'clean') return '';
   const spoken = words.filter((x) => x.start <= rec);
   if (style === 'karaoke') return w.start <= rec ? 'active' : '';

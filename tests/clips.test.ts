@@ -3,6 +3,7 @@ import { bursts, clipCardText, clipMoments, lastRoundKills, planSourceClips, rou
 import { classify, newEntries, parseTimer, sameName, whoIsMe, type RawEntry } from '../server/clips/read.ts';
 import { feedShotTimes } from '../server/clips/analyze.ts';
 import { applyEdits } from '../server/edit/edits.ts';
+import { protectSpeech } from '../server/edit/plan.ts';
 import { DEFAULT_SETTINGS, type ClipAnalysis, type FeedEntry, type HudSample, type Source } from '../server/types.ts';
 
 const kill = (t: number, extra: Partial<FeedEntry> = {}): FeedEntry => ({ t, kind: 'kill', attacker: 'me', victim: `v${t}`, weapon: 'ak47', headshot: false, ...extra });
@@ -88,6 +89,18 @@ describe('bursts', () => {
 });
 
 describe('clip moments and pieces', () => {
+  it("cuts wait for a sentence to finish, but only inside the clip's own file", () => {
+    const first = source('a', 0, analysis([kill(50), kill(116)]), 120);
+    const second = source('b', 120, analysis([kill(3)]), 120);
+    const sources = [first, second];
+    const clips = planSourceClips(sources.flatMap((s, i) => clipMoments(s, i, settings)), sources, settings);
+    // talking over the end of the first piece, past the end of the first clip, and over the start of the second clip
+    const speech = { raw: [[50, 56], [115, 120], [120, 121]] as [number, number][], utterances: [[50, 56], [115, 120], [120, 121]] as [number, number][] };
+    const out = protectSpeech(clips, speech, { speechMaxWait: 8, mergeGap: 1.5, sentenceGap: 1 }, 240);
+    expect(clips.map((c) => [c.start, c.end])).toEqual([[47, 52], [113, 118], [120, 125]]);
+    expect(out.map((c) => [c.start, c.end])).toEqual([[47, 56.4], [113, 120], [120, 125]]);
+  });
+
   it('one moment per burst, pieces with pre/post-roll on the timeline', () => {
     const a = analysis([kill(50, { headshot: true }), kill(53), kill(80)], [30]);
     const src = source('a', 200, a);
@@ -185,8 +198,10 @@ describe('kill-feed entries', () => {
     const out = newEntries([
       { t: 10, entries: [e('me', 'a')] },
       { t: 13, entries: [e('me', 'a'), e('me', 'b')] },
-      { t: 60, entries: [e('me', 'a')] }, // same names much later: another round
+      { t: 15, entries: [e('me', 'a'), e('me', 'b')] },
+      // same names after the entry went away: another kill (Clip 24's two "M"s 16 s apart)
+      { t: 31, entries: [e('me', 'a')] },
     ]);
-    expect(out.map((x) => [x.t, x.victim])).toEqual([[10, 'a'], [13, 'b'], [60, 'a']]);
+    expect(out.map((x) => [x.t, x.victim])).toEqual([[10, 'a'], [13, 'b'], [31, 'a']]);
   });
 });

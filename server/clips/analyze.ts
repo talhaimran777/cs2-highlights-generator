@@ -1,7 +1,7 @@
 import { mkdirSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { detectKillfeed, SAMPLE_FPS } from '../sync/killfeed.ts';
-import { runFfmpeg, type VideoInfo } from '../util/ffmpeg.ts';
+import { cropRect, runFfmpeg, type VideoInfo } from '../util/ffmpeg.ts';
 import type { ClipAnalysis, Settings } from '../types.ts';
 import { readClip, type Shot } from './read.ts';
 import { roundStartsFrom } from './moments.ts';
@@ -25,11 +25,9 @@ type Region = Settings['killfeed'];
 
 /** crop + scale for a region of the frame (even sizes, as encoders and scalers like them) */
 function cropFilter(info: VideoInfo, r: Region, width: number) {
-  const even = (n: number) => Math.max(2, Math.floor(n / 2) * 2);
-  const cw = even(info.width * r.w);
-  const ch = even(info.height * r.h);
-  const w = Math.min(width, cw);
-  return `crop=${cw}:${ch}:${Math.floor(info.width * r.x)}:${Math.floor(info.height * r.y)},scale=${w}:-2:flags=lanczos`;
+  const crop = cropRect(info, r);
+  const w = Math.min(width, Number(crop.split(/[=:]/)[1]));
+  return `${crop},scale=${w}:-2:flags=lanczos`;
 }
 
 /**

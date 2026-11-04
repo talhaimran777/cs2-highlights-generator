@@ -32,19 +32,19 @@ describe('utterances', () => {
 });
 
 const clip = (round: number, start: number, end: number, id = `${round}-${start}`): Clip => ({ round, start, end, momentIds: [id], label: id });
-const settings = { speechMaxWait: 8, mergeGap: 1.5 };
+const settings = { speechMaxWait: 8, mergeGap: 1.5, sentenceGap: 1 };
 
 describe('speech-safe cuts', () => {
   it('a cut mid-sentence waits for the sentence to end', () => {
     const out = protectSpeech([clip(1, 10, 20)], { raw: [[18, 23]], utterances: [[18, 23]] }, settings, 100);
-    expect(out[0].end).toBeCloseTo(23.25);
-    expect(out[0].speech!.end).toBeCloseTo(3.25);
+    expect(out[0].end).toBeCloseTo(23.4);
+    expect(out[0].speech!.end).toBeCloseTo(3.4);
   });
 
-  it('a long monologue is cut at the first breath pause within 8 s', () => {
+  it('a long monologue is cut at the longest pause within 8 s', () => {
     const raw: [number, number][] = [[15, 22], [22.3, 26], [26.4, 40]];
     const out = protectSpeech([clip(1, 10, 20)], { raw, utterances: [[15, 40]] }, settings, 100);
-    expect(out[0].end).toBeCloseTo(22.15); // middle of the 22.0–22.3 pause
+    expect(out[0].end).toBeCloseTo(26.2); // middle of the 26.0–26.4 pause, longer than the 22.0–22.3 one
   });
 
   it('no pause at all: cut at the 8 s limit', () => {
@@ -54,7 +54,19 @@ describe('speech-safe cuts', () => {
 
   it('a clip that would start mid-sentence starts with the sentence', () => {
     const out = protectSpeech([clip(1, 30, 40)], { raw: [[27, 32]], utterances: [[27, 32]] }, settings, 100);
-    expect(out[0].start).toBeCloseTo(26.8);
+    expect(out[0].start).toBeCloseTo(26.2); // 0.8 s of room before the first word
+  });
+
+  it('speech starting right after the start gets the same room', () => {
+    const out = protectSpeech([clip(1, 30, 40)], { raw: [[30.3, 32]], utterances: [[30.3, 32]] }, settings, 100);
+    expect(out[0].start).toBeCloseTo(29.5);
+    expect(out[0].speech!.start).toBeCloseTo(0.5);
+  });
+
+  it('the room never reaches back into the sentence before', () => {
+    // the sentence before ends 1.2 s earlier: start halfway into that gap
+    const out = protectSpeech([clip(1, 30, 40)], { raw: [[25, 25.8], [27, 32]], utterances: [[25, 25.8], [27, 32]] }, settings, 100);
+    expect(out[0].start).toBeCloseTo(26.4);
   });
 
   it('cuts outside speech are left alone', () => {
@@ -65,6 +77,20 @@ describe('speech-safe cuts', () => {
   it('clips of a round that now touch become one, so no tiny cut remains', () => {
     const out = protectSpeech([clip(1, 10, 20, 'a'), clip(1, 24, 30, 'b')], { raw: [[19, 23]], utterances: [[19, 23]] }, settings, 100);
     expect(out.map((c) => [c.start, c.end, c.momentIds])).toEqual([[10, 30, ['a', 'b']]]);
+  });
+
+  it('a thinking pause between words does not end the sentence: the cut waits through it', () => {
+    // speech detection split the sentence at a 0.7 s pause: 15–20.3 and 21–24
+    const speech = { raw: [[15, 20.3], [21, 24]] as [number, number][], utterances: [[15, 20.3], [21, 24]] as [number, number][] };
+    expect(protectSpeech([clip(1, 10, 20)], speech, settings, 100)[0].end).toBeCloseTo(24.4);
+    // a cut landing right in the pause waits too
+    expect(protectSpeech([clip(1, 10, 20.6)], speech, settings, 100)[0].end).toBeCloseTo(24.4);
+  });
+
+  it('a long pause (over the sentence gap) is a real end', () => {
+    const speech = { raw: [[15, 20.3], [22, 24]] as [number, number][], utterances: [[15, 20.3], [22, 24]] as [number, number][] };
+    expect(protectSpeech([clip(1, 10, 20)], speech, settings, 100)[0].end).toBeCloseTo(20.7);
+    expect(protectSpeech([clip(1, 10, 21)], speech, settings, 100)[0].end).toBe(21);
   });
 
   it('rounds never overlap after extending', () => {

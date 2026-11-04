@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { FFMPEG, runFfmpeg } from '../util/ffmpeg.ts';
+import { audioTracksArgs, FFMPEG, runFfmpeg } from '../util/ffmpeg.ts';
 import { romanize } from './romanize.ts';
 import { mergeEnglish, soundKey, type TimedWord } from './merge.ts';
 import { retime, spreadWords } from './cleanup.ts';
@@ -125,9 +125,7 @@ export function audioSpans(utterances: [number, number][]): [number, number][] {
 
 /** The voice track(s) as 16 kHz mono, decoded only around the given ranges (not the whole recording). */
 async function decodeVoice(videoPath: string, ranges: [number, number][], tracks: number[], workDir: string, onProgress?: (f: number) => void, signal?: AbortSignal) {
-  const audio = tracks.length <= 1
-    ? ['-map', `0:a:${tracks[0] ?? 0}`]
-    : ['-filter_complex', `${tracks.map((t) => `[0:a:${t}]`).join('')}amix=inputs=${tracks.length}:normalize=0[v]`, '-map', '[v]'];
+  const audio = audioTracksArgs(tracks.length ? tracks : [0]);
   // nearby ranges share one seek-and-decode
   const spans = audioSpans(ranges);
   const pcmPath = join(workDir, 'voice.s16');

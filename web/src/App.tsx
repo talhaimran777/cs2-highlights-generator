@@ -4,6 +4,7 @@ import { FilePicker } from './FilePicker.tsx';
 import { AnalyzeStep, ClipsForm, ClipsHighlightsStep } from './Clips.tsx';
 import { Progress } from './ui.tsx';
 import { Editor } from './Editor.tsx';
+import { CreateShortButton, ShortScreen } from './Short.tsx';
 import { BrandingSection } from './Branding.tsx';
 import { CaptionPreview, type CaptionPreviewControl } from './CaptionPreview.tsx';
 
@@ -31,18 +32,20 @@ const CLIPS_STEPS: { id: Step; label: string }[] = [
 const recordingOnly = (p: Pick<ProjectView, 'mode'>) => p.mode === 'captions' || p.mode === 'edit';
 
 const KIND_LABEL: Record<Moment['kind'], string> = {
-  intro: 'Opening', clutch: 'Clutch', kills: 'Kills', bomb: 'Bomb', assist: 'Assist', team: 'Teammates', decider: 'Round end', funny: 'Funny', death: 'Death',
+  intro: 'Opening', clutch: 'Clutch', kills: 'Kills', bomb: 'Bomb', assist: 'Assist', team: 'Teammates', decider: 'Round end', funny: 'Funny', death: 'Death', fight: 'Fight', utility: 'Utility',
 };
 const FULL_ROUND_HINT =
   'Opening: your rotation to your spot (shortened if long) and a few seconds of holding, leading into first contact. Untick to start the round at your first fight.';
 
 export function App() {
-  const [projectId, setProjectId] = useState(() => location.hash.slice(1));
+  // #<project> or #<project>/short/<short>
+  const [route, setRoute] = useState(() => location.hash.slice(1));
   useEffect(() => {
-    const onHash = () => setProjectId(location.hash.slice(1));
+    const onHash = () => setRoute(location.hash.slice(1));
     addEventListener('hashchange', onHash);
     return () => removeEventListener('hashchange', onHash);
   }, []);
+  const [projectId, , shortId] = route.split('/');
 
   return (
     <div className="app">
@@ -52,7 +55,7 @@ export function App() {
         </a>
         <Health />
       </header>
-      {projectId ? <ProjectScreen id={projectId} /> : <Home />}
+      {projectId && shortId ? <ShortScreen key={route} id={projectId} sid={shortId} /> : projectId ? <ProjectScreen id={projectId} /> : <Home />}
     </div>
   );
 }
@@ -305,7 +308,13 @@ function ProjectScreen({ id }: { id: string }) {
           {step === 'analyze' && <AnalyzeStep p={p} setP={setP} update={update} onNext={() => setStep('highlights')} />}
           {step === 'highlights' &&
             (clips ? (
-              <ClipsHighlightsStep p={p} update={update} play={playRange} onNext={() => setStep('edit')} />
+              <ClipsHighlightsStep
+                p={p}
+                update={update}
+                play={playRange}
+                onNext={() => setStep('edit')}
+                speech={<SpeechProtection p={p} setting={(patch) => update(() => api.patch(p.id, { settings: patch }))} update={update} />}
+              />
             ) : (
               <HighlightsStep p={p} update={update} preview={preview} onNext={() => setStep('edit')} />
             ))}
@@ -386,6 +395,21 @@ function SyncStep({ p, setP, update, preview, onNext }: { p: ProjectView; setP: 
 
   return (
     <>
+      {p.video.audio.length > 1 && (
+        <section className="card">
+          <h2>Your mic track</h2>
+          <p className="muted">
+            Tick the track with your voice (and Discord too, if your teammates' talking should never be cut either). Cuts then wait for those sentences to
+            finish. Pause the preview where you're talking and press Listen to hear each track on its own.
+          </p>
+          <VoiceTrackPicker
+            p={p}
+            setting={(patch) => update(() => api.patch(p.id, { settings: patch }))}
+            update={update}
+            at={() => preview.ref.current?.currentTime ?? 0}
+          />
+        </section>
+      )}
       <section className="card">
         <h2>Line up the demo with your recording</h2>
         <p className="muted">
@@ -539,6 +563,7 @@ function HighlightsStep({ p, update, preview, onNext }: { p: ProjectView; update
                 </span>
               )}
               {r.roster[me] && <span className="muted small">{r.roster[me]}</span>}
+              {p.shortRounds.includes(r.num) && <CreateShortButton p={p} round={r.num} />}
               <span className="grow" />
               {moments.length > 0 && p.sync && (
                 <span className="nudge">
@@ -651,8 +676,8 @@ function ExportStep({ p, setP, update }: { p: ProjectView; setP: (p: ProjectView
           </label>
         </div>
         )}
-        {/* a captions test has no cuts to protect; its voice tracks are chosen on the Captions page; clips have no speech detection yet */}
-        {!recordingOnly(p) && p.mode !== 'clips' && <SpeechProtection p={p} setting={setting} update={update} />}
+        {/* a captions test has no cuts to protect; its voice tracks are chosen on the Captions page */}
+        {!recordingOnly(p) && <SpeechProtection p={p} setting={setting} update={update} />}
         {p.mode !== 'captions' && <BrandingSection p={p} setting={setting} />}
         <QualityMatch p={p} />
         <label className="field">
@@ -1027,6 +1052,86 @@ function CaptionCleanup({
   );
 }
 
+/** a track this quiet (bits/s) is almost certainly unused */
+const SILENT_TRACK_BPS = 8000;
+
+/**
+ * Which audio tracks carry voice. Each can be heard on its own (a few seconds
+ * from `at`, default the start) to find the mic. Ticking only changes the
+ * choice; "Find speech" saves it and detects speech on just those tracks.
+ */
+function VoiceTrackPicker({
+  p,
+  setting,
+  update,
+  at,
+}: {
+  p: ProjectView;
+  setting: (patch: Partial<ProjectView['settings']>) => Promise<void>;
+  update: Update;
+  /** where to listen from (the preview's position) */
+  at?: () => number;
+}) {
+  const saved = p.settings.voiceTracks ?? p.video.audio.map((_, i) => i);
+  const [tracks, setTracks] = useState(saved);
+  const savedKey = saved.join(',');
+  useEffect(() => setTracks(saved), [savedKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  const changed = tracks.join(',') !== savedKey;
+  // a new choice is saved (the server then detects speech on it); the same choice is detected again
+  const findSpeech = () => (changed ? setting({ voiceTracks: tracks }) : update(async () => (await api.detectSpeech(p.id), api.get(p.id))));
+  const audio = useRef<HTMLAudioElement>(null);
+  const [playing, setPlaying] = useState<number | null>(null);
+  const listen = (i: number) => {
+    const a = audio.current;
+    if (!a) return;
+    if (playing === i) {
+      a.pause();
+      setPlaying(null);
+      return;
+    }
+    a.src = `/api/projects/${p.id}/track/${i}?at=${(at?.() ?? 0).toFixed(1)}`;
+    void a.play();
+    setPlaying(i);
+  };
+  const job = p.speechJob;
+  return (
+    <div className="voice-tracks">
+      {p.video.audio.map((t, i) => (
+        <div key={i} className="row small">
+          <label className="row">
+            <input
+              type="checkbox"
+              checked={tracks.includes(i)}
+              onChange={(e) => setTracks(e.target.checked ? [...tracks, i].sort() : tracks.filter((x) => x !== i))}
+            />
+            <strong>Track {i + 1}</strong>
+            {t.title && t.title !== `Track${i + 1}` && <span className="muted">{t.title}</span>}
+            {t.bitRate !== null && t.bitRate < SILENT_TRACK_BPS && <span className="muted">· nearly silent</span>}
+          </label>
+          <button className="btn btn-xs" onClick={() => listen(i)}>
+            {playing === i ? '■ Stop' : '▶ Listen'}
+          </button>
+        </div>
+      ))}
+      <audio ref={audio} onEnded={() => setPlaying(null)} />
+      <div className="row small">
+        {tracks.length === 0 ? (
+          <span className="muted">Tick the tracks with voice, then find speech on them</span>
+        ) : (
+          <button className={`btn btn-sm ${changed ? 'btn-primary' : ''}`} disabled={job?.status === 'running'} onClick={findSpeech}>
+            Find speech on {tracks.length === 1 ? `track ${tracks[0] + 1}` : `tracks ${tracks.map((t) => t + 1).join(', ')}`}
+          </button>
+        )}
+        {job?.status === 'running' ? (
+          <span className="muted">Finding speech… {Math.round(job.progress * 100)}%</span>
+        ) : changed ? (
+          <span className="muted">Not used yet: press the button to find speech on your new choice</span>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 /** Keeps cuts out of sentences: status of speech detection, toggle, max wait, voice tracks. */
 function SpeechProtection({
   p,
@@ -1041,7 +1146,6 @@ function SpeechProtection({
   const job = p.speechJob;
   const running = job?.status === 'running';
   const held = p.clips.filter((c) => c.speech && c.speech.start + c.speech.end >= 0.1);
-  const tracks = st.voiceTracks ?? p.video.audio.map((_, i) => i);
   const status = running
     ? `Detecting speech… ${Math.round(job.progress * 100)}%`
     : p.speech
@@ -1074,22 +1178,21 @@ function SpeechProtection({
           />
           <span className="muted">s</span>
         </label>
+        <label className="row small" title="Thinking pauses between words: a pause shorter than this doesn't end the sentence, so the cut waits">
+          <span className="muted">pauses under</span>
+          <input
+            className="input narrow"
+            type="number"
+            min={0.4}
+            max={3}
+            step={0.1}
+            value={st.sentenceGap}
+            onChange={(e) => setting({ sentenceGap: Number(e.target.value) })}
+          />
+          <span className="muted">s don’t end a sentence</span>
+        </label>
       </div>
-      {p.video.audio.length > 1 && (
-        <div className="row wrap small">
-          <span className="muted">Voice tracks:</span>
-          {p.video.audio.map((_, i) => (
-            <label key={i} className="row">
-              <input
-                type="checkbox"
-                checked={tracks.includes(i)}
-                onChange={(e) => setting({ voiceTracks: e.target.checked ? [...tracks, i].sort() : tracks.filter((t) => t !== i) })}
-              />
-              Track {i + 1}
-            </label>
-          ))}
-        </div>
-      )}
+      {p.video.audio.length > 1 && <VoiceTrackPicker p={p} setting={setting} update={update} />}
       <div className="row small">
         <span className={job?.status === 'error' ? 'error' : 'muted'}>{status}</span>
         {!running && (

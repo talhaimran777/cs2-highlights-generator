@@ -5,13 +5,13 @@ import { findArrivals, parseDemo, scoreRounds } from './demo/parse.ts';
 import { buildMoments } from './demo/moments.ts';
 import { detectKillfeed } from './sync/killfeed.ts';
 import { fitSync, type Anchor } from './sync/align.ts';
-import { planClips, roundCardText } from './edit/plan.ts';
+import { planClips, protectSpeech, roundCardText } from './edit/plan.ts';
 import { applyEdits } from './edit/edits.ts';
 import { encodeArgs, renderReel, type Bookend } from './edit/render.ts';
 import { bumperFile, bumperSeconds, reelTarget, type BumperKind } from './branding/bumper.ts';
-import { probe, type VideoInfo } from './util/ffmpeg.ts';
+import { imageSize, probe, type VideoInfo } from './util/ffmpeg.ts';
 import { detectSpeech, type Speech } from './audio/speech.ts';
-import { DEFAULT_SETTINGS, NO_EDITS, type CaptionLine, type Edits, type Clip, type MatchData, type Moment, type RoundIntro, type Settings, type Source, type SyncModel } from './types.ts';
+import { DEFAULT_SETTINGS, NO_EDITS, type CaptionLine, type Edits, type Clip, type MatchData, type Moment, type RoundIntro, type FeedKill, type Settings, type Short, type Source, type SyncModel } from './types.ts';
 import { computePeaks, PEAKS_PER_SEC, readPeaks } from './audio/peaks.ts';
 import { analyzeClip } from './clips/analyze.ts';
 import { clipCardText, clipMoments, planSourceClips, roundStartsFrom } from './clips/moments.ts';
@@ -19,9 +19,14 @@ import { alignLines, transcribe } from './captions/transcribe.ts';
 import { cleanupCaptions, retime } from './captions/cleanup.ts';
 import { buildAss } from './captions/ass.ts';
 import { resolveFont } from './captions/fonts.ts';
+import { loopOrder, matchShortClips, matchShortKills, matchShortRounds, SHORT_GAP_S, SHORT_MIN_KILLS, sourceShortClips, sourceShortKills, sourceShortRounds } from './shorts/plan.ts';
+import { feedImageRect, feedTopPct, fitFeedScale, killfeedAss, slideFrom } from './shorts/killfeed.ts';
+import { grabFeedEntries } from './shorts/feedgrab.ts';
+import { fitLayout, overlayRect, shortFrame } from './shorts/layout.ts';
+import { shortGraph } from './shorts/render.ts';
 
 /** Bump when parsing/moments change in a way saved projects should pick up. */
-const PROJECT_VERSION = 12;
+const PROJECT_VERSION = 16;
 
 export const DATA_DIR = resolve(process.env.CS2H_DATA ?? 'data');
 const PROJECTS_DIR = join(DATA_DIR, 'projects');
@@ -58,6 +63,8 @@ export interface Project {
   /** cuts made in the editor */
   edits?: Edits;
   outputPath: string | null;
+  /** vertical shorts made from single rounds */
+  shorts?: Short[];
 }
 
 export function loadSettings(): Settings {
@@ -67,7 +74,15 @@ export function loadSettings(): Settings {
 
 /** Settings saved before a field existed get its default (caption settings too). */
 export function withDefaults(s: Partial<Settings>): Settings {
-  return { ...DEFAULT_SETTINGS, ...s, captions: { ...DEFAULT_SETTINGS.captions, ...s.captions } };
+  return {
+    ...DEFAULT_SETTINGS,
+    ...s,
+    captions: { ...DEFAULT_SETTINGS.captions, ...s.captions },
+    shortCaptions: { ...DEFAULT_SETTINGS.shortCaptions, ...s.shortCaptions },
+    shortKillfeed: { ...DEFAULT_SETTINGS.shortKillfeed, ...s.shortKillfeed },
+    shortOverlay: { ...DEFAULT_SETTINGS.shortOverlay, ...s.shortOverlay },
+    shortLoop: { ...DEFAULT_SETTINGS.shortLoop, ...s.shortLoop },
+  };
 }
 
 export function saveSettings(s: Settings) {
@@ -293,6 +308,8 @@ export function createProject(videoPath: string, demoPath: string): Project {
     killfeedEvents: null,
     outputPath: null,
   };
+  // several audio tracks: the voice tracks are ticked in Sync, none to begin with
+  if (p.video.audio.length > 1) p.settings = { ...p.settings, voiceTracks: [] };
   if (settings.steamId) analyzePlayer(p);
   saveProject(p);
   return p;
@@ -337,7 +354,10 @@ export function baseClipsFor(p: Project): Clip[] {
   if (recordingOnly(p)) {
     return [{ round: 0, start: 0, end: p.video.duration, momentIds: [], label: 'Full recording' }];
   }
-  if (clipsMode(p)) return planSourceClips(p.moments, p.sources ?? [], p.settings);
+  if (clipsMode(p)) {
+    const clips = planSourceClips(p.moments, p.sources ?? [], p.settings);
+    return p.speech && p.settings.protectSpeech ? protectSpeech(clips, p.speech, p.settings, p.video.duration) : clips;
+  }
   if (!p.sync) return [];
   return planClips(p.moments, p.sync, p.settings, p.video.duration, p.speech);
 }
@@ -348,13 +368,30 @@ export const clipsFor = (p: Project): Clip[] => applyEdits(baseClipsFor(p), p.ed
 export const editsOf = (p: Project): Edits => p.edits ?? NO_EDITS;
 
 /** Cached waveform of the whole recording, for the editor's timeline. */
-// not under work/<id>: rendering clears that folder
-export const peaksFile = (p: Project) => join(DATA_DIR, 'peaks', `${p.id}.u8`);
+// not under work/<id>: rendering clears that folder.
+// v2: older waveforms of 6-track recordings went flat after ~12 min (see audioTracksArgs); the new name redraws them
+export const peaksFile = (p: Project) => join(DATA_DIR, 'peaks', `${p.id}.v2.u8`);
 
 export const voiceTracks =(p: Project) => p.settings.voiceTracks ?? p.video.audio.map((_, i) => i);
 
+/** Speech in every clip, placed on the timeline at the clip's offset. */
+async function clipsSpeech(p: Project, onProgress?: (f: number) => void, signal?: AbortSignal): Promise<Speech> {
+  const tracks = voiceTracks(p);
+  const sources = p.sources ?? [];
+  const out: Speech = { tracks, raw: [], utterances: [] };
+  for (const [i, s] of sources.entries()) {
+    const own = tracks.filter((t) => t < s.info.audio.length);
+    const sp = await detectSpeech(s.path, s.info, own, (f) => onProgress?.((i + f) / sources.length), signal);
+    const shift = ([a, b]: [number, number]): [number, number] => [a + s.offset, b + s.offset];
+    out.raw.push(...sp.raw.map(shift));
+    out.utterances.push(...sp.utterances.map(shift));
+  }
+  return out;
+}
+
 export async function analyzeSpeech(p: Project, onProgress?: (f: number) => void, signal?: AbortSignal): Promise<Speech> {
-  p.speech = await detectSpeech(p.videoPath, p.video, voiceTracks(p), onProgress, signal);
+  if (voiceTracks(p).length === 0) throw new Error('Tick your voice tracks in the Sync step first');
+  p.speech = clipsMode(p) ? await clipsSpeech(p, onProgress, signal) : await detectSpeech(p.videoPath, p.video, voiceTracks(p), onProgress, signal);
   return p.speech;
 }
 
@@ -418,6 +455,117 @@ export function defaultOutputPath(p: Project) {
   if (clipsMode(p)) return join(dirname(p.videoPath), `${basename(dirname(p.videoPath))}_highlights.mp4`);
   const suffix = p.mode === 'captions' ? '_captions' : p.mode === 'edit' ? '_edited' : '_highlights';
   return join(dirname(p.videoPath), `${basename(p.videoPath, extname(p.videoPath))}${suffix}.mp4`);
+}
+
+// --- shorts -----------------------------------------------------------------
+
+/** Rounds with enough of my kills for a short (clip numbers in clips mode). */
+export function shortRounds(p: Project): number[] {
+  if (clipsMode(p)) return sourceShortRounds(p.sources ?? []);
+  if (recordingOnly(p) || !p.sync || !hasPlayer(p)) return [];
+  return matchShortRounds(p.match, p.settings.steamId);
+}
+
+/** A short's round cut to its fights, before the short's own edits. */
+export function baseShortClips(p: Project, round: number): Clip[] {
+  const clips = clipsMode(p)
+    ? (p.sources?.[round - 1] ? sourceShortClips(p.sources[round - 1], round) : [])
+    : p.sync
+      ? matchShortClips(p.match, p.settings.steamId, p.sync, round, p.video.duration)
+      : [];
+  // a sentence isn't cut in half here either; pieces it joins up merge
+  return p.speech && p.settings.protectSpeech ? protectSpeech(clips, p.speech, { ...p.settings, mergeGap: SHORT_GAP_S }, p.video.duration) : clips;
+}
+
+export const shortClipsFor = (p: Project, s: Short): Clip[] => applyEdits(baseShortClips(p, s.round), s.edits);
+
+/** Cut-out kill-feed entries, cached per project. */
+export const feedImagesDir = (p: Project) => join(DATA_DIR, 'killfeed', p.id);
+
+/** The game's own kill-feed entry for each kill (sorted by time), or null where it wasn't found. */
+export function shortFeedImages(p: Project, kills: FeedKill[], signal?: AbortSignal) {
+  const sourceOf = (t: number) => (clipsMode(p) ? sourceAt(p, t) : { path: p.videoPath, info: p.video, offset: 0 });
+  return grabFeedEntries(kills, sourceOf, p.settings.killfeed, feedImagesDir(p), signal);
+}
+
+/** My kills in a short's round, for its kill feed. */
+export function shortKills(p: Project, round: number): FeedKill[] {
+  if (clipsMode(p)) return p.sources?.[round - 1] ? sourceShortKills(p.sources[round - 1]) : [];
+  return p.sync ? matchShortKills(p.match, p.settings.steamId, p.sync, round) : [];
+}
+
+export const findShort = (p: Project, id: string) => p.shorts?.find((s) => s.id === id) ?? null;
+
+/** The round's short, made on first use from the last layout used. */
+export function createShort(p: Project, round: number): Short {
+  const existing = p.shorts?.find((s) => s.round === round);
+  if (existing) return existing;
+  if (!shortRounds(p).includes(round)) throw new Error(`Round ${round} has fewer than ${SHORT_MIN_KILLS} kills`);
+  const s: Short = { id: `r${round}`, round, layout: fitLayout(loadSettings().shortLayout, p.video), edits: { ...NO_EDITS }, outputPath: null };
+  p.shorts = [...(p.shorts ?? []), s];
+  return s;
+}
+
+export function defaultShortPath(p: Project, s: Short) {
+  return defaultOutputPath(p).replace(/(_highlights|_captions|_edited)?\.mp4$/, `_short_r${s.round}.mp4`);
+}
+
+/** Renders a short: the source's codec, bitrate and frame rate, at 9:16, captions placed for the vertical frame, no cards or bumpers. */
+export async function renderShort(p: Project, s: Short, onProgress?: (f: number) => void, signal?: AbortSignal): Promise<string> {
+  const edited = shortClipsFor(p, s);
+  if (edited.length === 0) throw new Error('Nothing left in this short');
+  // a looping short opens on its final kill and ends right before it (pieces reordered, nothing re-encoded)
+  const clips = shortLoopOrder(p, s, edited) ?? edited;
+  const frame = shortFrame(p.video);
+  const caps = { ...p.settings.captions, ...p.settings.shortCaptions };
+  const lines = (p.transcript ?? []).filter((l) => !l.removed);
+  const font = caps.enabled && lines.length ? resolveFont(caps.font) : '';
+  const feed = p.settings.shortKillfeed;
+  const kills = feed.enabled ? shortKills(p, s.round) : [];
+  const sortedKills = [...kills].sort((a, b) => a.at - b.at); // the order rows (and images) are in
+  const feedTop = feedTopPct(feed.positionPct, s.layout.split);
+  // the game's own entries where they can be found; the others are drawn
+  const images = kills.length ? await shortFeedImages(p, kills, signal) : [];
+  const feedScale = fitFeedScale(images, frame, feed.scale);
+  const over = p.settings.shortOverlay;
+  const badge = over.enabled && over.path && existsSync(over.path) ? imageSize(over.path) : null;
+  const outPath = s.outputPath ?? defaultShortPath(p, s);
+  await renderReel(
+    {
+      videoPath: p.videoPath, info: p.video, clips, cards: new Map(), outPath,
+      // its own folder: rendering clears it, and the reel may be rendering at the same time
+      workDir: join(DATA_DIR, 'work', `${p.id}-short-${s.id}`),
+      // the kill feed under the captions, should they meet
+      captions: (c) => [
+        kills.length ? killfeedAss(kills, c, frame, feedTop, (i) => !images[i], feedScale, feed.align) : null,
+        font ? buildAss(lines, c, frame, caps, font) : null,
+      ],
+      sourceOf: clipsMode(p) ? (c) => sourceAt(p, c.start) : undefined,
+      frame: {
+        ...frame,
+        graph: (src) => shortGraph(s.layout, src, frame),
+        overlays: (c) => [
+          ...images.flatMap((img, i) => {
+            const at = sortedKills[i].at;
+            return img && at < c.end
+              ? [{ file: img.file, from: at - c.start, slide: slideFrom(feed.align), ...feedImageRect(img, i, frame, feedTop, feedScale, feed.align) }]
+              : [];
+          }),
+          // the badge / logo, up the whole time, over the kill feed
+          ...(badge ? [{ file: over.path, from: 0, ...overlayRect(over, badge, frame) }] : []),
+        ],
+      },
+    },
+    onProgress,
+    signal,
+  );
+  return outPath;
+}
+
+/** The short's pieces in loop order (see loopOrder), or null when it doesn't loop (off, or no kill left to cut before). */
+export function shortLoopOrder(p: Project, s: Short, clips = shortClipsFor(p, s)): Clip[] | null {
+  const l = p.settings.shortLoop;
+  return l.enabled ? loopOrder(clips, shortKills(p, s.round), l.lead) : null;
 }
 
 export async function renderProject(p: Project, onProgress?: (f: number) => void, signal?: AbortSignal): Promise<string> {

@@ -1,4 +1,4 @@
-import type { Kill, MatchData, Moment, MomentKind, Round, RoundIntro } from '../types.ts';
+import type { Kill, MatchData, Moment, MomentKind, Round, RoundIntro, UtilityKind } from '../types.ts';
 
 const CHAIN_GAP_S = 10; // own kills closer than this become one multi-kill clip
 const TEAM_FIGHT_GAP_S = 5; // teammate kills/deaths closer than this are one fight
@@ -18,13 +18,29 @@ const HOLD_KEEP_S = 4;
 //    chained back through gaps shorter than CONTACT_GAP_S.
 const CONTACT_GAP_S = 5;
 const CONTACT_LOOKBACK_S = 12;
+// Fights nobody died in still count: hits I dealt or took, closer than this,
+// are one fight. Hits already inside a kill, death or other play of mine are
+// shown there.
+const FIGHT_GAP_S = 5;
+const FIGHT_TAIL_S = 1;
+// My grenades: throws closer than this are one piece, which runs on until
+// they land / pop.
+const UTILITY_GAP_S = 5;
+const UTILITY_LAND_S = 2;
+const UTILITY_NAME: Record<UtilityKind, [string, string]> = {
+  smoke: ['Smoke', 'Smokes'],
+  flash: ['Flash', 'Flashes'],
+  he: ['HE', 'HEs'],
+  molotov: ['Molotov', 'Molotovs'],
+  decoy: ['Decoy', 'Decoys'],
+};
 const MULTI_BONUS: Record<number, number> = { 2: 5, 3: 15, 4: 30, 5: 60 };
 const MULTI_LABEL: Record<number, string> = { 1: 'Kill', 2: '2K', 3: '3K', 4: '4K', 5: 'ACE' };
 
 const isKnife = (w: string) => w.includes('knife') || w === 'bayonet';
 const isZeus = (w: string) => w === 'taser';
 const isWorld = (k: Kill) => !k.attacker || k.attacker === k.victim || k.weapon === 'world';
-const isTeamkill = (k: Kill) =>
+export const isTeamkill = (k: Kill) =>
   !!k.attacker && k.attacker !== k.victim && !!k.attackerSide && k.attackerSide === k.victimSide;
 
 export function buildMoments(match: MatchData, me: string, intros: Record<number, RoundIntro> = {}): Moment[] {
@@ -128,30 +144,94 @@ export function buildMoments(match: MatchData, me: string, intros: Record<number
       }
     }
 
+    // my grenades (while I'm alive)
+    const myThrows = (match.utility ?? []).filter(
+      (u) => u.round === round.num && u.player === me && u.tick <= round.endTick && (!myDeath || u.tick <= myDeath.tick),
+    );
+    for (const group of chainTicks(myThrows, UTILITY_GAP_S * match.tickrate)) {
+      const blinded = group.reduce((n, u) => n + u.blinded, 0);
+      const kinds = [...new Set(group.map((u) => u.kind))];
+      const names = kinds.map((k) => {
+        const n = group.filter((u) => u.kind === k).length;
+        return n === 1 ? UTILITY_NAME[k][0] : `${n} ${UTILITY_NAME[k][1]}`;
+      });
+      add({
+        kind: 'utility',
+        label: `${names.join(' + ')}${blinded ? ` · blinded ${blinded}` : ''}`,
+        tags: blinded ? ['utility', 'flashed'] : ['utility'],
+        score: 2 + 3 * blinded,
+        startTick: group[0].tick,
+        endTick: Math.min(group.at(-1)!.tick + UTILITY_LAND_S * match.tickrate, round.endTick),
+      });
+    }
+
+    // exchanges where nobody died: hits outside my other plays
+    {
+      const covered = roundMoments.filter((m) => m.kind !== 'utility').map((m) => [m.startTick, m.endTick + FIGHT_TAIL_S * match.tickrate]);
+      const mySide = round.roster[me];
+      const isEnemy = (id: string | null) => !!id && !!mySide && !!round.roster[id] && round.roster[id] !== mySide;
+      const hits = match.combat.filter(
+        (c) =>
+          c.tick >= round.startTick &&
+          c.tick <= round.endTick &&
+          ((c.attacker === me && isEnemy(c.victim)) || (c.victim === me && isEnemy(c.attacker))) &&
+          !covered.some(([a, b]) => c.tick >= a && c.tick <= b),
+      );
+      // a fight's lead-in (my first shots) can reach back into the one before: then they're one fight
+      const end = (fight: typeof hits) => Math.min(fight.at(-1)!.tick + FIGHT_TAIL_S * match.tickrate, round.endTick);
+      const fights: (typeof hits)[] = [];
+      for (const fight of chainTicks(hits, FIGHT_GAP_S * match.tickrate)) {
+        const prev = fights.at(-1);
+        if (prev && contact([me], fight[0].tick) <= end(prev)) prev.push(...fight);
+        else fights.push(fight);
+      }
+      for (const fight of fights) {
+        const dealt = fight.filter((c) => c.attacker === me);
+        const taken = fight.length - dealt.length;
+        const foes = [...new Set(fight.map((c) => (c.attacker === me ? c.victim! : c.attacker!)))];
+        add({
+          kind: 'fight',
+          label: `Fight vs ${foes.map((id) => nameOf(match, id)).join(', ')} · ${[
+            dealt.length && plural(dealt.length, 'hit'),
+            taken && `took ${taken}`,
+          ]
+            .filter(Boolean)
+            .join(', ')}`,
+          tags: ['fight'],
+          score: 1 + dealt.length,
+          startTick: contact([me], fight[0].tick),
+          endTick: end(fight),
+        });
+      }
+    }
+
     // Every action of mine this round: the opening runs to the first one, and
     // the rest of the round (teammates, bomb) is told after the last one.
     const ownTicks = [
       ...kills.filter((k) => k.attacker === me || k.victim === me || k.assister === me).map((k) => k.tick),
       ...bombs.filter((b) => b.player === me && b.kind !== 'exploded').map((b) => b.tick),
+      ...roundMoments.filter((m) => m.kind === 'fight' || m.kind === 'utility').map((m) => m.endTick),
     ].filter((t) => t <= round.endTick);
     const lastAction = ownTicks.length ? Math.max(...ownTicks) : round.startTick;
     // everything in roundMoments so far is my own play
     const firstContact = roundMoments.length ? Math.min(...roundMoments.map((m) => m.startTick)) : null;
 
-    // 5. After I die, keep teammates' fights selectively: a multi-kill, a
-    // teammate clutch, or a fight while the round is still winnable.
-    if (myDeath) {
+    // 5. After I die (or, alive, after my last action, e.g. a plant),
+    // keep teammates' fights selectively: a multi-kill, a teammate clutch,
+    // or a fight while the round is still winnable. Quiet rounds stay quiet.
+    if (ownTicks.length) {
       const mySide = round.roster[me];
       const isMate = (id: string | null) => !!id && id !== me && !!mySide && round.roster[id] === mySide;
+      const since = myDeath?.tick ?? lastAction;
       const after = kills.filter(
-        (k) => k.tick > myDeath.tick && k.tick <= round.endTick && (isMate(k.attacker) || isMate(k.victim)),
+        (k) => k.tick > since && k.tick <= round.endTick && (isMate(k.attacker) || isMate(k.victim)),
       );
       for (const fight of chainKills(after, TEAM_FIGHT_GAP_S * match.tickrate)) {
         const won = fight.filter((k) => isMate(k.attacker) && !isMate(k.victim)).length;
         const lost = fight.filter((k) => isMate(k.victim)).length;
         const { mates, enemies } = aliveBefore(round, kills, me, fight[0].tick);
 
-        if (mates.length === 1 && enemies >= 1) {
+        if (myDeath && mates.length === 1 && enemies >= 1) {
           // A teammate clutch is one moment to the end of the round. Long odds
           // (1v4, 1v5) only count if they actually get a kill.
           const rest = after.filter((k) => k.tick >= fight[0].tick);
@@ -168,7 +248,8 @@ export function buildMoments(match: MatchData, me: string, intros: Record<number
           }
           break;
         }
-        if (won < 2 && mates.length < enemies - 1) continue; // one-sided trade: skip
+        const mySideAlive = mates.length + (myDeath ? 0 : 1);
+        if (won < 2 && mySideAlive < enemies - 1) continue; // one-sided trade: skip
 
         add({
           kind: 'team',
@@ -285,8 +366,12 @@ const playerName = (match: MatchData, kills: Kill[], id: string) =>
   kills.find((k) => k.attacker === id)?.attackerName ?? kills.find((k) => k.victim === id)?.victimName ?? nameOf(match, id);
 
 export function chainKills(kills: Kill[], maxGapTicks: number): Kill[][] {
-  const chains: Kill[][] = [];
-  for (const k of [...kills].sort((a, b) => a.tick - b.tick)) {
+  return chainTicks(kills, maxGapTicks);
+}
+
+function chainTicks<T extends { tick: number }>(events: T[], maxGapTicks: number): T[][] {
+  const chains: T[][] = [];
+  for (const k of [...events].sort((a, b) => a.tick - b.tick)) {
     const last = chains.at(-1);
     if (last && k.tick - last.at(-1)!.tick <= maxGapTicks) last.push(k);
     else chains.push([k]);
@@ -360,7 +445,8 @@ function findDecider(
   if (bomb) {
     return {
       tick: bomb.tick,
-      player: bomb.player,
+      // the explosion carries the planter's id, but it's nobody's play
+      player: bomb.kind === 'defused' ? bomb.player : null,
       label: bomb.kind === 'defused' ? 'Round won on defuse' : 'Bomb exploded',
     };
   }
@@ -375,4 +461,4 @@ function findDecider(
 
 const covers = (m: Moment, tick: number) => tick >= m.startTick && tick <= m.endTick;
 
-export const KIND_ORDER: MomentKind[] = ['intro', 'clutch', 'kills', 'bomb', 'assist', 'team', 'decider', 'funny', 'death'];
+export const KIND_ORDER: MomentKind[] = ['intro', 'clutch', 'kills', 'bomb', 'assist', 'team', 'decider', 'fight', 'utility', 'funny', 'death'];

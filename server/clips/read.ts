@@ -9,8 +9,13 @@ import type { FeedEntry, HudSample } from '../types.ts';
 // assisted) was easy to read the wrong way round.
 
 const MODEL = 'claude-opus-5-5';
-/** a kill-feed entry seen this recently is still the same entry */
-const SAME_ENTRY_S = 20;
+/**
+ * A kill-feed entry seen again this soon is the same entry, still on screen.
+ * Shots come every couple of seconds while an entry is up, so a longer gap
+ * means it went away and this is a new kill with the same names (two enemies
+ * both called "M", or a fancy name read as a plain one).
+ */
+const SAME_ENTRY_S = 5;
 
 export interface Shot {
   t: number; // seconds into the clip
@@ -163,7 +168,7 @@ export function parseTimer(s: string): number | null {
 
 /**
  * The entries that appeared in each kill-feed shot: an entry still on screen
- * from an earlier shot (same attacker and victim) isn't new. Each new entry
+ * from the shot before (same attacker and victim) isn't new. Each new entry
  * gets the time of the shot where it first showed up.
  */
 export function newEntries(feed: { t: number; entries: Omit<FeedEntry, 't'>[] }[]): FeedEntry[] {

@@ -1,9 +1,9 @@
-import type { CaptionLine, CaptionSettings, CaptionWord, Clip, Edits, Kill, MatchData, Moment, Settings, Source, SyncModel } from '../../server/types.ts';
+import type { CaptionLine, CaptionSettings, CaptionWord, Clip, Edits, FeedKill, Kill, MatchData, Moment, Rect, Settings, Short, ShortLayout, Source, SyncModel } from '../../server/types.ts';
 import type { VideoInfo } from '../../server/util/ffmpeg.ts';
 import type { Job } from '../../server/jobs.ts';
 import type { ExportSettings } from '../../server/edit/render.ts';
 
-export type { CaptionLine, CaptionSettings, CaptionWord, Clip, Edits, Kill, Moment, Settings, Source, SyncModel, Job, ExportSettings };
+export type { CaptionLine, CaptionSettings, CaptionWord, Clip, Edits, FeedKill, Kill, Moment, Rect, Settings, Short, ShortLayout, Source, SyncModel, Job, ExportSettings };
 
 export interface ProjectView {
   id: string;
@@ -44,6 +44,26 @@ export interface ProjectView {
   /** caption lines for speech inside the current reel */
   reelCaptions: CaptionLine[];
   anchors: { tick: number; round: number }[];
+  /** rounds (clip numbers in clips mode) with enough kills for a short */
+  shortRounds: number[];
+  shorts?: Short[];
+}
+
+/** A short with its pieces, as the short page needs it. */
+export interface ShortView {
+  short: Short;
+  /** the round cut to its fights, before the short's edits */
+  baseClips: Clip[];
+  clips: Clip[];
+  /** my kills in the round, for the short's kill feed */
+  kills: FeedKill[];
+  duration: number;
+  /** where a looping short is cut (recording seconds): it opens there and ends right before it; null = it doesn't loop */
+  loopCut: number | null;
+  /** the short's size in pixels (9:16) */
+  frame: { width: number; height: number };
+  defaultOutputPath: string;
+  renderJob: Job | null;
 }
 
 export interface FsEntry {
@@ -94,6 +114,26 @@ export const api = {
   captionsStatus: () => req<{ ok: boolean; missing: string[]; fonts: string[]; cleanup: boolean }>('GET', '/api/captions/status'),
   alignCaptions: (id: string) => req<Job>('POST', `/api/projects/${id}/captions/align`),
   cleanupCaptions: (id: string) => req<Job>('POST', `/api/projects/${id}/captions/cleanup`),
+  /** the round's short (made on first use) */
+  createShort: (id: string, round: number) => req<ShortView>('POST', `/api/projects/${id}/shorts`, { round }),
+  short: (id: string, sid: string) => req<ShortView>('GET', `/api/projects/${id}/shorts/${sid}`),
+  patchShort: (
+    id: string,
+    sid: string,
+    body: {
+      edits?: Edits;
+      layout?: ShortLayout;
+      outputPath?: string;
+      captions?: Partial<Settings['shortCaptions']>;
+      killfeed?: Partial<Settings['shortKillfeed']>;
+      overlay?: Partial<Settings['shortOverlay']>;
+      loop?: Partial<Settings['shortLoop']>;
+    },
+  ) =>
+    req<ShortView>('PATCH', `/api/projects/${id}/shorts/${sid}`, body),
+  /** the game's own kill-feed entry for each kill of the short (time order), null where none was found */
+  shortFeed: (id: string, sid: string) => req<({ url: string; w: number; h: number } | null)[]>('GET', `/api/projects/${id}/shorts/${sid}/feed`),
+  renderShort: (id: string, sid: string) => req<Job>('POST', `/api/projects/${id}/shorts/${sid}/render`),
   job: (id: string) => req<Job | null>('GET', `/api/jobs/${id}`),
   cancel: (id: string) => req('DELETE', `/api/jobs/${id}`),
 };

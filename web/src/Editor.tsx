@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { api, fmtTime, locator, type Clip, type Edits, type Moment, type ProjectView } from './api.ts';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { api, fmtTime, locator, type Clip, type Edits, type Located, type Moment, type ProjectView } from './api.ts';
 import { applyEdits, subtractRange } from '../../server/edit/edits.ts';
-import { buildSegments, parseFps, PlayerControls, ReelStage, segIndexAt, useReelPlayer } from './reel.tsx';
+import { buildSegments, parseFps, PlayerControls, ReelStage, segIndexAt, useReelPlayer, type ReelPlayer } from './reel.tsx';
 
 type Update = (fn: () => Promise<ProjectView>) => Promise<void>;
 
@@ -23,8 +23,61 @@ const isTyping = (e: KeyboardEvent) =>
  * cut it like Premiere or CapCut. Nothing is rendered until Export.
  */
 export function Editor({ p, update, onNext, nextLabel }: { p: ProjectView; update: Update; onNext: () => void; nextLabel: string }) {
+  const onSave = useCallback((e: Edits) => void update(() => api.patch(p.id, { edits: e })), [p.id, update]);
+  return (
+    <TimelineEditor
+      id={p.id}
+      baseClips={p.baseClips}
+      initialEdits={p.edits}
+      onSave={onSave}
+      video={p.video}
+      moments={p.moments}
+      locate={locator(p)}
+      title="Edit"
+      what="Reel"
+      empty="Pick some moments in Highlights first."
+      actions={(flush) => (
+        <button
+          className="btn btn-primary"
+          onClick={() => {
+            flush();
+            onNext();
+          }}
+        >
+          {nextLabel} →
+        </button>
+      )}
+      stage={(player, badge) => <ReelStage player={player}>{badge}</ReelStage>}
+    />
+  );
+}
+
+export interface TimelineEditorProps {
+  /** project id, for the waveform */
+  id: string;
+  /** the planned pieces before the edits */
+  baseClips: Clip[];
+  initialEdits: Edits;
+  /** called (debounced) with every change of the edits */
+  onSave: (e: Edits) => void;
+  video: { fps: string; duration: number };
+  moments: Moment[];
+  locate: (t: number) => Located;
+  title: string;
+  /** what's being cut, for the length line ("Reel") */
+  what: string;
+  /** shown when there are no pieces at all */
+  empty: string;
+  /** buttons at the top right; `flush` saves pending edits right away */
+  actions?: (flush: () => void) => ReactNode;
+  /** the picture: `badge` names the piece playing */
+  stage: (player: ReelPlayer, badge: ReactNode) => ReactNode;
+}
+
+/** The timeline editor, for any set of pieces (the reel, or a short). */
+export function TimelineEditor({ id, baseClips, initialEdits, onSave, video, moments, locate, title, what, empty, actions, stage }: TimelineEditorProps) {
   // --- edits + undo -------------------------------------------------------
-  const [edits, setEdits] = useState<Edits>(p.edits);
+  const [edits, setEdits] = useState<Edits>(initialEdits);
   const [history, setHistory] = useState<{ past: Edits[]; future: Edits[] }>({ past: [], future: [] });
   const pendingSave = useRef<Edits | null>(null);
   const saveTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
@@ -33,8 +86,8 @@ export function Editor({ p, update, onNext, nextLabel }: { p: ProjectView; updat
     clearTimeout(saveTimer.current);
     const e = pendingSave.current;
     pendingSave.current = null;
-    if (e) void update(() => api.patch(p.id, { edits: e }));
-  }, [p.id, update]);
+    if (e) onSave(e);
+  }, [onSave]);
   const save = (e: Edits) => {
     pendingSave.current = e;
     clearTimeout(saveTimer.current);
@@ -65,14 +118,14 @@ export function Editor({ p, update, onNext, nextLabel }: { p: ProjectView; updat
 
   // --- reel model ---------------------------------------------------------
   // keyed on the content, so a server refresh with the same clips doesn't re-seek playback
-  const sig = JSON.stringify([p.baseClips.map((c) => [c.start, c.end, c.round]), edits]);
-  const segments = useMemo(() => buildSegments(applyEdits(p.baseClips, edits), edits.splits), [sig]); // eslint-disable-line react-hooks/exhaustive-deps
-  const baseTotal = useMemo(() => p.baseClips.reduce((s, c) => s + c.end - c.start, 0), [p.baseClips]);
-  const fps = parseFps(p.video.fps);
-  const kindOf = useMemo(() => new Map<string, Moment['kind']>(p.moments.map((m) => [m.id, m.kind])), [p.moments]);
+  const sig = JSON.stringify([baseClips.map((c) => [c.start, c.end, c.round]), edits]);
+  const segments = useMemo(() => buildSegments(applyEdits(baseClips, edits), edits.splits), [sig]); // eslint-disable-line react-hooks/exhaustive-deps
+  const baseTotal = useMemo(() => baseClips.reduce((s, c) => s + c.end - c.start, 0), [baseClips]);
+  const fps = parseFps(video.fps);
+  const kindOf = useMemo(() => new Map<string, Moment['kind']>(moments.map((m) => [m.id, m.kind])), [moments]);
 
   // --- player -------------------------------------------------------------
-  const player = useReelPlayer(segments, fps, locator(p));
+  const player = useReelPlayer(segments, fps, locate);
   const { time, playing, total, seekTo, togglePlay } = player;
 
   // --- edit operations (all in recording time) ----------------------------
@@ -115,10 +168,10 @@ export function Editor({ p, update, onNext, nextLabel }: { p: ProjectView; updat
   const edgeLimits = (i: number, side: 'start' | 'end') => {
     const s = segments[i];
     // in clips mode a piece can't grow past the end of the clip file it comes from
-    const [lo, hi] = s.clip.bounds ?? [0, p.video.duration];
+    const [lo, hi] = s.clip.bounds ?? [0, video.duration];
     return side === 'start'
       ? { min: Math.max(lo, segments[i - 1]?.recEnd ?? 0), max: s.recEnd - MIN_PIECE_S }
-      : { min: s.recStart + MIN_PIECE_S, max: Math.min(hi, segments[i + 1]?.recStart ?? p.video.duration) };
+      : { min: s.recStart + MIN_PIECE_S, max: Math.min(hi, segments[i + 1]?.recStart ?? video.duration) };
   };
   const onEdgeDown = (e: React.PointerEvent, i: number, side: 'start' | 'end') => {
     if (e.button !== 0) return;
@@ -220,11 +273,11 @@ export function Editor({ p, update, onNext, nextLabel }: { p: ProjectView; updat
     let started = false;
     const load = async () => {
       while (!stop) {
-        const data = await api.peaks(p.id).catch(() => null);
+        const data = await api.peaks(id).catch(() => null);
         if (data) return !stop && setPeaks(data);
         if (!started) {
           started = true;
-          await api.startPeaks(p.id).catch(() => {}); // older projects: compute it now
+          await api.startPeaks(id).catch(() => {}); // older projects: compute it now
         }
         await new Promise((r) => setTimeout(r, 2000));
       }
@@ -233,7 +286,7 @@ export function Editor({ p, update, onNext, nextLabel }: { p: ProjectView; updat
     return () => {
       stop = true;
     };
-  }, [p.id]);
+  }, [id]);
 
   const canvas = useRef<HTMLCanvasElement>(null);
   const TRACK_H = 84;
@@ -303,6 +356,8 @@ export function Editor({ p, update, onNext, nextLabel }: { p: ProjectView; updat
     if (k === ' ') return run(togglePlay);
     if (k === 's') return run(split);
     if (k === 'm') return run(() => player.setSilent((s) => !s));
+    if (e.key === '>') return run(() => player.stepSpeed(1));
+    if (e.key === '<') return run(() => player.stepSpeed(-1));
     if (k === 'q') return run(trimLeft);
     if (k === 'w') return run(trimRight);
     if (k === 'delete' || k === 'backspace') return run(deleteSelected);
@@ -322,11 +377,11 @@ export function Editor({ p, update, onNext, nextLabel }: { p: ProjectView; updat
     return () => removeEventListener('keydown', on);
   }, []);
 
-  if (p.baseClips.length === 0) {
+  if (baseClips.length === 0) {
     return (
       <section className="card">
         <h2>Nothing to edit yet</h2>
-        <p className="muted">Pick some moments in Highlights first.</p>
+        <p className="muted">{empty}</p>
       </section>
     );
   }
@@ -338,9 +393,9 @@ export function Editor({ p, update, onNext, nextLabel }: { p: ProjectView; updat
     <section className="card editor">
       <div className="row spread wrap">
         <div>
-          <h2>Edit</h2>
+          <h2>{title}</h2>
           <div className="muted small">
-            Reel <strong className="mono">{fmtTime(total)}</strong>
+            {what} <strong className="mono">{fmtTime(total)}</strong>
             {Math.abs(baseTotal - total) > 0.05 && (
               <>
                 {' '}
@@ -362,21 +417,11 @@ export function Editor({ p, update, onNext, nextLabel }: { p: ProjectView; updat
           <button className="btn btn-sm" disabled={edits.cuts.length + edits.splits.length + (edits.adds?.length ?? 0) === 0} onClick={reset}>
             Reset edits
           </button>
-          <button
-            className="btn btn-primary"
-            onClick={() => {
-              flush();
-              onNext();
-            }}
-          >
-            {nextLabel} →
-          </button>
+          {actions?.(flush)}
         </div>
       </div>
 
-      <ReelStage player={player}>
-        {cur && <div className="editor-badge">{label(cur.clip)}</div>}
-      </ReelStage>
+      {stage(player, cur && <div className="editor-badge">{label(cur.clip)}</div>)}
       {player.videoError && (
         <div className="muted small">The browser can't play this recording (e.g. HEVC). Cuts still work and the export is unaffected.</div>
       )}
@@ -466,7 +511,7 @@ export function Editor({ p, update, onNext, nextLabel }: { p: ProjectView; updat
       </div>
 
       <div className="muted small shortcuts">
-        <kbd>Space</kbd> play · <kbd>M</kbd> mute ·<kbd>Q</kbd> cut left of playhead · <kbd>W</kbd> cut right · <kbd>S</kbd> split · <kbd>Del</kbd> delete selected piece · drag a piece's edge to trim it, or out to bring back cut footage
+        <kbd>Space</kbd> play · <kbd>M</kbd> mute · <kbd>Shift</kbd>+<kbd>&gt;</kbd>/<kbd>&lt;</kbd> speed ·<kbd>Q</kbd> cut left of playhead · <kbd>W</kbd> cut right · <kbd>S</kbd> split · <kbd>Del</kbd> delete selected piece · drag a piece's edge to trim it, or out to bring back cut footage
         · <kbd>Ctrl+Z</kbd> undo · <kbd>←</kbd>/<kbd>→</kbd> frame (Shift: 1 s) · <kbd>↑</kbd>/<kbd>↓</kbd> edit points · <kbd>Ctrl</kbd>+wheel zoom ·{' '}
         <kbd>\</kbd> fit
       </div>

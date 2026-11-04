@@ -54,6 +54,9 @@ export const parseFps = (fps: string) => {
 
 export type ReelPlayer = ReturnType<typeof useReelPlayer>;
 
+/** Preview speeds, as on YouTube. */
+export const SPEEDS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
+
 /** Playback of the segments: a clock in reel time, seeking, play/pause and preview volume. */
 export function useReelPlayer(segments: Segment[], fps: number, locate: (rec: number) => Located) {
   const vidA = useRef<HTMLVideoElement>(null);
@@ -67,7 +70,7 @@ export function useReelPlayer(segments: Segment[], fps: number, locate: (rec: nu
     if (v.dataset.src !== at.src) {
       v.dataset.src = at.src;
       v.dataset.offset = String(at.offset);
-      v.src = at.src;
+      v.src = at.src; // loading resets playbackRate to defaultPlaybackRate, which holds the speed
     }
     if (Math.abs(v.currentTime - (rec - at.offset)) > 0.02) v.currentTime = rec - at.offset;
   };
@@ -100,6 +103,31 @@ export function useReelPlayer(segments: Segment[], fps: number, locate: (rec: nu
     }
   });
   const [silent, setSilent] = useState(false);
+
+  // preview speed only; remembered per browser
+  const [speed, setSpeed] = useState(() => {
+    try {
+      const s = Number(localStorage.getItem('editor.speed'));
+      return SPEEDS.includes(s) ? s : 1;
+    } catch {
+      return 1;
+    }
+  });
+  const speedRef = useRef(speed);
+  speedRef.current = speed;
+  useEffect(() => {
+    for (const v of [vidA.current, vidB.current]) {
+      if (!v) continue;
+      v.defaultPlaybackRate = speed;
+      v.playbackRate = speed;
+    }
+    try {
+      localStorage.setItem('editor.speed', String(speed));
+    } catch {}
+  }, [speed]);
+  /** One step faster (+1) or slower (-1) through SPEEDS. */
+  const stepSpeed = (dir: 1 | -1) =>
+    setSpeed((s) => SPEEDS[Math.min(SPEEDS.length - 1, Math.max(0, SPEEDS.indexOf(s) + dir))] ?? 1);
   useEffect(() => {
     // .muted belongs to the A/B swap (only the visible video is heard), so the user's level goes on .volume
     for (const v of [vidA.current, vidB.current]) if (v) v.volume = silent ? 0 : volume;
@@ -195,8 +223,8 @@ export function useReelPlayer(segments: Segment[], fps: number, locate: (rec: nu
         return;
       }
       if (playingRef.current) {
-        // a frame early: the next check is one animation frame (~16 ms) away
-        if (recOf(v) >= seg.recEnd - Math.max(0.5 / fps, 0.017)) {
+        // a frame early: the next check is one animation frame (~16 ms, more video when sped up) away
+        if (recOf(v) >= seg.recEnd - Math.max(0.5 / fps, 0.017 * speedRef.current)) {
           if (segIdx.current + 1 >= segs.length) {
             v.pause();
             setPlay(false);
@@ -244,7 +272,7 @@ export function useReelPlayer(segments: Segment[], fps: number, locate: (rec: nu
 
   return {
     vidA, vidB, active, activeVid, segIdx, total, time, timeRef, playing, videoError, setVideoError,
-    volume, setVolume, silent, setSilent, prepare, seekTo, play, pause, togglePlay, playRange, recNow, peek,
+    volume, setVolume, silent, setSilent, speed, setSpeed, stepSpeed, prepare, seekTo, play, pause, togglePlay, playRange, recNow, peek,
   };
 }
 
@@ -273,7 +301,7 @@ export function ReelStage({ player, children }: { player: ReelPlayer; children?:
   );
 }
 
-/** Play/pause, the time, and the preview volume. */
+/** Play/pause, the time, the preview volume and speed. */
 export function PlayerControls({ player }: { player: ReelPlayer }) {
   const { volume, silent } = player;
   const level = silent ? 0 : volume;
@@ -304,6 +332,19 @@ export function PlayerControls({ player }: { player: ReelPlayer }) {
         />
         <span className="mono small muted">{Math.round(level * 100)}%</span>
       </span>
+      <select
+        className="speed"
+        value={player.speed}
+        title="Preview speed (Shift + > / <)"
+        onChange={(e) => player.setSpeed(Number(e.target.value))}
+        onKeyDown={(e) => e.key === ' ' && e.preventDefault()}
+      >
+        {SPEEDS.map((s) => (
+          <option key={s} value={s}>
+            {s === 1 ? 'Normal' : `${s}×`}
+          </option>
+        ))}
+      </select>
     </>
   );
 }

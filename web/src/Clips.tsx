@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { api, fmtTime, waitJob, type FsEntry, type Job, type Moment, type ProjectView, type Source } from './api.ts';
 import { Progress } from './ui.tsx';
+import { CreateShortButton } from './Short.tsx';
 
 // Clips mode: OBS replay-buffer clips, no demo. Pick a folder, let the app
 // read each clip's kill feed and round timer, keep the last round's kills.
@@ -242,12 +243,15 @@ export function ClipsHighlightsStep({
   update,
   play,
   onNext,
+  speech,
 }: {
   p: ProjectView;
   update: Update;
   /** plays timeline seconds [from, to] in the preview */
   play: (from: number, to: number) => void;
   onNext: () => void;
+  /** speech-safe cuts: settings, voice tracks, detection */
+  speech?: ReactNode;
 }) {
   const patchMoments = (patch: Record<string, Partial<Moment>>) => update(() => api.patch(p.id, { moments: patch }));
   const clipOf = (m: Moment) => p.clips.find((c) => c.momentIds.includes(m.id));
@@ -279,6 +283,7 @@ export function ClipsHighlightsStep({
           <span className="muted">seconds become separate pieces (the walking between them is cut).</span>
         </label>
       </section>
+      {speech && <section className="card">{speech}</section>}
 
       {(p.sources ?? []).map((s, i) => {
         const moments = p.moments.filter((m) => m.round === i + 1);
@@ -287,6 +292,7 @@ export function ClipsHighlightsStep({
             <div className="round-head">
               <strong>Clip {i + 1}</strong>
               <span className="muted small">{s.name}</span>
+              {p.shortRounds.includes(i + 1) && <CreateShortButton p={p} round={i + 1} />}
               <span className="grow" />
               {clipStatus(s, moments)}
             </div>
@@ -307,6 +313,11 @@ export function ClipsHighlightsStep({
                     ))}
                   </span>
                   <span className="grow" />
+                  {clip?.speech && clip.speech.start + clip.speech.end >= 0.1 && (
+                    <span className="tag speech" title="Cut moved so nobody is cut off mid-sentence">
+                      🎙 +{(clip.speech.start + clip.speech.end).toFixed(1)}s
+                    </span>
+                  )}
                   {m.at && <span className="muted small mono">{fmtTime(m.at[0] - s.offset)}</span>}
                   <span className="trim">
                     <button className="btn btn-xs" title="Start earlier" onClick={() => patchMoments({ [m.id]: { trimStart: m.trimStart - 1 } })}>

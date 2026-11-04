@@ -6,8 +6,10 @@ import { cancelJob, getJob, latestJob, startJob } from './jobs.ts';
 import {
   alignProject, analyzeSpeech, autoSync, cleanupProject, baseClipsFor, clipsFor, createProject, createRecordingTest, defaultOutputPath, editCaption, editsOf, getProject, hasPlayer, listProjects,
   BUMPER_CACHE, loadSettings, peaksFile, reelCaptions, renderProject, saveProject, saveSettings, setPlayer, syncAnchors, transcribeProject, type Project,
-  analyzeClips, buildClipMoments, clipsMode, clipsPeaks, createClipsProject,
+  analyzeClips, buildClipMoments, clipsMode, clipsPeaks, createClipsProject, sourceAt,
+  baseShortClips, createShort, defaultShortPath, feedImagesDir, findShort, renderShort, shortClipsFor, shortFeedImages, shortKills, shortLoopOrder, shortRounds,
 } from './project.ts';
+import { fitLayout, shortFrame } from './shorts/layout.ts';
 import { readerAvailable } from './clips/read.ts';
 import { captionsReady } from './captions/transcribe.ts';
 import { cleanupAvailable } from './captions/cleanup.ts';
@@ -17,9 +19,13 @@ import { totalDuration } from './edit/plan.ts';
 import { normalizeCuts } from './edit/edits.ts';
 import { computePeaks, PEAKS_PER_SEC, readPeaks } from './audio/peaks.ts';
 import { exportSettings } from './edit/render.ts';
-import { checkFfmpeg, hasNvenc } from './util/ffmpeg.ts';
+import { checkFfmpeg, FFMPEG, hasNvenc } from './util/ffmpeg.ts';
+import { spawn } from 'node:child_process';
+
+/** seconds of a track played when listening for the mic */
+const TRACK_SAMPLE_S = 8;
 import { bumperFile, PREVIEW_TARGET } from './branding/bumper.ts';
-import type { CaptionLine, Edits, Settings } from './types.ts';
+import type { CaptionLine, Edits, Settings, Short, ShortLayout } from './types.ts';
 
 // ANTHROPIC_API_KEY (caption cleanup) can live in .env, so it works without a system-wide variable
 if (existsSync('.env')) process.loadEnvFile('.env');
@@ -64,10 +70,21 @@ function view(p: Project) {
     readerAvailable: readerAvailable(),
     reelCaptions: reelCaptions(p, clips),
     anchors: hasPlayer(p) ? syncAnchors(p) : [],
+    shortRounds: shortRounds(p),
   };
 }
 
-app.get('/api/health', async () => ({ ffmpeg: checkFfmpeg(), nvenc: hasNvenc(), settings: loadSettings() }));
+/** Edits from the editor, kept inside the recording and normalized. */
+function cleanEdits(p: Project, edits: Edits): Edits {
+  const inside = (t: number) => Math.min(p.video.duration, Math.max(0, Number(t) || 0));
+  return {
+    cuts: normalizeCuts((edits.cuts ?? []).map(([a, b]) => [inside(a), inside(b)])),
+    splits: [...new Set((edits.splits ?? []).map(inside))].sort((a, b) => a - b),
+    adds: normalizeCuts((edits.adds ?? []).map(([a, b]) => [inside(a), inside(b)])),
+  };
+}
+
+app.get('/api/health',async () => ({ ffmpeg: checkFfmpeg(), nvenc: hasNvenc(), settings: loadSettings() }));
 
 app.get('/api/captions/status', async () => ({ ...captionsReady(), fonts: availableFonts(), cleanup: cleanupAvailable() }));
 
@@ -181,7 +198,8 @@ function startSpeechJob(id: string) {
 
 app.post<{ Body: { videoPath: string; demoPath: string } }>('/api/projects', async (req) => {
   const p = createProject(req.body.videoPath, req.body.demoPath);
-  startSpeechJob(p.id);
+  // with several tracks, speech waits until the voice tracks are ticked in Sync
+  if (p.settings.voiceTracks === null) startSpeechJob(p.id);
   startPeaksJob(p.id);
   return view(p);
 });
@@ -226,6 +244,7 @@ app.post<{ Body: { videoPath: string } }>('/api/projects/edit-test', async (req)
 app.post<{ Body: { paths: string[]; playerName?: string } }>('/api/projects/clips', async (req) => {
   if (req.body.playerName !== undefined) saveSettings({ ...loadSettings(), playerName: req.body.playerName.trim() });
   const p = createClipsProject(req.body.paths ?? []);
+  startSpeechJob(p.id);
   startPeaksJob(p.id);
   return view(p);
 });
@@ -281,7 +300,8 @@ app.patch<{
     redetectSpeech = 'voiceTracks' in settings && JSON.stringify(settings.voiceTracks) !== JSON.stringify(p.settings.voiceTracks);
     p.settings = { ...p.settings, ...settings, steamId: p.settings.steamId };
     // steamId and voice tracks belong to this match; the rest are defaults for the next one
-    const { steamId: _, voiceTracks: __, ...shared } = p.settings;
+    // (a short's layout and captions are saved by the short, so this project's older copy never overwrites them)
+    const { steamId: _, voiceTracks: __, shortLayout: ___, shortCaptions: ____, shortKillfeed: _____, shortOverlay: ______, shortLoop: _______, ...shared } = p.settings;
     saveSettings({ ...loadSettings(), ...shared });
     if (redetectSpeech) {
       // new voice tracks, new speech: drop lines transcribed from the old tracks (keep hand edits)
@@ -294,17 +314,10 @@ app.patch<{
     const m = p.moments.find((x) => x.id === id);
     if (m) Object.assign(m, patch);
   }
-  if (edits) {
-    const inside = (t: number) => Math.min(p.video.duration, Math.max(0, Number(t) || 0));
-    p.edits = {
-      cuts: normalizeCuts((edits.cuts ?? []).map(([a, b]) => [inside(a), inside(b)])),
-      splits: [...new Set((edits.splits ?? []).map(inside))].sort((a, b) => a - b),
-      adds: normalizeCuts((edits.adds ?? []).map(([a, b]) => [inside(a), inside(b)])),
-    };
-  }
+  if (edits) p.edits = cleanEdits(p, edits);
   if (outputPath !== undefined) p.outputPath = outputPath || null;
   saveProject(p);
-  if (redetectSpeech) startSpeechJob(p.id);
+  if (redetectSpeech && p.settings.voiceTracks?.length !== 0) startSpeechJob(p.id);
   return view(p);
 });
 
@@ -361,6 +374,124 @@ app.post<{ Params: { id: string } }>('/api/projects/:id/render', async (req) => 
   });
 });
 
+// --- shorts: a vertical short of one round, with its own cut and layout ------
+
+function loadShort(p: Project, sid: string): Short {
+  const s = findShort(p, sid);
+  if (!s) throw Object.assign(new Error('Short not found'), { statusCode: 404 });
+  return s;
+}
+
+function shortView(p: Project, s: Short) {
+  const clips = shortClipsFor(p, s);
+  return {
+    short: s,
+    baseClips: baseShortClips(p, s.round),
+    clips,
+    kills: shortKills(p, s.round),
+    duration: totalDuration(clips),
+    // where a looping short is cut (recording seconds): it opens there and ends right before it
+    loopCut: shortLoopOrder(p, s, clips)?.[0].start ?? null,
+    frame: shortFrame(p.video),
+    defaultOutputPath: defaultShortPath(p, s),
+    renderJob: latestJob(p.id, `short:${s.id}`),
+  };
+}
+
+app.post<{ Params: { id: string }; Body: { round: number } }>('/api/projects/:id/shorts', async (req) => {
+  const p = load(req.params.id);
+  const s = createShort(p, Number(req.body.round));
+  saveProject(p);
+  return shortView(p, s);
+});
+
+app.get<{ Params: { id: string; sid: string } }>('/api/projects/:id/shorts/:sid', async (req) => {
+  const p = load(req.params.id);
+  return shortView(p, loadShort(p, req.params.sid));
+});
+
+app.patch<{
+  Params: { id: string; sid: string };
+  Body: {
+    edits?: Edits;
+    layout?: ShortLayout;
+    outputPath?: string;
+    captions?: Settings['shortCaptions'];
+    killfeed?: Partial<Settings['shortKillfeed']>;
+    overlay?: Partial<Settings['shortOverlay']>;
+    loop?: Partial<Settings['shortLoop']>;
+  };
+}>(
+  '/api/projects/:id/shorts/:sid',
+  async (req) => {
+    const p = load(req.params.id);
+    const s = loadShort(p, req.params.sid);
+    const { edits, layout, outputPath, captions, killfeed, overlay, loop } = req.body;
+    if (loop) {
+      p.settings.shortLoop = { ...p.settings.shortLoop, ...loop };
+      saveSettings({ ...loadSettings(), shortLoop: p.settings.shortLoop });
+    }
+    if (killfeed) {
+      p.settings.shortKillfeed = { ...p.settings.shortKillfeed, ...killfeed };
+      saveSettings({ ...loadSettings(), shortKillfeed: p.settings.shortKillfeed });
+    }
+    if (overlay) {
+      // the same badge goes on every short, so it's remembered for the next ones
+      p.settings.shortOverlay = { ...p.settings.shortOverlay, ...overlay };
+      saveSettings({ ...loadSettings(), shortOverlay: p.settings.shortOverlay });
+    }
+    if (edits) s.edits = cleanEdits(p, edits);
+    if (layout) {
+      s.layout = fitLayout(layout, p.video);
+      // the facecam sits in the same place in the next recording
+      saveSettings({ ...loadSettings(), shortLayout: s.layout });
+    }
+    if (captions) {
+      p.settings.shortCaptions = { ...p.settings.shortCaptions, ...captions };
+      saveSettings({ ...loadSettings(), shortCaptions: p.settings.shortCaptions });
+    }
+    if (outputPath !== undefined) s.outputPath = outputPath || null;
+    saveProject(p);
+    return shortView(p, s);
+  },
+);
+
+app.post<{ Params: { id: string; sid: string } }>('/api/projects/:id/shorts/:sid/render', async (req) => {
+  const { id, sid } = req.params;
+  loadShort(load(id), sid);
+  return startJob(`short:${sid}`, id, async (progress, signal) => {
+    const working = load(id);
+    const out = await renderShort(working, loadShort(working, sid), progress, signal);
+    // re-read so edits made while rendering aren't overwritten
+    const p = load(id);
+    loadShort(p, sid).outputPath = out;
+    saveProject(p);
+    return out;
+  });
+});
+
+/** The game's own kill-feed entry for each of the short's kills (in time order), cut out on first use; null where none was found. */
+app.get<{ Params: { id: string; sid: string } }>('/api/projects/:id/shorts/:sid/feed', async (req) => {
+  const p = load(req.params.id);
+  const s = loadShort(p, req.params.sid);
+  const images = await shortFeedImages(p, shortKills(p, s.round));
+  return images.map((img) => (img ? { url: `/api/projects/${p.id}/killfeed/${img.key}`, w: img.w, h: img.h } : null));
+});
+
+app.get<{ Params: { id: string; key: string } }>('/api/projects/:id/killfeed/:key', (req, reply) => {
+  const p = load(req.params.id);
+  const file = join(feedImagesDir(p), `${req.params.key}.png`);
+  if (!/^[0-9a-f]+$/.test(req.params.key) || !existsSync(file)) return reply.code(404).send({ error: 'Not found' });
+  reply.type('image/png').header('Cache-Control', 'max-age=31536000, immutable');
+  return reply.send(createReadStream(file));
+});
+
+app.get<{ Params: { id: string; sid: string } }>('/api/projects/:id/shorts/:sid/output', (req, reply) => {
+  const s = loadShort(load(req.params.id), req.params.sid);
+  if (!s.outputPath || !existsSync(s.outputPath)) return reply.code(404).send({ error: 'Not rendered yet' });
+  return streamFile(s.outputPath, req.headers.range, reply);
+});
+
 app.get<{ Params: { id: string } }>('/api/jobs/:id', async (req) => getJob(req.params.id));
 app.delete<{ Params: { id: string } }>('/api/jobs/:id', async (req) => {
   cancelJob(req.params.id);
@@ -402,6 +533,28 @@ app.get<{ Querystring: { path?: string } }>('/api/image', (req, reply) => {
   if (!IMAGE_EXT.includes(ext) || !existsSync(path)) return reply.code(404).send({ error: 'Image not found' });
   reply.type(ext === '.png' ? 'image/png' : ext === '.webp' ? 'image/webp' : 'image/jpeg');
   return reply.send(createReadStream(path));
+});
+
+/**
+ * A few seconds of one audio track on its own from `at` seconds, to tell
+ * which track is the mic. Encoded on the fly; small enough to stream whole.
+ */
+app.get<{ Params: { id: string; n: string }; Querystring: { at?: string } }>('/api/projects/:id/track/:n', async (req, reply) => {
+  const p = load(req.params.id);
+  const n = Number(req.params.n);
+  if (!Number.isInteger(n) || n < 0 || n >= p.video.audio.length) return reply.code(404).send({ error: 'No such audio track' });
+  let at = Math.max(0, Math.min(p.video.duration - 1, Number(req.query.at) || 0));
+  let file = p.videoPath;
+  if (clipsMode(p)) {
+    // timeline time -> the clip playing there
+    const s = sourceAt(p, at);
+    if (n >= s.info.audio.length) return reply.code(404).send({ error: 'This clip has no such audio track' });
+    file = s.path;
+    at -= s.offset;
+  }
+  const ff = spawn(FFMPEG, ['-hide_banner', '-loglevel', 'error', '-ss', at.toFixed(2), '-i', file, '-t', String(TRACK_SAMPLE_S), '-map', `0:a:${n}`, '-vn', '-c:a', 'libmp3lame', '-b:a', '128k', '-f', 'mp3', 'pipe:1']);
+  reply.type('audio/mpeg').header('Cache-Control', 'no-store');
+  return reply.send(ff.stdout);
 });
 
 /** The recording; in clips mode, the clip `source` (default: the first). */

@@ -9,6 +9,8 @@ export interface AudioStream {
   sampleRate: number;
   channels: number;
   bitRate: number | null; // bits/s
+  /** the track's name as OBS saved it ("Main Audio Track", "Track2", ...) */
+  title?: string;
 }
 
 /** The source's encoding settings, so the export can match them. */
@@ -70,6 +72,7 @@ export function probe(path: string): VideoInfo {
       sampleRate: Number(s.sample_rate),
       channels: s.channels,
       bitRate: streamBitRate(s),
+      title: s.tags?.title ?? s.tags?.name ?? (s.tags?.handler_name !== 'SoundHandler' ? s.tags?.handler_name : undefined),
     }));
   // MKV often has no per-stream video bitrate: take the container's minus audio.
   const containerRate = Number(j.format.bit_rate) || null;
@@ -122,7 +125,37 @@ export function runFfmpeg(args: string[], onProgress?: (sec: number) => void, si
   });
 }
 
+/**
+ * ffmpeg options that take audio tracks of input 0 as one stream, then `post`
+ * filters. Several tracks are mixed, each re-timed first: amix of all six
+ * tracks of an hour-long OBS recording quietly dropped audio (everything after
+ * ~12 minutes came out silent) unless its inputs go through aresample=async.
+ */
+export function audioTracksArgs(tracks: number[], post = ''): string[] {
+  if (tracks.length === 1) return ['-map', `0:a:${tracks[0]}`, ...(post ? ['-af', post] : [])];
+  const retimed = tracks.map((t, i) => `[0:a:${t}]aresample=async=1[t${i}]`).join(';');
+  const inputs = tracks.map((_, i) => `[t${i}]`).join('');
+  return ['-filter_complex', `${retimed};${inputs}amix=inputs=${tracks.length}:normalize=0${post ? `,${post}` : ''}[mix]`, '-map', '[mix]'];
+}
+
+/** crop for a region of the frame given as fractions (even sizes, as encoders and scalers like them; kept inside the frame) */
+export function cropRect(info: { width: number; height: number }, r: { x: number; y: number; w: number; h: number }) {
+  const even = (n: number) => Math.max(2, Math.floor(n / 2) * 2);
+  const cw = Math.min(even(info.width * r.w), even(info.width));
+  const ch = Math.min(even(info.height * r.h), even(info.height));
+  const x = Math.max(0, Math.min(info.width - cw, Math.floor(info.width * r.x)));
+  const y = Math.max(0, Math.min(info.height - ch, Math.floor(info.height * r.y)));
+  return `crop=${cw}:${ch}:${x}:${y}`;
+}
+
 /** Escapes a Windows path for use inside an ffmpeg filter option. */
 export function filterPath(p: string): string {
   return p.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'");
+}
+
+/** A picture's size in pixels (png / jpg / webp), or null if it can't be read. */
+export function imageSize(path: string): { w: number; h: number } | null {
+  const r = spawnSync(FFPROBE, ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=p=0', path], { encoding: 'utf8' });
+  const [w, h] = (r.stdout ?? '').trim().split(',').map(Number);
+  return r.status === 0 && w > 0 && h > 0 ? { w, h } : null;
 }

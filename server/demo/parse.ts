@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { gunzipSync } from 'node:zlib';
 import { decompress as zstdDecompress } from 'fzstd';
 import { repairDemo } from './repair.ts';
-import type { BombEvent, CombatEvent, Kill, MatchData, Player, Round, RoundIntro, Side } from '../types.ts';
+import type { BombEvent, CombatEvent, Kill, MatchData, Player, Round, RoundIntro, Side, UtilityKind, UtilityThrow } from '../types.ts';
 
 const require = createRequire(import.meta.url);
 const dp = require('@laihoe/demoparser2') as typeof import('@laihoe/demoparser2');
@@ -29,6 +29,30 @@ export function sideOf(v: unknown): Side | null {
 
 const sid = (v: unknown): string | null =>
   v === null || v === undefined || v === '' || v === '0' || v === 0 ? null : String(v);
+
+/**
+ * A player's id: the steam id, or for a bot (steam id 0, e.g. one that took
+ * over for a player who left) "bot:<name>", so kills on and by bots aren't
+ * lost. `team` is required for the bot form: world / bomb deaths have no
+ * attacker team.
+ */
+const pid = (steamid: unknown, name: unknown, team?: unknown): string | null =>
+  sid(steamid) ?? (name && String(name).trim() && (team === undefined || sideOf(team)) ? `bot:${String(name).trim()}` : null);
+
+/**
+ * Who died in a player_death event. A bot that took over for a player who left
+ * can die with no victim info at all; a real killer and weapon make that a
+ * kill on a bot of the killer's enemy team. A victimless "world" death with no
+ * killer is a bot being removed, not a kill (null).
+ */
+export function deathVictim(e: Row): { id: string; name: string; side: Side | null } | null {
+  const id = pid(e.user_steamid, e.user_name, e.user_team_num);
+  if (id) return { id, name: String(e.user_name ?? ''), side: sideOf(e.user_team_num) };
+  const killer = pid(e.attacker_steamid, e.attacker_name, e.attacker_team_num);
+  if (!killer || e.weapon === 'world') return null;
+  const killerSide = sideOf(e.attacker_team_num);
+  return { id: `bot:${e.tick}`, name: 'BOT', side: killerSide ? (killerSide === 'T' ? 'CT' : 'T') : null };
+}
 
 export function parseDemo(demoPath: string, mySteamId?: string): MatchData {
   const buf = loadDemo(demoPath);
@@ -64,6 +88,7 @@ function parseBuffer(demoPath: string, buf: Buffer, mySteamId?: string): MatchDa
       'bomb_exploded',
       'weapon_fire',
       'player_hurt',
+      'player_blind',
     ],
     ['team_num'],
     ['is_warmup_period'],
@@ -76,26 +101,43 @@ function parseBuffer(demoPath: string, buf: Buffer, mySteamId?: string): MatchDa
   const kills: Kill[] = [];
   const bombs: BombEvent[] = [];
   const combat: CombatEvent[] = [];
+  const utility: UtilityThrow[] = [];
   for (const e of events) {
     const round = roundAt(e.tick);
     if (round === 0) continue;
     if (e.event_name === 'weapon_fire') {
-      combat.push({ tick: e.tick, attacker: sid(e.user_steamid), victim: null });
+      const player = pid(e.user_steamid, e.user_name, e.user_team_num);
+      combat.push({ tick: e.tick, attacker: player, victim: null });
+      const kind = GRENADES[String(e.weapon ?? '')];
+      if (kind) utility.push({ tick: e.tick, round, player, kind, blinded: 0 });
+    } else if (e.event_name === 'player_blind') {
+      // credit the thrower's latest flash, if it was thrown just before
+      const thrower = pid(e.attacker_steamid, e.attacker_name, e.attacker_team_num);
+      const enemy = sideOf(e.attacker_team_num) && sideOf(e.user_team_num) && sideOf(e.attacker_team_num) !== sideOf(e.user_team_num);
+      if (!thrower || !enemy || Number(e.blind_duration ?? 0) < MIN_BLIND_S) continue;
+      const flash = utility.filter((u) => u.kind === 'flash' && u.player === thrower).at(-1);
+      if (flash && e.tick - flash.tick <= FLASH_WINDOW_S * CS2_TICKRATE) flash.blinded++;
     } else if (e.event_name === 'player_hurt') {
-      combat.push({ tick: e.tick, attacker: sid(e.attacker_steamid), victim: sid(e.user_steamid) });
+      combat.push({
+        tick: e.tick,
+        attacker: pid(e.attacker_steamid, e.attacker_name, e.attacker_team_num),
+        victim: pid(e.user_steamid, e.user_name, e.user_team_num),
+      });
     } else if (e.event_name === 'player_death') {
-      const victim = sid(e.user_steamid);
-      if (!victim) continue;
+      const attacker = pid(e.attacker_steamid, e.attacker_name, e.attacker_team_num);
+      const attackerSide = sideOf(e.attacker_team_num);
+      const v = deathVictim(e);
+      if (!v) continue;
       kills.push({
         tick: e.tick,
         round,
-        attacker: sid(e.attacker_steamid),
+        attacker,
         attackerName: String(e.attacker_name ?? ''),
-        attackerSide: sideOf(e.attacker_team_num),
-        victim,
-        victimName: String(e.user_name ?? ''),
-        victimSide: sideOf(e.user_team_num),
-        assister: sid(e.assister_steamid),
+        attackerSide,
+        victim: v.id,
+        victimName: v.name,
+        victimSide: v.side,
+        assister: pid(e.assister_steamid, e.assister_name, e.assister_team_num),
         assisterName: String(e.assister_name ?? ''),
         flashAssist: !!e.assistedflash,
         weapon: String(e.weapon ?? ''),
@@ -128,8 +170,20 @@ function parseBuffer(demoPath: string, buf: Buffer, mySteamId?: string): MatchDa
     kills,
     bombs,
     combat,
+    utility,
   };
 }
+
+const GRENADES: Record<string, UtilityKind> = {
+  weapon_smokegrenade: 'smoke',
+  weapon_flashbang: 'flash',
+  weapon_hegrenade: 'he',
+  weapon_molotov: 'molotov',
+  weapon_incgrenade: 'molotov',
+  weapon_decoy: 'decoy',
+};
+const MIN_BLIND_S = 1; // shorter is a glance, not a flash that matters
+const FLASH_WINDOW_S = 4; // throw to pop is ~1.6 s
 
 /**
  * Rounds run from freeze-time end to round_end. Everything before the last
@@ -203,7 +257,7 @@ function attachRosters(buf: Buffer, rounds: Round[]) {
   for (const row of rows) {
     const round = byTick.get(row.tick);
     const side = sideOf(row.team_num);
-    const id = sid(row.steamid);
+    const id = pid(row.steamid, row.name, row.team_num);
     if (round && side && id && row.is_alive !== false) round.roster[id] = side;
   }
 }

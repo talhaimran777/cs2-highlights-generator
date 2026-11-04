@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
-import { FFMPEG, type VideoInfo } from '../util/ffmpeg.ts';
+import { audioTracksArgs, FFMPEG, type VideoInfo } from '../util/ffmpeg.ts';
 
 const require = createRequire(import.meta.url);
 const ort = require('onnxruntime-node') as typeof import('onnxruntime-node');
@@ -67,10 +67,7 @@ export async function detectSpeech(
   if (tracks.length === 0) return { tracks, raw: [], utterances: [] };
   const session = await ort.InferenceSession.create(MODEL);
   const band = 'highpass=f=150,lowpass=f=4000';
-  const audio =
-    tracks.length === 1
-      ? ['-map', `0:a:${tracks[0]}`, '-af', band]
-      : ['-filter_complex', `${tracks.map((t) => `[0:a:${t}]`).join('')}amix=inputs=${tracks.length}:normalize=0,${band}[v]`, '-map', '[v]'];
+  const audio = audioTracksArgs(tracks, band);
   const ff = spawn(
     FFMPEG,
     ['-hide_banner', '-loglevel', 'error', '-i', videoPath, '-vn', ...audio, '-ac', '1', '-ar', String(SAMPLE_RATE), '-f', 'f32le', '-'],
@@ -82,6 +79,8 @@ export async function detectSpeech(
     ff.on('error', reject);
     ff.on('close', resolve);
   });
+  // a cancel rejects this while the frames are still being read; it's awaited after, so don't let it crash the server meanwhile
+  exited.catch(() => {});
 
   const totalFrames = Math.ceil((info.duration * SAMPLE_RATE) / FRAME);
   const probs = new Float32Array(totalFrames + 64);
