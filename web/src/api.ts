@@ -2,13 +2,19 @@ import type { CaptionLine, CaptionSettings, CaptionWord, Clip, Edits, FeedKill, 
 import type { VideoInfo } from '../../server/util/ffmpeg.ts';
 import type { Job } from '../../server/jobs.ts';
 import type { ExportSettings } from '../../server/edit/render.ts';
+import type { TitleIdea, TitleSet } from '../../server/titles/generate.ts';
 
+export type { TitleIdea, TitleSet };
 export type { CaptionLine, CaptionSettings, CaptionWord, Clip, Edits, FeedKill, Kill, Moment, Rect, Settings, Short, ShortLayout, Source, SyncModel, Job, ExportSettings };
 
 export interface ProjectView {
   id: string;
   /** 'captions' / 'edit': a recording without a demo, used whole; 'clips': OBS replay clips back to back */
   mode?: 'match' | 'captions' | 'edit' | 'clips';
+  /** clips mode, one clip made straight into a short (it opens in the short editor) */
+  direct?: boolean;
+  /** clips mode: CS2 clips whose kill feed Claude reads; false: any game, every clip whole (missing = read) */
+  readKillfeed?: boolean;
   /** clips mode: the clips, in timeline order */
   sources?: Source[];
   analyzeJob: Job | null;
@@ -47,6 +53,15 @@ export interface ProjectView {
   /** rounds (clip numbers in clips mode) with enough kills for a short */
   shortRounds: number[];
   shorts?: Short[];
+  /** Claude's YouTube titles for the highlight video */
+  titles?: (TitleSet & { generatedAt: string; direction: string }) | null;
+  titlesJob: Job | null;
+  /** this project can have titles (a demo, the player picked) */
+  titlesPossible: boolean;
+  /** an Anthropic key is set */
+  titlesAvailable: boolean;
+  /** who the creator is, the same for every match */
+  creatorProfile: string;
 }
 
 /** A short with its pieces, as the short page needs it. */
@@ -60,10 +75,27 @@ export interface ShortView {
   duration: number;
   /** where a looping short is cut (recording seconds): it opens there and ends right before it; null = it doesn't loop */
   loopCut: number | null;
+  /** per title font: its letters' size in the export against CSS at the same size, its baseline and capital height */
+  titleFonts: Record<string, { scale: number; ascent: number | null; cap: number | null }>;
   /** the short's size in pixels (9:16) */
   frame: { width: number; height: number };
   defaultOutputPath: string;
   renderJob: Job | null;
+  /** the 1080p export for Instagram, TikTok and Facebook */
+  socialJob: Job | null;
+  defaultSocialPath: string;
+  /** a clip made straight into a short (from the home page) */
+  direct: boolean;
+  /** its kill feed being read by Claude */
+  readJob: Job | null;
+  /** the kill feed is known (a demo, or CS2 clips read by Claude); off: any game, no kill feed or titles */
+  killfeed: boolean;
+  /** the latest Shorts titles job */
+  titlesJob: Job | null;
+  /** an Anthropic key is set */
+  titlesAvailable: boolean;
+  /** who the creator is, the same for every match */
+  creatorProfile: string;
 }
 
 export interface FsEntry {
@@ -93,7 +125,9 @@ export const api = {
   create: (videoPath: string, demoPath: string) => req<ProjectView>('POST', '/api/projects', { videoPath, demoPath }),
   createCaptionTest: (videoPath: string) => req<ProjectView>('POST', '/api/projects/captions-test', { videoPath }),
   createEditTest: (videoPath: string) => req<ProjectView>('POST', '/api/projects/edit-test', { videoPath }),
-  createClips: (paths: string[], playerName: string) => req<ProjectView>('POST', '/api/projects/clips', { paths, playerName }),
+  createClips: (paths: string[], playerName: string, readKillfeed = true) => req<ProjectView>('POST', '/api/projects/clips', { paths, playerName, readKillfeed }),
+  /** one clip straight into a short: opens in the short editor */
+  createDirectShort: (path: string, playerName: string, readKillfeed = true) => req<{ id: string; shortId: string }>('POST', '/api/projects/short', { path, playerName, readKillfeed }),
   /** reads the unread clips, all of them `again`, or just the clips `ids` */
   analyze: (id: string, again = false, ids?: string[]) => req<Job>('POST', `/api/projects/${id}/analyze`, { again, ids }),
   get: (id: string) => req<ProjectView>('GET', `/api/projects/${id}`),
@@ -114,6 +148,8 @@ export const api = {
   captionsStatus: () => req<{ ok: boolean; missing: string[]; fonts: string[]; cleanup: boolean }>('GET', '/api/captions/status'),
   alignCaptions: (id: string) => req<Job>('POST', `/api/projects/${id}/captions/align`),
   cleanupCaptions: (id: string) => req<Job>('POST', `/api/projects/${id}/captions/cleanup`),
+  writeTitles: (id: string, direction: string) => req<Job>('POST', `/api/projects/${id}/titles`, { direction }),
+  writeShortTitles: (id: string, sid: string, direction: string) => req<Job>('POST', `/api/projects/${id}/shorts/${sid}/titles`, { direction }),
   /** the round's short (made on first use) */
   createShort: (id: string, round: number) => req<ShortView>('POST', `/api/projects/${id}/shorts`, { round }),
   short: (id: string, sid: string) => req<ShortView>('GET', `/api/projects/${id}/shorts/${sid}`),
@@ -128,12 +164,14 @@ export const api = {
       killfeed?: Partial<Settings['shortKillfeed']>;
       overlay?: Partial<Settings['shortOverlay']>;
       loop?: Partial<Settings['shortLoop']>;
+      title?: string;
+      titleStyle?: Partial<Settings['shortTitle']>;
     },
   ) =>
     req<ShortView>('PATCH', `/api/projects/${id}/shorts/${sid}`, body),
   /** the game's own kill-feed entry for each kill of the short (time order), null where none was found */
   shortFeed: (id: string, sid: string) => req<({ url: string; w: number; h: number } | null)[]>('GET', `/api/projects/${id}/shorts/${sid}/feed`),
-  renderShort: (id: string, sid: string) => req<Job>('POST', `/api/projects/${id}/shorts/${sid}/render`),
+  renderShort: (id: string, sid: string, social = false) => req<Job>('POST', `/api/projects/${id}/shorts/${sid}/render${social ? '?for=social' : ''}`),
   job: (id: string) => req<Job | null>('GET', `/api/jobs/${id}`),
   cancel: (id: string) => req('DELETE', `/api/jobs/${id}`),
 };

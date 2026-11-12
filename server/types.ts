@@ -89,7 +89,7 @@ export interface RoundIntro {
   place: string;
 }
 
-export type MomentKind = 'intro' | 'kills' | 'clutch' | 'bomb' | 'assist' | 'team' | 'decider' | 'death' | 'funny' | 'fight' | 'utility';
+export type MomentKind = 'intro' | 'kills' | 'clutch' | 'bomb' | 'assist' | 'team' | 'decider' | 'death' | 'funny' | 'fight' | 'utility' | 'clip';
 
 export interface Moment {
   id: string;
@@ -139,6 +139,8 @@ export interface Clip {
   bounds?: [number, number];
   /** a looping short's seam: this edge runs straight on in the recording, so its sound isn't faded there */
   seamless?: 'start' | 'end';
+  /** crossfade into this piece from the one before it over this many seconds (picture and sound) */
+  blend?: number;
 }
 
 /** One red-outlined kill-feed entry (it involves me), as read from a replay clip. */
@@ -204,13 +206,33 @@ export interface Rect {
   h: number;
 }
 
-/** Where a short's two bands come from: the facecam on top, gameplay below. */
+/** Where a short's bands come from: the facecam on top (when there's one), gameplay below. */
 export interface ShortLayout {
   camera: Rect;
   gameplay: Rect;
-  /** the camera band's share of the short's height */
+  /** the camera band's share of the short's height (kept while the camera is off, for when it's back on) */
   split: number;
+  /**
+   * the bottom band's share of the short's height, kept clear of the gameplay
+   * (YouTube lays its title, channel and buttons there) and filled with it
+   * blurred; missing = DEFAULT_SAFE_BOTTOM
+   */
+  bottom?: number;
+  /**
+   * the facecam: 'off' (none: the gameplay runs up to a top safe band),
+   * 'float' (as 'off', with the camera in a box on top, anywhere: `pip`) or
+   * 'band' (its own band above the gameplay); missing = from `noCamera`
+   */
+  webcam?: WebcamMode;
+  /** older layouts: no facecam ('off'); missing = 'band' */
+  noCamera?: boolean;
+  /** with no camera band, the top band's share of the short's height, filled with the gameplay blurred; missing = DEFAULT_SAFE_TOP */
+  top?: number;
+  /** the floating webcam: its top-left corner and width, as shares of the short's frame (its height follows the camera crop's shape) */
+  pip?: { x: number; y: number; w: number };
 }
+
+export type WebcamMode = 'off' | 'float' | 'band';
 
 /** One of my kills, for a short's own kill feed; `at` is timeline seconds. */
 export interface FeedKill {
@@ -233,7 +255,23 @@ export interface Short {
   round: number;
   layout: ShortLayout;
   edits: Edits;
+  /** the YouTube export: the recording's own quality */
   outputPath: string | null;
+  /** the export for Instagram, TikTok and Facebook: 1080p, made to survive their re-encoding */
+  socialOutputPath?: string | null;
+  /** shown over the whole short (what it's about); lines break where it has a newline */
+  title?: string;
+  /** YouTube Shorts titles and thumbnail text, written by Claude from the round's story */
+  titles?: ShortTitles | null;
+}
+
+/** Titles written by Claude (the shape of titles/generate.ts's TitleSet, kept here so types.ts imports nothing) */
+export interface ShortTitles {
+  arc: string;
+  ideas: { title: string; thumbnail: string; angle: string; why: string; rounds: number[] }[];
+  best: number;
+  generatedAt: string;
+  direction: string;
 }
 
 /** A transcribed word, in recording seconds; `text` is what's shown (English or Roman Urdu). */
@@ -336,6 +374,10 @@ export interface Settings {
     scale: number;
     /** which side of the short the rows line up on */
     align: 'left' | 'center' | 'right';
+    /** gap between the feed and that side, % of the short's width (not used when centred) */
+    sidePct: number;
+    /** seconds a row stays up after its kill before it fades out, as in the game; 0 = up for the rest of the short */
+    stay: number;
   };
   /**
    * a picture laid over every short (a "follow me" badge, a logo), placed by
@@ -350,13 +392,21 @@ export interface Settings {
     w: number;
     /** lined up on a side or exactly centred (kept while resizing); 'free' = where it was dragged (x) */
     align: 'free' | 'left' | 'center' | 'right';
+    /** 1 = solid; lower lets the video show through */
+    opacity: number;
   };
   /**
-   * a short that loops: it's cut `lead` seconds before the final kill and the
-   * part from there to the end moved to the front, so it opens on the payoff
-   * and its end runs straight (same footage, no transition) into its start
+   * a short that loops: it's cut `after` seconds after the final kill and the
+   * reaction from there to the end moved to the front. It opens on the
+   * reaction, blends into the round's start and ends on the final kill, which
+   * runs straight (same footage, no transition) into the reaction again
    */
-  shortLoop: { enabled: boolean; lead: number };
+  shortLoop: { enabled: boolean; after: number };
+  /** a short's title (its text is per short): one of the title presets, its size and where its top is, as % of the frame height */
+  /** aboveGameplay: kept just above the gameplay (shorts/title.ts placeTitle), whatever positionPct says */
+  shortTitle: { preset: string; sizePct: number; positionPct: number; lineHeight: number; wordSpacing: number; aboveGameplay: boolean };
+  /** who the creator is (role, rank, style, catchphrases, audience), for Claude's YouTube titles; the same for every match */
+  creatorProfile: string;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -390,10 +440,18 @@ export const DEFAULT_SETTINGS: Settings = {
     camera: { x: 0, y: 0.65, w: 0.3, h: 0.332 },
     gameplay: { x: 0.256, y: 0, w: 0.487, h: 1 },
     split: 0.35,
+    bottom: 0.15,
+    // no webcam band: the gameplay between a top and a bottom safe band (a webcam can float on top, or have its band)
+    webcam: 'off',
+    top: 0.15,
   },
   shortCaptions: { sizePct: 4, positionPct: 35 },
-  shortKillfeed: { enabled: true, positionPct: null, scale: 1, align: 'right' },
+  shortKillfeed: { enabled: true, positionPct: null, scale: 1, align: 'right', sidePct: 3.5, stay: 6 },
   // near the bottom, most of the width: where a "follow me" badge usually sits
-  shortOverlay: { enabled: true, path: '', x: 0.1, y: 0.8, w: 0.8, align: 'center' },
-  shortLoop: { enabled: true, lead: 1 },
+  shortOverlay: { enabled: true, path: '', x: 0.1, y: 0.8, w: 0.8, align: 'center', opacity: 1 },
+  shortLoop: { enabled: true, after: 0.5 },
+  // TEYE's look: Bold White, big enough for a phone, a third of the way down
+  // kept just above the gameplay: the same place in every short, clear of the crosshair
+  shortTitle: { preset: 'bold', sizePct: 6.5, positionPct: 32, lineHeight: 0.85, wordSpacing: 1, aboveGameplay: true },
+  creatorProfile: '',
 };

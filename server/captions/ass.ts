@@ -45,7 +45,8 @@ export function chunkWords(words: CaptionWord[], maxWords = 2, maxChars = 18, pa
 /** Caption text can't contain ASS override braces or backslashes. */
 export const escapeAss = (s: string) => s.replace(/\\/g, '/').replace(/\{/g, '(').replace(/\}/g, ')').replace(/\n/g, ' ');
 
-function time(sec: number) {
+/** seconds -> ASS "h:mm:ss.cc" */
+export function time(sec: number) {
   const cs = Math.max(0, Math.round(sec * 100));
   const h = Math.floor(cs / 360000);
   const m = Math.floor((cs % 360000) / 6000);

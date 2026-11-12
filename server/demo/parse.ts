@@ -1,7 +1,7 @@
 import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
 import { gunzipSync } from 'node:zlib';
-import { decompress as zstdDecompress } from 'fzstd';
+import { Decompress } from 'fzstd';
 import { repairDemo } from './repair.ts';
 import type { BombEvent, CombatEvent, Kill, MatchData, Player, Round, RoundIntro, Side, UtilityKind, UtilityThrow } from '../types.ts';
 
@@ -16,9 +16,25 @@ type Row = Record<string, any>;
 export function loadDemo(path: string): Buffer {
   const raw = readFileSync(path);
   const lower = path.toLowerCase();
-  if (lower.endsWith('.zst')) return Buffer.from(zstdDecompress(raw));
+  if (lower.endsWith('.zst')) return zstdDecompress(raw);
   if (lower.endsWith('.gz')) return gunzipSync(raw);
   return raw;
+}
+
+const ZSTD_CHUNK = 1 << 20;
+
+/**
+ * zstd, decoded as a stream: fzstd's one-shot decompress() rejects some FACEIT
+ * demos ("invalid zstd data") that its streaming decoder reads in full.
+ */
+export function zstdDecompress(raw: Uint8Array): Buffer {
+  const parts: Uint8Array[] = [];
+  const d = new Decompress((chunk) => parts.push(chunk));
+  for (let at = 0; at < raw.length; at += ZSTD_CHUNK) {
+    const end = Math.min(raw.length, at + ZSTD_CHUNK);
+    d.push(raw.subarray(at, end), end === raw.length);
+  }
+  return Buffer.concat(parts);
 }
 
 export function sideOf(v: unknown): Side | null {

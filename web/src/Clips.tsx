@@ -22,12 +22,58 @@ function readLastDir() {
   }
 }
 
-/** New clips project: a folder of replay clips (oldest first, untick any) and your in-game name. */
+const READ_FEED_KEY = 'cs2h:readKillfeed';
+
+/** Whether new clips are CS2 clips whose kill feed is read: remembered on this computer (off at first). */
+export function useReadKillfeed(): [boolean, (on: boolean) => void] {
+  const [on, setOn] = useState(() => {
+    try {
+      return localStorage.getItem(READ_FEED_KEY) === '1';
+    } catch {
+      return false;
+    }
+  });
+  const set = (v: boolean) => {
+    setOn(v);
+    try {
+      localStorage.setItem(READ_FEED_KEY, v ? '1' : '0');
+    } catch {
+      // not remembered: fine
+    }
+  };
+  return [on, set];
+}
+
+/**
+ * CS2 or any game: ticked, Claude reads the clips' kill feed (your kills,
+ * what's kept, the short's kill feed), which needs your in-game name; unticked
+ * (GTA, anything), every clip is used whole and nothing is read.
+ */
+export function KillfeedChoice({ on, setOn, name, setName }: { on: boolean; setOn: (on: boolean) => void; name: string; setName: (n: string) => void }) {
+  return (
+    <>
+      <label className="row">
+        <input type="checkbox" checked={on} onChange={(e) => setOn(e.target.checked)} />
+        <span>CS2: read the kill feed with Claude</span>
+        <span className="muted small">{on ? 'finds your kills (Claude sees a few small screenshots)' : 'off: any game, every clip used whole, nothing read'}</span>
+      </label>
+      {on && (
+        <label className="field">
+          <span>Your in-game name</span>
+          <input className="input" placeholder="As it shows in the kill feed" value={name} onChange={(e) => setName(e.target.value)} />
+        </label>
+      )}
+    </>
+  );
+}
+
+/** New clips project: a folder of replay clips (oldest first, untick any) and, for CS2, your in-game name. */
 export function ClipsForm() {
   const [dir, setDir] = useState(readLastDir);
   const [listing, setListing] = useState<{ path: string; parent: string | null; entries: FsEntry[] } | null>(null);
   const [skipped, setSkipped] = useState<Set<string>>(new Set());
   const [name, setName] = useState('');
+  const [read, setRead] = useReadKillfeed();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
 
@@ -66,6 +112,7 @@ export function ClipsForm() {
       const p = await api.createClips(
         chosen.map((c) => c.path),
         name,
+        read,
       );
       location.hash = p.id;
     } catch (e: any) {
@@ -77,10 +124,7 @@ export function ClipsForm() {
 
   return (
     <>
-      <label className="field">
-        <span>Your in-game name</span>
-        <input className="input" placeholder="As it shows in the kill feed" value={name} onChange={(e) => setName(e.target.value)} />
-      </label>
+      <KillfeedChoice on={read} setOn={setRead} name={name} setName={setName} />
       <div className="field">
         <span>Clips folder</span>
         <div className="browser">
@@ -256,6 +300,8 @@ export function ClipsHighlightsStep({
   const patchMoments = (patch: Record<string, Partial<Moment>>) => update(() => api.patch(p.id, { moments: patch }));
   const clipOf = (m: Moment) => p.clips.find((c) => c.momentIds.includes(m.id));
   const setting = (burstGap: number) => update(() => api.patch(p.id, { settings: { burstGap } }));
+  // CS2 clips read by Claude; off, any game: every clip whole
+  const read = p.readKillfeed !== false;
 
   return (
     <>
@@ -269,6 +315,7 @@ export function ClipsHighlightsStep({
             Edit →
           </button>
         </div>
+        {read && (
         <label className="row small">
           <span className="muted">Kills further apart than</span>
           <input
@@ -282,6 +329,8 @@ export function ClipsHighlightsStep({
           />
           <span className="muted">seconds become separate pieces (the walking between them is cut).</span>
         </label>
+        )}
+        {!read && <div className="muted small">Every clip is used whole: untick one to leave it out, trim its ends here, or cut it down in the editor.</div>}
       </section>
       {speech && <section className="card">{speech}</section>}
 
@@ -294,14 +343,14 @@ export function ClipsHighlightsStep({
               <span className="muted small">{s.name}</span>
               {p.shortRounds.includes(i + 1) && <CreateShortButton p={p} round={i + 1} />}
               <span className="grow" />
-              {clipStatus(s, moments)}
+              {read && clipStatus(s, moments)}
             </div>
             {moments.map((m) => {
               const clip = clipOf(m);
               return (
                 <div key={m.id} className={`moment ${m.enabled ? '' : 'off'}`}>
                   <input type="checkbox" checked={m.enabled} onChange={(e) => patchMoments({ [m.id]: { enabled: e.target.checked } })} />
-                  <span className="chip kind-kills on">Kills</span>
+                  <span className="chip kind-kills on">{m.kind === 'clip' ? 'Clip' : 'Kills'}</span>
                   <span className="label" title={m.label}>
                     {m.label}
                   </span>

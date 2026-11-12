@@ -11,14 +11,18 @@ import { join } from 'node:path';
 import { FFMPEG, type VideoInfo } from '../util/ffmpeg.ts';
 import type { FeedKill, Rect } from '../types.ts';
 
-/** a new entry fades in: looked for from this long after the kill, for this long, at this many frames a second */
+/**
+ * a new entry fades in: looked for from this long after the kill, for this
+ * long (a flashbang can white out the screen for a few seconds), at this many
+ * frames a second
+ */
 const LOOK_FROM_S = 0.3;
-const LOOK_FOR_S = 2.7;
+const LOOK_FOR_S = 5;
 const LOOK_FPS = 8;
 /** once it's in, the best-looking of this many frames (about a second) is kept */
 const PICK_FRAMES = 8;
 /** bump when the cut-outs change, so cached ones are made again */
-const CUT_VERSION = 4;
+const CUT_VERSION = 5;
 /** the feed just before the kill, to tell the new entry from the ones already up */
 const BEFORE_S = 0.25;
 /** shortest red run that can be a border, as a fraction of the region width */
@@ -155,15 +159,23 @@ const ENTRY_BG = [18, 18, 20];
 /** the red outline's thickness in a 1440p recording (scaled up for the short anyway) */
 const OUTLINE_PX = 2;
 
-/** How well an entry shows in a frame: text fully faded in first, then the darkest background. */
+/**
+ * share of an entry that's dark background when it shows clearly (about 0.75);
+ * a flashbang's white-out or a fade-in leaves much less
+ */
+const CLEAR_DARK = 0.65;
+
+/** How well an entry shows in a frame: text fully faded in first, then the darkest background; `dark` is the share that's background. */
 function entryScore(rgb: Uint8Array, width: number, b: Box) {
   let text = 0;
   let bg = 0;
   let bgN = 0;
+  let n = 0;
   for (let y = b.y0 + 4; y <= b.y1 - 4; y++) {
     for (let x = b.x0 + 4; x <= b.x1 - 4; x++) {
       const i = (y * width + x) * 3;
       const v = Math.max(rgb[i], rgb[i + 1], rgb[i + 2]);
+      n++;
       if (v >= TEXT_MIN) text++;
       else if (v < BG_MAX) {
         bg += v;
@@ -171,7 +183,7 @@ function entryScore(rgb: Uint8Array, width: number, b: Box) {
       }
     }
   }
-  return { text, bg: bgN ? bg / bgN : 255 };
+  return { text, bg: bgN ? bg / bgN : 255, dark: n ? bgN / n : 0 };
 }
 
 /**
@@ -254,17 +266,25 @@ export async function grabFeedEntries(
     // the feed after the kill, in one pass: the entry fades in, then stays for several seconds
     const from = Math.max(0, local + LOOK_FROM_S);
     const frames = await grabRegion(src.path, from, crop, signal, Math.min(LOOK_FOR_S, src.info.duration - from), LOOK_FPS);
+    // the first frame where the new entry shows clearly; failing that (it never does), the first where it shows at all
     let found: { at: number; box: Box } | null = null;
+    let faint: { at: number; box: Box } | null = null;
     for (const [j, rgb] of frames.entries()) {
       const t = from + j / LOOK_FPS;
       // a later kill whose entry is already in by then sits below this one
       const later = sorted.slice(i + 1).filter((x) => x.at - src.offset <= t && sourceOf(x.at).path === src.path).length;
       const fresh = newBoxes(before, boxes(rgb));
       if (fresh.length >= 1 + later) {
-        found = { at: j, box: fresh[fresh.length - 1 - later] };
-        break;
+        const box = fresh[fresh.length - 1 - later];
+        faint ??= { at: j, box };
+        // while flashed, the outline and the entry are washed out (and the box found may be only part of it)
+        if (entryScore(rgb, crop.w, box).dark >= CLEAR_DARK) {
+          found = { at: j, box };
+          break;
+        }
       }
     }
+    found ??= faint;
     if (!found) {
       writeFileSync(none, '');
       out.push(null);
@@ -280,6 +300,8 @@ export async function grabFeedEntries(
         .sort((a, b) => Math.abs(a.y0 - found!.box.y0) - Math.abs(b.y0 - found!.box.y0))[0];
       if (!same) continue;
       const score = entryScore(rgb, crop.w, same);
+      // never a frame that shows it less clearly (a flash coming back, the feed fading)
+      if (score.dark < Math.min(CLEAR_DARK, best.score.dark)) continue;
       if (score.text > best.score.text * 1.02 || (score.text >= best.score.text * 0.98 && score.bg < best.score.bg)) best = { rgb, box: same, score };
     }
     const entry = cleanEntry(best.rgb, crop.w, best.box);

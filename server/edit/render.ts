@@ -27,6 +27,8 @@ export interface RenderInput {
    * that makes it from a source's video ([0:v] in, its last chain's output out).
    */
   frame?: { width: number; height: number; graph: (src: VideoInfo) => string; overlays?: (clip: Clip) => Overlay[] };
+  /** made for Instagram, TikTok and Facebook (see SOCIAL) instead of the source's own settings */
+  social?: boolean;
 }
 
 /** A picture laid over a clip from `from` seconds into it (sliding in when that's inside the clip), in output pixels. */
@@ -39,15 +41,25 @@ export interface Overlay {
   from: number;
   /** where it slides in from: +1 the right (default), -1 the left, 0 it only fades in */
   slide?: number;
+  /** 1 (default) = solid */
+  opacity?: number;
+  /** when it's gone (seconds into the clip), faded out over the `fadeOut` seconds before; missing = up to the end */
+  until?: number;
+  fadeOut?: number;
+  /** it moves up by `by` pixels at each of these times (into the clip), over `over` seconds: a kill-feed row whose rows above are gone */
+  up?: { at: number[]; by: number; over: number };
 }
 
 const SLIDE_S = 0.18;
 
-/** The clip's sound faded in and out at its cuts; not at a seamless edge (a looping short's seam). */
-function afade(clip: Clip, dur: number, fade: number): string[] {
+/**
+ * The clip's sound faded in and out at its cuts; not at a seamless edge (a
+ * looping short's seam) or where it's crossfaded with its neighbour.
+ */
+function afade(clip: Clip, next: Clip | undefined, dur: number, fade: number): string[] {
   const parts = [
-    ...(clip.seamless === 'start' ? [] : [`afade=t=in:d=${fade}`]),
-    ...(clip.seamless === 'end' ? [] : [`afade=t=out:st=${(dur - fade).toFixed(3)}:d=${fade}`]),
+    ...(clip.seamless === 'start' || clip.blend ? [] : [`afade=t=in:d=${fade}`]),
+    ...(clip.seamless === 'end' || next?.blend ? [] : [`afade=t=out:st=${(dur - fade).toFixed(3)}:d=${fade}`]),
   ];
   return parts.length ? ['-af', parts.join(',')] : [];
 }
@@ -58,10 +70,20 @@ export function overlayGraph(overlays: Overlay[], fps: string): { inputs: string
   const steps = overlays.map((o, n) => {
     const from = Math.max(0, o.from).toFixed(3);
     const slides = o.from > 0;
-    const pic = `[${n + 1}:v]scale=${o.w}:${o.h}:flags=lanczos,format=rgba${slides ? `,fade=t=in:st=${from}:d=${SLIDE_S}:alpha=1` : ''}[p${n}]`;
+    const see = o.opacity !== undefined && o.opacity < 1 ? `,colorchannelmixer=aa=${o.opacity.toFixed(3)}` : '';
+    // fading out before it's gone (a shorter fade when the clip starts part-way into it)
+    const fadeOut =
+      o.until !== undefined && o.fadeOut
+        ? `,fade=t=out:st=${Math.max(0, o.until - o.fadeOut).toFixed(3)}:d=${Math.max(0.001, Math.min(o.fadeOut, o.until)).toFixed(3)}:alpha=1`
+        : '';
+    const pic = `[${n + 1}:v]scale=${o.w}:${o.h}:flags=lanczos,format=rgba${see}${slides ? `,fade=t=in:st=${from}:d=${SLIDE_S}:alpha=1` : ''}${fadeOut}[p${n}]`;
     const dist = Math.round(o.h * 1.2) * (o.slide ?? 1);
     const x = slides && dist ? `'${o.x}+max(0\\,${from}+${SLIDE_S}-t)/${SLIDE_S}*(${dist})'` : String(o.x);
-    const lay = `[${n ? `o${n - 1}` : 'in'}][p${n}]overlay=x=${x}:y=${o.y}:enable='gte(t\\,${from})'${n === overlays.length - 1 ? '[out]' : `[o${n}]`}`;
+    // each move up eases in over `over` seconds (already done for a time before the clip)
+    const ups = o.up?.at.map((at) => `clip((t-(${at.toFixed(3)}))/${o.up!.over}\\,0\\,1)`) ?? [];
+    const y = ups.length ? `'${o.y}-${o.up!.by}*(${ups.join('+')})'` : String(o.y);
+    const shown = o.until !== undefined ? `between(t\\,${from}\\,${o.until.toFixed(3)})` : `gte(t\\,${from})`;
+    const lay = `[${n ? `o${n - 1}` : 'in'}][p${n}]overlay=x=${x}:y=${y}:enable='${shown}'${n === overlays.length - 1 ? '[out]' : `[o${n}]`}`;
     return `${pic};${lay}`;
   });
   return { inputs, graph: steps.join(';') };
@@ -177,8 +199,65 @@ export function encodeArgs(info: VideoInfo): string[] {
 }
 
 /**
+ * Instagram, TikTok and Facebook re-encode every upload, so a short for them
+ * is made to survive that: 1080 wide (their playback size: a bigger upload is
+ * scaled down by them anyway), H.264 High in MP4 (the codec all three take
+ * without a detour), 8-bit BT.709, at most 60 fps, a key frame every 2
+ * seconds, and a bitrate well above what they stream but under Meta's 25 Mbps
+ * cap: 16 Mbps at 60 fps (fast, detailed gameplay), 10 at 30, quality-led
+ * (constant quality, capped). One stereo AAC track at 48 kHz.
+ */
+export const SOCIAL = {
+  width: 1080,
+  maxFps: 60,
+  /** Mbps: what it aims at, and its cap, above / at 30 fps */
+  high: { target: 16, max: 20 },
+  low: { target: 10, max: 14 },
+  audioKbps: 256,
+  /** seconds between key frames */
+  gop: 2,
+};
+
+const fpsValue = (fps: string) => {
+  const [n, d] = fps.split('/').map(Number);
+  return d ? n / d : n;
+};
+
+/** A social upload's frame rate: the recording's, at most 60. */
+export const socialFps = (fps: string) => (fpsValue(fps) > SOCIAL.maxFps + 0.01 ? `${SOCIAL.maxFps}/1` : fps);
+
+/** The output stream as a social upload has it: its frame rate capped, one audio track (the first: OBS's mix). */
+export const socialInfo = (info: VideoInfo): VideoInfo => ({ ...info, fps: socialFps(info.fps), audio: info.audio.slice(0, 1) });
+
+/** ffmpeg output options for a social upload (see SOCIAL); `info` as socialInfo gives it. */
+export function socialEncodeArgs(info: VideoInfo, nvenc = hasEncoder('h264_nvenc')): string[] {
+  const fps = fpsValue(info.fps);
+  const rate = fps > 30.5 ? SOCIAL.high : SOCIAL.low;
+  const m = (n: number) => `${n}M`;
+  const video = nvenc
+    ? [
+        '-c:v', 'h264_nvenc', '-preset', 'p7', '-tune', 'hq', '-rc', 'vbr', '-multipass', 'fullres',
+        // constant quality, held between the target and the cap
+        '-cq', '19', '-b:v', m(rate.target), '-maxrate', m(rate.max), '-bufsize', m(rate.max * 2),
+        '-spatial-aq', '1', '-temporal-aq', '1', '-rc-lookahead', '32', '-bf', '3',
+      ]
+    : ['-c:v', 'libx264', '-preset', 'slow', '-crf', '18', '-maxrate', m(rate.max), '-bufsize', m(rate.max * 2)];
+  return [
+    ...video,
+    '-profile:v', 'high', '-level:v', '4.2', '-pix_fmt', 'yuv420p',
+    '-g', String(Math.round(fps * SOCIAL.gop)),
+    '-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709', '-color_range', 'tv',
+    // NVENC only writes matrix and range itself
+    ...(nvenc ? ['-bsf:v', 'h264_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1:video_full_range_flag=0'] : []),
+    '-r', info.fps, '-video_track_timescale', '90000',
+    ...(info.audio.length ? ['-c:a', 'aac', '-b:a', `${SOCIAL.audioKbps}k`, '-ar', '48000', '-ac', '2'] : []),
+  ];
+}
+
+/**
  * Every segment (clips and title cards) is encoded with identical stream
- * layout, so the final join is a lossless concat. All OBS audio tracks are kept.
+ * layout, so the final join is a lossless concat. All OBS audio tracks are
+ * kept (a social upload: the first only).
  */
 export async function renderReel(
   input: RenderInput,
@@ -186,14 +265,16 @@ export async function renderReel(
   signal?: AbortSignal,
 ): Promise<string> {
   const { clips, workDir, frame } = input;
-  // the output: the source's settings, at the frame's size when there is one
-  const info = frame ? { ...input.info, width: frame.width, height: frame.height } : input.info;
+  // the output: the source's settings, at the frame's size when there is one (made for social media: see SOCIAL)
+  const sized = frame ? { ...input.info, width: frame.width, height: frame.height } : input.info;
+  const info = input.social ? socialInfo(sized) : sized;
   rmSync(workDir, { recursive: true, force: true });
   mkdirSync(workDir, { recursive: true });
 
-  const common = encodeArgs(info);
+  const common = input.social ? socialEncodeArgs(info) : encodeArgs(info);
+  const audioMap = input.social ? '0:a:0?' : '0:a?';
 
-  const plan: { kind: 'bookend' | 'card' | 'clip'; dur: number; run: (out: string, prog: (s: number) => void) => Promise<void> }[] = [];
+  const plan: { kind: 'bookend' | 'card' | 'clip'; dur: number; blend?: number; run: (out: string, prog: (s: number) => void) => Promise<void> }[] = [];
   const bookend = (b: Bookend) => ({
     kind: 'bookend' as const,
     dur: b.dur,
@@ -201,7 +282,7 @@ export async function renderReel(
   });
   if (input.intro) plan.push(bookend(input.intro));
   const seenRounds = new Set<number>();
-  for (const clip of clips) {
+  for (const [ci, clip] of clips.entries()) {
     const card = input.cards.get(clip.round);
     if (card && !seenRounds.has(clip.round)) {
       seenRounds.add(clip.round);
@@ -213,9 +294,12 @@ export async function renderReel(
     plan.push({
       kind: 'clip',
       dur,
+      blend: clip.blend,
       run: (out, prog) => {
         const src = input.sourceOf?.(clip) ?? { path: input.videoPath, info: input.info, offset: 0 };
         const filters: string[] = [];
+        // a social upload is limited-range BT.709: a full-range recording is converted, not just relabelled
+        if (input.social && src.info.encoding.colorRange === 'pc') filters.push('scale=in_range=pc:out_range=tv');
         // a clip recorded at another size or frame rate is conformed, so the lossless join still works
         if (!frame && (src.info.width !== info.width || src.info.height !== info.height)) {
           filters.push(`scale=${info.width}:${info.height}:force_original_aspect_ratio=decrease`, `pad=${info.width}:${info.height}:(ow-iw)/2:(oh-ih)/2`, 'setsar=1');
@@ -238,11 +322,11 @@ export async function renderReel(
               ? [
                   '-filter_complex',
                   lay ? `${frame.graph(src.info)}[in];${lay.graph};[out]${tail}` : `${frame.graph(src.info)},${tail}`,
-                  '-map', '[v]', '-map', '0:a?',
+                  '-map', '[v]', '-map', audioMap,
                 ]
-              : ['-map', '0:v:0', '-map', '0:a?', ...(filters.length ? ['-vf', filters.join(',')] : [])]),
+              : ['-map', '0:v:0', '-map', audioMap, ...(filters.length ? ['-vf', filters.join(',')] : [])]),
             // a short fade at each cut, except where a looping short's seam runs straight on
-            ...afade(clip, dur, fade),
+            ...afade(clip, clips[ci + 1], dur, fade),
             ...common, out,
           ],
           prog,
@@ -256,20 +340,53 @@ export async function renderReel(
 
   const total = plan.reduce((s, p) => s + p.dur, 0);
   let done = 0;
-  const segments: string[] = [];
+  const segments: { file: string; dur: number }[] = [];
   for (const [i, step] of plan.entries()) {
     const out = join(workDir, `seg_${String(i).padStart(4, '0')}.mp4`);
     await step.run(out, (s) => onProgress?.(Math.min(0.99, (done + Math.min(s, step.dur)) / total)));
     done += step.dur;
-    segments.push(out);
+    const prev = segments.at(-1);
+    const blend = step.blend && prev ? Math.min(step.blend, prev.dur / 2, step.dur / 2) : 0;
+    if (prev && blend > 0) {
+      // crossfaded with the segment before: the two become one (only these two are encoded again)
+      const both = out.replace(/\.mp4$/, '_blend.mp4');
+      await crossfade(prev, { file: out, dur: step.dur }, blend, info.audio.length, common, both, signal);
+      segments[segments.length - 1] = { file: both, dur: prev.dur + step.dur - blend };
+    } else {
+      segments.push({ file: out, dur: step.dur });
+    }
   }
 
   const list = join(workDir, 'segments.txt');
-  writeFileSync(list, segments.map((s) => `file '${s.replace(/\\/g, '/')}'`).join('\n'));
+  writeFileSync(list, segments.map((s) => `file '${s.file.replace(/\\/g, '/')}'`).join('\n'));
   await runFfmpeg(['-f', 'concat', '-safe', '0', '-i', list, '-map', '0', '-c', 'copy', '-movflags', '+faststart', input.outPath], undefined, signal);
   onProgress?.(1);
   rmSync(workDir, { recursive: true, force: true });
   return input.outPath;
+}
+
+/** Two segments as one, the first fading into the second over `blend` seconds, picture and every audio track. */
+function crossfade(
+  a: { file: string; dur: number },
+  b: { file: string; dur: number },
+  blend: number,
+  tracks: number,
+  common: string[],
+  out: string,
+  signal?: AbortSignal,
+) {
+  const d = blend.toFixed(3);
+  const sound = Array.from({ length: tracks }, (_, k) => `[0:a:${k}][1:a:${k}]acrossfade=d=${d}[a${k}]`);
+  return runFfmpeg(
+    [
+      '-i', a.file, '-i', b.file,
+      '-filter_complex', [`[0:v][1:v]xfade=transition=fade:duration=${d}:offset=${(a.dur - blend).toFixed(3)}[v]`, ...sound].join(';'),
+      '-map', '[v]', ...Array.from({ length: tracks }, (_, k) => ['-map', `[a${k}]`]).flat(),
+      ...common, out,
+    ],
+    undefined,
+    signal,
+  );
 }
 
 function renderCard(

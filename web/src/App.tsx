@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, fmtTime, locator, videoTime, waitJob, type CaptionSettings, type Job, type Moment, type ProjectView } from './api.ts';
 import { FilePicker } from './FilePicker.tsx';
-import { AnalyzeStep, ClipsForm, ClipsHighlightsStep } from './Clips.tsx';
+import { AnalyzeStep, ClipsForm, ClipsHighlightsStep, KillfeedChoice, useReadKillfeed } from './Clips.tsx';
 import { Progress } from './ui.tsx';
 import { Editor } from './Editor.tsx';
 import { CreateShortButton, ShortScreen } from './Short.tsx';
 import { BrandingSection } from './Branding.tsx';
+import { TitlesCard } from './Titles.tsx';
 import { CaptionPreview, type CaptionPreviewControl } from './CaptionPreview.tsx';
 
 type Step = 'player' | 'sync' | 'analyze' | 'highlights' | 'edit' | 'captions' | 'export';
@@ -29,10 +30,16 @@ const CLIPS_STEPS: { id: Step; label: string }[] = [
   { id: 'edit', label: '3 · Edit' },
   { id: 'export', label: '4 · Export' },
 ];
+/** clips of any game, kill feed not read: every clip whole */
+const WHOLE_CLIPS_STEPS: { id: Step; label: string }[] = [
+  { id: 'highlights', label: '1 · Clips' },
+  { id: 'edit', label: '2 · Edit' },
+  { id: 'export', label: '3 · Export' },
+];
 const recordingOnly = (p: Pick<ProjectView, 'mode'>) => p.mode === 'captions' || p.mode === 'edit';
 
 const KIND_LABEL: Record<Moment['kind'], string> = {
-  intro: 'Opening', clutch: 'Clutch', kills: 'Kills', bomb: 'Bomb', assist: 'Assist', team: 'Teammates', decider: 'Round end', funny: 'Funny', death: 'Death', fight: 'Fight', utility: 'Utility',
+  intro: 'Opening', clutch: 'Clutch', kills: 'Kills', bomb: 'Bomb', assist: 'Assist', team: 'Teammates', decider: 'Round end', funny: 'Funny', death: 'Death', fight: 'Fight', utility: 'Utility', clip: 'Clip',
 };
 const FULL_ROUND_HINT =
   'Opening: your rotation to your spot (shortened if long) and a few seconds of holding, leading into first contact. Untick to start the round at your first fight.';
@@ -75,7 +82,7 @@ function Health() {
 function Home() {
   const [video, setVideo] = useState('');
   const [demo, setDemo] = useState('');
-  const [mode, setMode] = useState<'match' | 'captions' | 'edit' | 'clips'>('match');
+  const [mode, setMode] = useState<'match' | 'captions' | 'edit' | 'clips' | 'short'>('match');
   const captionsOnly = mode === 'captions';
   const recordingTest = mode !== 'match';
   const [busy, setBusy] = useState(false);
@@ -84,7 +91,7 @@ function Home() {
   useEffect(() => void api.projects().then(setRecent).catch(() => {}), []);
 
   const create = async () => {
-    if (mode === 'clips') return; // the clips form creates its own project
+    if (mode === 'clips' || mode === 'short') return; // those forms create their own project
     setBusy(true);
     setError('');
     try {
@@ -106,13 +113,16 @@ function Home() {
     <main className="home">
       <section className="card">
         <div className="row spread">
-          <h1>{captionsOnly ? 'Captions test' : mode === 'edit' ? 'Editing test' : mode === 'clips' ? 'Replay clips' : 'New match'}</h1>
+          <h1>{captionsOnly ? 'Captions test' : mode === 'edit' ? 'Editing test' : mode === 'clips' ? 'Replay clips' : mode === 'short' ? 'Short from a clip' : 'New match'}</h1>
           <div className="steps">
             <button className={`step ${mode === 'match' ? 'active' : ''}`} onClick={() => setMode('match')}>
               Match + demo
             </button>
             <button className={`step ${mode === 'clips' ? 'active' : ''}`} onClick={() => setMode('clips')}>
               Replay clips
+            </button>
+            <button className={`step ${mode === 'short' ? 'active' : ''}`} onClick={() => setMode('short')}>
+              Short
             </button>
             <button className={`step ${captionsOnly ? 'active' : ''}`} onClick={() => setMode('captions')}>
               Captions test
@@ -122,11 +132,21 @@ function Home() {
             </button>
           </div>
         </div>
-        {mode === 'clips' ? (
+        {mode === 'short' ? (
           <>
             <p className="muted">
-              Pick the folder with your OBS replay clips, no demo needed. From each clip the last round with your kills is kept, and all clips
-              become one video. Files are read where they are; Claude only sees a few small screenshots of the kill feed and round timer.
+              Pick one clip of any game (your gameplay with your webcam) and it opens straight in the short editor: the whole clip, laid out for
+              9:16, ready to cut, title and export. For CS2, tick the kill feed and Claude reads it in the background, so the short gets your kills.
+              Files are read where they are.
+            </p>
+            <ShortForm />
+          </>
+        ) : mode === 'clips' ? (
+          <>
+            <p className="muted">
+              Pick the folder with your replay clips (any game), no demo needed; all clips become one video, each one whole, to cut in the editor.
+              For CS2, tick the kill feed: Claude reads it (a few small screenshots of the kill feed and round timer) and from each clip only the last
+              round with your kills is kept. Files are read where they are.
             </p>
             <ClipsForm />
           </>
@@ -181,6 +201,43 @@ function Home() {
   );
 }
 
+/** One clip straight into a short: the clip and your in-game name (to find your kills in its kill feed). */
+function ShortForm() {
+  const [path, setPath] = useState('');
+  const [name, setName] = useState('');
+  const [read, setRead] = useReadKillfeed();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  useEffect(() => void api.health().then((h) => setName(h.settings.playerName ?? '')).catch(() => {}), []);
+
+  const create = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      const r = await api.createDirectShort(path.trim(), name, read);
+      location.hash = `${r.id}/short/${r.shortId}`;
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <>
+      <label className="field">
+        <span>Clip</span>
+        <FilePicker kind="video" value={path} onChange={setPath} />
+      </label>
+      <KillfeedChoice on={read} setOn={setRead} name={name} setName={setName} />
+      {error && <div className="error">{error}</div>}
+      <button className="btn btn-primary" disabled={!path || busy} onClick={create}>
+        {busy ? 'Opening clip…' : 'Make a short'}
+      </button>
+    </>
+  );
+}
+
 /** Shared preview player; plays a range and stops at its end. */
 function usePreview() {
   const ref = useRef<HTMLVideoElement>(null);
@@ -215,6 +272,11 @@ function ProjectScreen({ id }: { id: string }) {
     api
       .get(id)
       .then((proj) => {
+        // a clip made straight into a short has only the short (opened from the recent list)
+        if (proj.direct && proj.shorts?.[0]) {
+          location.replace(`#${proj.id}/short/${proj.shorts[0].id}`);
+          return;
+        }
         setP(proj);
         setStep(
           proj.mode === 'captions'
@@ -222,7 +284,7 @@ function ProjectScreen({ id }: { id: string }) {
             : proj.mode === 'edit'
               ? 'edit'
               : proj.mode === 'clips'
-                ? proj.moments.length
+                ? proj.moments.length || proj.readKillfeed === false
                   ? 'highlights'
                   : 'analyze'
                 : !proj.hasPlayer
@@ -261,7 +323,8 @@ function ProjectScreen({ id }: { id: string }) {
 
   const testMode = p.mode === 'captions' || p.mode === 'edit' ? p.mode : null;
   const clips = p.mode === 'clips';
-  const steps = testMode ? TEST_STEPS[testMode] : clips ? CLIPS_STEPS : STEPS;
+  // clips of any game (kill feed not read): nothing to read, so no reading step
+  const steps = testMode ? TEST_STEPS[testMode] : clips ? (p.readKillfeed === false ? WHOLE_CLIPS_STEPS : CLIPS_STEPS) : STEPS;
   const enabled = (s: Step) => !!testMode || clips || s === 'player' || (p.hasPlayer && (s === 'sync' || !!p.sync));
   const locate = locator(p);
   /** plays timeline seconds in the preview (in clips mode, from the clip that holds them) */
@@ -712,6 +775,7 @@ function ExportStep({ p, setP, update }: { p: ProjectView; setP: (p: ProjectView
           <div className="mono small">{p.outputPath}</div>
         </section>
       )}
+      <TitlesCard p={p} setP={setP} />
     </>
   );
 }

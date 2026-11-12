@@ -73,7 +73,8 @@ const killLabel = (n: number) => (n === 1 ? '1 kill' : n === 5 ? 'ACE' : `${n}K`
  * One moment per burst of my kills in the clip's last round with kills. The
  * clip's number is used as the "round", so each clip gets its own title card.
  */
-export function clipMoments(src: Source, index: number, settings: Pick<Settings, 'burstGap'>): Moment[] {
+export function clipMoments(src: Source, index: number, settings: Pick<Settings, 'burstGap'>, readFeed = true): Moment[] {
+  if (!readFeed) return [wholeClipMoment(src, index)];
   const round = src.analysis && lastRoundKills(src.analysis);
   if (!round) return [];
   // never before the round started; never long after I died
@@ -98,6 +99,29 @@ export function clipMoments(src: Source, index: number, settings: Pick<Settings,
       trimEnd: 0,
     };
   });
+}
+
+/**
+ * A clip whose kill feed isn't read (any game, not only CS2): all of it, one
+ * moment (cut it down with its trims or in the editor).
+ */
+export function wholeClipMoment(src: Source, index: number): Moment {
+  const range: [number, number] = [src.offset, src.offset + src.info.duration];
+  return {
+    id: `${src.id}-clip`,
+    round: index + 1,
+    kind: 'clip',
+    label: src.name,
+    tags: [],
+    score: 0,
+    startTick: 0,
+    endTick: 0,
+    at: range,
+    limits: range,
+    enabled: true,
+    trimStart: 0,
+    trimEnd: 0,
+  };
 }
 
 /**

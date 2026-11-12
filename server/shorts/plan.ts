@@ -12,10 +12,10 @@ export const SHORT_GAP_S = 4;
 /** before a kill's fight starts; the kill feed is read late in clips mode, so it needs more */
 export const SHORT_PRE_S = { match: 2, clips: 4 };
 export const SHORT_POST_S = 1.5;
-/** after the last kill, so the clutch or ace reaction plays out */
-const SHORT_TAIL_S = 1;
-/** a round ending: the win banner shows for a few seconds */
-const ROUND_END_S = 3;
+/** after the last kill, so the clutch or ace reaction plays out (a looping short opens on it) */
+const SHORT_TAIL_S = 2.5;
+/** after the match's last round: the win banner and the match's end */
+const LAST_ROUND_END_S = 10;
 /** a short needs this many kills in the round */
 export const SHORT_MIN_KILLS = 3;
 
@@ -60,7 +60,11 @@ export function matchShortClips(match: MatchData, me: string, sync: SyncModel, r
   const r = match.rounds.find((x) => x.num === round);
   if (!r) return [];
   const t = (tick: number) => videoTime(sync, tick, round);
-  const bounds: [number, number] = [Math.max(0, t(r.startTick)), Math.min(videoDuration, t(r.endTick) + ROUND_END_S)];
+  // the editor can bring footage back up to the next round's start: after the round ends the
+  // players still talk and move (the reaction to a clutch or ace), then buy in freeze time
+  const next = match.rounds.find((x) => x.num === round + 1);
+  const end = next ? videoTime(sync, next.startTick, next.num) : t(r.endTick) + LAST_ROUND_END_S;
+  const bounds: [number, number] = [Math.max(0, t(r.startTick)), Math.min(videoDuration, end)];
   const marks = myRoundKills(match, me, round).map((k) => ({ from: t(contactStart(match, me, k.tick)), at: t(k.tick) }));
   return cutRound(marks, round, bounds, SHORT_PRE_S.match);
 }
@@ -118,25 +122,34 @@ export function sourceShortRounds(sources: Source[]): number[] {
 
 /** the seam is never closer than this to a piece's edge, so both sides of it have some footage */
 const SEAM_ROOM_S = 0.3;
+/** the opening reaction crossfades into the round's start over this long */
+export const LOOP_BLEND_S = 0.5;
+/** the opening reaction is at least this long (blend included) */
+const MIN_OPENING_S = 1;
 
 /**
- * A looping short's order: cut `lead` seconds before the final kill (inside
- * its piece, where the recording runs on) and the part from there to the end
- * moved to the front. It opens on the payoff; its end is the footage right
+ * A looping short's order: cut `after` seconds after the final kill (inside
+ * its piece, where the recording runs on) and the reaction from there to the
+ * end moved to the front. It opens on the reaction, which blends (`blend`)
+ * into the round's first piece; it ends on the final kill, the footage right
  * before the opening, so a replay runs on with no seam. The two edges at the
  * cut are marked `seamless` (no sound fade there). Null when there's no kill
- * left in the pieces to cut before.
+ * left in the pieces, or no room after it for an opening.
  */
-export function loopOrder(clips: Clip[], kills: FeedKill[], lead: number): Clip[] | null {
+export function loopOrder(clips: Clip[], kills: FeedKill[], after: number): Clip[] | null {
   const last = [...kills]
     .sort((a, b) => b.at - a.at)
     .map((k) => ({ k, i: clips.findIndex((c) => k.at > c.start && k.at <= c.end) }))
     .find((x) => x.i >= 0);
   if (!last) return null;
   const piece = clips[last.i];
-  const cut = Math.max(piece.start + SEAM_ROOM_S, last.k.at - lead);
+  // the reaction plays after the kill; a short tail still leaves room for an opening
+  const cut = Math.max(piece.start + SEAM_ROOM_S, Math.min(last.k.at + after, piece.end - MIN_OPENING_S));
   if (cut > piece.end - SEAM_ROOM_S) return null;
-  const before: Clip = { ...piece, momentIds: [...piece.momentIds], end: cut, seamless: 'end' };
-  const after: Clip = { ...piece, momentIds: [...piece.momentIds], start: cut, seamless: 'start' };
-  return [after, ...clips.slice(last.i + 1), ...clips.slice(0, last.i), before];
+  const head: Clip = { ...piece, momentIds: [...piece.momentIds], end: cut, seamless: 'end' };
+  const reaction: Clip = { ...piece, momentIds: [...piece.momentIds], start: cut, seamless: 'start' };
+  const rest = [...clips.slice(0, last.i), head];
+  // the reaction blends into the round's start (a cut in time, so it's crossfaded, not run on)
+  rest[0] = { ...rest[0], blend: LOOP_BLEND_S };
+  return [reaction, ...clips.slice(last.i + 1), ...rest];
 }

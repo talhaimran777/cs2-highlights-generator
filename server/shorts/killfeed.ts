@@ -1,7 +1,8 @@
 // A short's own kill feed. The game's feed sits in the top-right corner,
 // which the 9:16 crop leaves out (and a phone screen is too small for), so my
-// kills are listed again where they can be seen: each one stays up for the
-// rest of the short, the next one slides in below it. Styled like CS2's feed
+// kills are listed again where they can be seen: each one slides in below
+// the last and, as in the game, fades out a few seconds after its kill (the
+// rows under it move up), or stays up for the rest of the short. Styled like CS2's feed
 // for your own kills (dark row, red outline). Burned in as ASS; the web
 // preview draws the same rows. No server-only imports: the web uses this too.
 
@@ -10,8 +11,12 @@ import type { FeedKill, Side } from '../types.ts';
 
 /** text height, as a fraction of the frame height */
 export const FEED_SIZE = 0.021;
-/** gap to the frame's edge on the side the feed is aligned to, as a fraction of its width */
+/** gap to the frame's edge on the side the feed is aligned to, as a fraction of its width (the default; it's a setting) */
 export const FEED_MARGIN = 0.035;
+/** the most side padding: a third of the width */
+export const MAX_FEED_MARGIN = 0.3;
+/** a side padding setting (% of the width) as a fraction, in range */
+export const feedMargin = (sidePct: number | undefined) => Math.min(MAX_FEED_MARGIN, Math.max(0, (sidePct ?? FEED_MARGIN * 100) / 100));
 /** a row's height, in text heights (text + padding + gap) */
 export const FEED_ROW = 2.2;
 /** a cut-out entry's height (the game's box with its red outline), in text heights */
@@ -23,23 +28,107 @@ export const BORDER = 0.09;
 /** a new row slides in from its side (fades in when centred) */
 const SLIDE_MS = 180;
 
+/** how long a row's fade-out takes, ending when it's gone */
+export const FEED_FADE_S = 0.4;
+/** how long the rows under a gone one take to move up */
+export const FEED_SHIFT_S = 0.18;
+/** the default and longest time a row stays up after its kill */
+export const DEFAULT_FEED_STAY = 6;
+export const MAX_FEED_STAY = 30;
+/** a stay setting (seconds) in range; 0 = rows never fade */
+export const feedStay = (stay: number | undefined) => Math.min(MAX_FEED_STAY, Math.max(0, stay ?? DEFAULT_FEED_STAY));
+/** when kill `k`'s row is gone (timeline seconds; never when rows stay) */
+export const feedGoneAt = (k: { at: number }, stay: number) => (stay > 0 ? k.at + stay : Infinity);
+const clamp01 = (n: number) => Math.min(1, Math.max(0, n));
+/**
+ * Row `i`'s slot at timeline time `t` (kills sorted by time): one for each
+ * row above it still up, a gone one's slot closing over FEED_SHIFT_S (so it's
+ * fractional while the rows move up).
+ */
+export function feedSlot(sorted: { at: number }[], i: number, t: number, stay: number) {
+  let slot = 0;
+  for (let j = 0; j < i; j++) slot += 1 - clamp01((t - feedGoneAt(sorted[j], stay)) / FEED_SHIFT_S);
+  return slot;
+}
+/** A row's opacity at timeline time `t`: 1 until it starts fading, 0 once it's gone. */
+export const feedAlpha = (k: { at: number }, t: number, stay: number) => clamp01((feedGoneAt(k, stay) - t) / FEED_FADE_S);
+
+/** a kill that hasn't come up yet in a piece (after it): never shown there */
+const NOT_YET = 1e15;
+
+/**
+ * The kills on the short's own clock (seconds into what's watched), for piece
+ * `n` of `pieces` (in the order they play): each kill's `at` moved to when its
+ * row comes up, and the piece's window on that clock. So a row stays up for
+ * `stay` seconds of the short, however much of the round was cut between.
+ * A kill in a cut comes up where the footage resumes; one that only plays
+ * later (a looping short opens on the reaction after its final kill) is from
+ * the loop before, as the short runs on into its start. Order is kept.
+ */
+export function feedOnScreen<K extends { at: number }>(
+  kills: K[],
+  pieces: { start: number; end: number; blend?: number }[],
+  n: number,
+): { kills: K[]; clip: { start: number; end: number } } {
+  // where each piece starts in the output (a crossfade overlaps it with the one before)
+  const starts: number[] = [];
+  let total = 0;
+  pieces.forEach((p, i) => {
+    total -= i ? (p.blend ?? 0) : 0;
+    starts.push(total);
+    total += p.end - p.start;
+  });
+  const inside = (p: { start: number; end: number }, at: number) => at >= p.start && at < p.end;
+  const shownAt = (at: number) => {
+    const i = pieces.findIndex((p) => inside(p, at));
+    if (i >= 0) return starts[i] + at - pieces[i].start;
+    // in a cut: when the footage after it plays
+    let next = -1;
+    pieces.forEach((p, j) => p.start > at && (next < 0 || p.start < pieces[next].start) && (next = j));
+    return next >= 0 ? starts[next] : NOT_YET;
+  };
+  const piece = pieces[n];
+  const from = starts[n];
+  return {
+    clip: { start: from, end: from + piece.end - piece.start },
+    kills: kills.map((k) => {
+      if (k.at >= piece.end) return { ...k, at: NOT_YET };
+      const at = shownAt(k.at);
+      return { ...k, at: inside(piece, k.at) || at <= from ? at : at - total };
+    }),
+  };
+}
+
+/**
+ * A looping short's opening reaction (everything from the loop's cut on):
+ * every kill of the round up together, already there and never fading, as
+ * the round's tally (the reaction comes after all of them). Kills from
+ * `until` on aren't up yet. Use with a stay of 0 (rows stay up).
+ */
+export function holdKills<K extends { at: number }>(kills: K[], until: number, at: number): K[] {
+  return kills.map((k) => ({ ...k, at: k.at < until ? at : NOT_YET }));
+}
+
+/** Footage from the loop's cut on is the opening reaction: its kill feed holds every kill (see holdKills). */
+export const holdsFeed = (start: number, loopCut: number | null | undefined) => loopCut != null && start >= loopCut - 1e-6;
+
 /** Which side of the short the feed sits on. */
 export type FeedAlign = 'left' | 'center' | 'right';
 
 /** Where a new row slides in from: the side it's aligned to (+1 right, -1 left), or nowhere when centred. */
 export const slideFrom = (align: FeedAlign) => (align === 'right' ? 1 : align === 'left' ? -1 : 0);
 
-/** Left edge of a row `w` wide, aligned in the frame (the margin kept on the aligned side). */
-export function feedRowX(w: number, frameWidth: number, align: FeedAlign) {
-  const margin = Math.round(frameWidth * FEED_MARGIN);
+/** Left edge of a row `w` wide, aligned in the frame (`margin`, a fraction of the width, kept on the aligned side). */
+export function feedRowX(w: number, frameWidth: number, align: FeedAlign, margin = FEED_MARGIN) {
+  margin = Math.round(frameWidth * margin);
   return align === 'left' ? margin : align === 'center' ? Math.round((frameWidth - w) / 2) : frameWidth - margin - w;
 }
-/** below the camera band when no position is set: the gameplay's top right */
+/** below the camera band (or the top safe band) when no position is set: the gameplay's top right */
 const UNDER_CAMERA_PCT = 2;
 
 export const feedFont = 'Arial';
 
-/** Top of the feed as % of the frame height. */
+/** Top of the feed as % of the frame height; `split` is where the gameplay starts (a share of the height). */
 export const feedTopPct = (positionPct: number | null, split: number) => positionPct ?? split * 100 + UNDER_CAMERA_PCT;
 
 const WEAPONS: Record<string, string> = {
@@ -98,12 +187,21 @@ export const feedTextSize = (frame: { height: number }, scale = 1) =>
  * widest entry wouldn't fit across the frame then; the whole feed is kept
  * smaller together, so every row stays the same height.
  */
-export function fitFeedScale(images: ({ w: number; h: number } | null)[], frame: { width: number; height: number }, scale: number) {
+export function fitFeedScale(
+  images: ({ w: number; h: number } | null)[],
+  frame: { width: number; height: number },
+  scale: number,
+  align: FeedAlign = 'right',
+  margin = FEED_MARGIN,
+) {
   const asked = Math.min(MAX_FEED_SCALE, Math.max(MIN_FEED_SCALE, scale || 1));
-  const room = frame.width * (1 - 2 * FEED_MARGIN);
+  const room = frame.width * feedRoom(align, margin);
   const fits = images.reduce((m, img) => (img ? Math.min(m, (room * img.h) / (img.w * frame.height * FEED_SIZE * FEED_IMAGE_H)) : m), Infinity);
   return Math.max(MIN_FEED_SCALE, Math.min(asked, fits));
 }
+
+/** The width a row may take, as a fraction of the frame: inside the side padding, and the default gap on the other side. */
+const feedRoom = (align: FeedAlign, margin: number) => (align === 'center' ? 1 - 2 * FEED_MARGIN : Math.max(0.2, 1 - margin - FEED_MARGIN));
 
 /**
  * Where a cut-out entry (`w` x `h` source pixels) goes in the short, in
@@ -117,20 +215,22 @@ export function feedImageRect(
   topPct: number,
   scale = 1,
   align: FeedAlign = 'right',
+  margin = FEED_MARGIN,
 ) {
   const size = feedTextSize(frame, scale);
-  const k = Math.min((size * FEED_IMAGE_H) / img.h, (frame.width * (1 - 2 * FEED_MARGIN)) / img.w);
+  const k = Math.min((size * FEED_IMAGE_H) / img.h, (frame.width * feedRoom(align, margin)) / img.w);
   const even = (n: number) => Math.max(2, Math.round(n / 2) * 2);
   const w = even(img.w * k);
   const h = even(img.h * k);
-  return { x: feedRowX(w, frame.width, align), y: Math.round((frame.height * topPct) / 100 + i * size * FEED_ROW), w, h };
+  return { x: feedRowX(w, frame.width, align, margin), y: Math.round((frame.height * topPct) / 100 + i * size * FEED_ROW), w, h };
 }
 
 /**
  * ASS for one piece of the short: every kill before the piece ends, each row
- * from its kill to the end of the piece (rows stay in their place for the
- * whole short, so a cut doesn't reshuffle them). A kill inside the piece
- * slides in; one before it is already there.
+ * from its kill until it's gone (`stay` seconds after it, faded out; 0 = the
+ * end of the piece). A kill inside the piece slides in; one before it is
+ * already there. Rows keep the order of their kills: when one is gone the
+ * rows under it move up (a row is split into events where that happens).
  */
 export function killfeedAss(
   kills: FeedKill[],
@@ -141,15 +241,19 @@ export function killfeedAss(
   drawn: (i: number) => boolean = () => true,
   scale = 1,
   align: FeedAlign = 'right',
+  /** the side padding, a fraction of the width */
+  sideMargin = FEED_MARGIN,
+  /** seconds a row stays up after its kill; 0 = for good */
+  stay = 0,
 ): string | null {
-  const dur = clip.end - clip.start;
   const sorted = [...kills].sort((a, b) => a.at - b.at);
-  if (!sorted.some((k, i) => k.at < clip.end && drawn(i))) return null;
+  const shown = (k: FeedKill, i: number) => k.at < clip.end && feedGoneAt(k, stay) > clip.start && drawn(i);
+  if (!sorted.some(shown)) return null;
 
   const size = feedTextSize(frame, scale);
   const pad = Math.max(2, Math.round(size * PAD));
   const border = Math.max(2, Math.round(size * BORDER));
-  const margin = Math.round(frame.width * FEED_MARGIN);
+  const margin = Math.round(frame.width * sideMargin);
   // the anchor (\an7 top-left, \an8 top-centre, \an9 top-right); the box reaches `pad` beyond the text, so it's moved in by that much
   const [an, x] = align === 'left' ? [7, margin + pad] : align === 'center' ? [8, Math.round(frame.width / 2)] : [9, frame.width - margin - pad];
   const slide = slideFrom(align) * Math.round(size * 2);
@@ -172,21 +276,46 @@ export function killfeedAss(
   ];
 
   const events: string[] = [];
+  const ms = (s: number) => Math.round(s * 1000);
+  const rowY = (slot: number) => Math.round(top + pad + slot * size * FEED_ROW);
   sorted.forEach((k, i) => {
-    if (k.at >= clip.end || !drawn(i)) return;
-    const from = Math.max(0, k.at - clip.start);
-    const y = Math.round(top + pad + i * size * FEED_ROW);
-    const anim = k.at >= clip.start ? `\\move(${x + slide},${y},${x},${y},0,${SLIDE_MS})\\fad(${SLIDE_MS},0)` : `\\pos(${x},${y})`;
+    if (!shown(k, i)) return;
+    const gone = feedGoneAt(k, stay);
+    const from = Math.max(k.at, clip.start);
+    const until = Math.min(gone, clip.end);
+    // split where a row above goes (this one moves up then)
+    const cuts = sorted.slice(0, i).map((o) => feedGoneAt(o, stay)).filter((g) => g > from && g < until);
+    const edges = [from, ...[...new Set(cuts)].sort((a, b) => a - b), until];
     const marks = killMarks(k);
     const text = [
       `{\\c${assColor(sideColor(k.attackerSide))}}${escapeAss(k.attacker)}`,
       `{\\c${assColor(FEED_MUTED)}}  ${escapeAss(weaponName(k.weapon))}${marks.length ? `  ${marks.join(' ')}` : ''}  `,
       `{\\c${assColor(sideColor(k.victimSide))}}${escapeAss(k.victim)}`,
     ].join('');
-    const at = `${time(from)},${time(dur)}`;
-    // the red outline: the same row's box, `border` bigger, underneath
-    events.push(`Dialogue: 0,${at},Feed,,0,0,0,,{\\an${an}${anim}\\bord${pad + border}\\3c${assColor(FEED_RED)}}${text}`);
-    events.push(`Dialogue: 1,${at},Feed,,0,0,0,,{\\an${an}${anim}}${text}`);
+    for (let e = 0; e + 1 < edges.length; e++) {
+      const [s, end] = [edges[e], edges[e + 1]];
+      const slidesIn = e === 0 && k.at >= clip.start;
+      const y0 = rowY(feedSlot(sorted, i, s, stay));
+      const y1 = rowY(feedSlot(sorted, i, s + FEED_SHIFT_S, stay));
+      const move = slidesIn
+        ? `\\move(${x + slide},${y1},${x},${y1},0,${SLIDE_MS})`
+        : y0 !== y1
+          ? `\\move(${x},${y0},${x},${y1},0,${ms(FEED_SHIFT_S)})`
+          : `\\pos(${x},${y1})`;
+      // fading out at the end of its last event (from part-way when the piece starts mid-fade)
+      const fades = end === gone;
+      const fadeAt = Math.max(s, gone - FEED_FADE_S);
+      const a = Math.round(255 * (1 - feedAlpha(k, fadeAt, stay)));
+      const fade = fades
+        ? `\\fade(${slidesIn ? 255 : a},${a},255,0,${slidesIn ? SLIDE_MS : 0},${ms(fadeAt - s)},${ms(end - s)})`
+        : slidesIn
+          ? `\\fad(${SLIDE_MS},0)`
+          : '';
+      const at = `${time(s - clip.start)},${time(end - clip.start)}`;
+      // the red outline: the same row's box, `border` bigger, underneath
+      events.push(`Dialogue: 0,${at},Feed,,0,0,0,,{\\an${an}${move}${fade}\\bord${pad + border}\\3c${assColor(FEED_RED)}}${text}`);
+      events.push(`Dialogue: 1,${at},Feed,,0,0,0,,{\\an${an}${move}${fade}}${text}`);
+    }
   });
   return [...header, ...events, ''].join('\n');
 }

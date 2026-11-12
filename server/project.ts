@@ -7,7 +7,7 @@ import { detectKillfeed } from './sync/killfeed.ts';
 import { fitSync, type Anchor } from './sync/align.ts';
 import { planClips, protectSpeech, roundCardText } from './edit/plan.ts';
 import { applyEdits } from './edit/edits.ts';
-import { encodeArgs, renderReel, type Bookend } from './edit/render.ts';
+import { encodeArgs, renderReel, SOCIAL, type Bookend } from './edit/render.ts';
 import { bumperFile, bumperSeconds, reelTarget, type BumperKind } from './branding/bumper.ts';
 import { imageSize, probe, type VideoInfo } from './util/ffmpeg.ts';
 import { detectSpeech, type Speech } from './audio/speech.ts';
@@ -18,11 +18,15 @@ import { clipCardText, clipMoments, planSourceClips, roundStartsFrom } from './c
 import { alignLines, transcribe } from './captions/transcribe.ts';
 import { cleanupCaptions, retime } from './captions/cleanup.ts';
 import { buildAss } from './captions/ass.ts';
-import { resolveFont } from './captions/fonts.ts';
+import { fontMetrics, resolveFont } from './captions/fonts.ts';
 import { loopOrder, matchShortClips, matchShortKills, matchShortRounds, SHORT_GAP_S, SHORT_MIN_KILLS, sourceShortClips, sourceShortKills, sourceShortRounds } from './shorts/plan.ts';
-import { feedImageRect, feedTopPct, fitFeedScale, killfeedAss, slideFrom } from './shorts/killfeed.ts';
+import { FEED_FADE_S, FEED_ROW, FEED_SHIFT_S, feedGoneAt, feedImageRect, feedOnScreen, holdKills, holdsFeed, feedMargin, feedStay, feedTextSize, feedTopPct, fitFeedScale, killfeedAss, slideFrom } from './shorts/killfeed.ts';
+import { placeTitle, titleAss, titlePreset } from './shorts/title.ts';
 import { grabFeedEntries } from './shorts/feedgrab.ts';
-import { fitLayout, overlayRect, shortFrame } from './shorts/layout.ts';
+import { buildStory, shortStoryFromClip, shortStoryFromMatch, type MatchStory, type ShortStory } from './titles/story.ts';
+import { generateShortTitles, generateTitles, type TitleSet } from './titles/generate.ts';
+import { lastRoundKills } from './clips/moments.ts';
+import { fitLayout, gameplayTop, overlayRect, shortFrame } from './shorts/layout.ts';
 import { shortGraph } from './shorts/render.ts';
 
 /** Bump when parsing/moments change in a way saved projects should pick up. */
@@ -44,6 +48,13 @@ export interface Project {
    * videoPath is the first clip and `video` describes the whole timeline.
    */
   mode?: 'match' | 'captions' | 'edit' | 'clips';
+  /**
+   * clips mode, one clip made straight into a short (from the home page): the
+   * whole clip is the short (round 1), its kill feed from the clip once read
+   */
+  direct?: boolean;
+  /** clips mode: CS2 clips whose kill feed Claude reads (see readsKillfeed); missing = read */
+  readKillfeed?: boolean;
   sources?: Source[];
   name: string;
   createdAt: string;
@@ -65,6 +76,8 @@ export interface Project {
   outputPath: string | null;
   /** vertical shorts made from single rounds */
   shorts?: Short[];
+  /** YouTube titles for the highlight video, written by Claude from the match story */
+  titles?: (TitleSet & { generatedAt: string; direction: string }) | null;
 }
 
 export function loadSettings(): Settings {
@@ -81,7 +94,9 @@ export function withDefaults(s: Partial<Settings>): Settings {
     shortCaptions: { ...DEFAULT_SETTINGS.shortCaptions, ...s.shortCaptions },
     shortKillfeed: { ...DEFAULT_SETTINGS.shortKillfeed, ...s.shortKillfeed },
     shortOverlay: { ...DEFAULT_SETTINGS.shortOverlay, ...s.shortOverlay },
-    shortLoop: { ...DEFAULT_SETTINGS.shortLoop, ...s.shortLoop },
+    shortTitle: { ...DEFAULT_SETTINGS.shortTitle, ...s.shortTitle },
+    // only today's fields (an older `lead` is dropped)
+    shortLoop: { enabled: s.shortLoop?.enabled ?? DEFAULT_SETTINGS.shortLoop.enabled, after: s.shortLoop?.after ?? DEFAULT_SETTINGS.shortLoop.after },
   };
 }
 
@@ -184,6 +199,12 @@ export function createRecordingTest(videoPath: string, mode: 'captions' | 'edit'
 
 export const clipsMode = (p: Pick<Project, 'mode'>) => p.mode === 'clips';
 
+/**
+ * A clips project reads its clips' kill feed (CS2): what's kept, the kill feed on its
+ * shorts, their titles. Off (any game), every clip is used whole. Older clips projects all read it.
+ */
+export const readsKillfeed = (p: Pick<Project, 'mode' | 'readKillfeed'>) => p.mode === 'clips' && p.readKillfeed !== false;
+
 /** Lays the clips back to back: offsets, and `video` as the whole timeline (the first clip's format). */
 function placeSources(p: Project, sources: Source[]) {
   let offset = 0;
@@ -201,8 +222,8 @@ export function sourceAt(p: Project, t: number): Source {
   return all.filter((s) => s.offset <= t + 1e-6).at(-1) ?? all[0];
 }
 
-/** OBS replay clips without a demo, in the order given (oldest first). */
-export function createClipsProject(paths: string[]): Project {
+/** OBS replay clips without a demo, in the order given (oldest first); `readKillfeed`: CS2 clips whose kill feed Claude reads (see readsKillfeed). */
+export function createClipsProject(paths: string[], readKillfeed = true): Project {
   if (paths.length === 0) throw new Error('Pick at least one clip');
   for (const f of paths) if (!existsSync(f)) throw new Error(`File not found: ${f}`);
   const settings = loadSettings();
@@ -210,6 +231,7 @@ export function createClipsProject(paths: string[]): Project {
     id: randomUUID().slice(0, 8),
     version: PROJECT_VERSION,
     mode: 'clips',
+    readKillfeed,
     name: `Clips · ${basename(dirname(paths[0]))} (${paths.length})`,
     createdAt: new Date().toISOString(),
     videoPath: paths[0],
@@ -226,6 +248,8 @@ export function createClipsProject(paths: string[]): Project {
     p,
     paths.map((path) => ({ id: randomUUID().slice(0, 6), path, name: basename(path, extname(path)), info: probe(path), offset: 0, analysis: null })),
   );
+  // nothing to read: every clip, whole, at once
+  if (!readKillfeed) buildClipMoments(p);
   saveProject(p);
   return p;
 }
@@ -236,7 +260,7 @@ export function buildClipMoments(p: Project) {
   for (const s of p.sources ?? []) if (s.analysis) s.analysis.roundStarts = roundStartsFrom(s.analysis.hud);
   const old = new Map(p.moments.map((m) => [m.id, m]));
   p.moments = (p.sources ?? []).flatMap((s, i) =>
-    clipMoments(s, i, p.settings).map((m) => {
+    clipMoments(s, i, p.settings, readsKillfeed(p)).map((m) => {
       const prev = old.get(m.id);
       return prev ? { ...m, enabled: prev.enabled, trimStart: prev.trimStart, trimEnd: prev.trimEnd } : m;
     }),
@@ -461,6 +485,10 @@ export function defaultOutputPath(p: Project) {
 
 /** Rounds with enough of my kills for a short (clip numbers in clips mode). */
 export function shortRounds(p: Project): number[] {
+  // a clip made straight into a short is one, kills found or not
+  if (p.direct) return [1];
+  // kill feed not read (any game): every clip can be a short
+  if (clipsMode(p) && !readsKillfeed(p)) return (p.sources ?? []).map((_, i) => i + 1);
   if (clipsMode(p)) return sourceShortRounds(p.sources ?? []);
   if (recordingOnly(p) || !p.sync || !hasPlayer(p)) return [];
   return matchShortRounds(p.match, p.settings.steamId);
@@ -468,7 +496,9 @@ export function shortRounds(p: Project): number[] {
 
 /** A short's round cut to its fights, before the short's own edits. */
 export function baseShortClips(p: Project, round: number): Clip[] {
-  const clips = clipsMode(p)
+  const clips = p.direct || (clipsMode(p) && !readsKillfeed(p))
+    ? wholeClipShort(p, round)
+    : clipsMode(p)
     ? (p.sources?.[round - 1] ? sourceShortClips(p.sources[round - 1], round) : [])
     : p.sync
       ? matchShortClips(p.match, p.settings.steamId, p.sync, round, p.video.duration)
@@ -478,6 +508,28 @@ export function baseShortClips(p: Project, round: number): Clip[] {
 }
 
 export const shortClipsFor = (p: Project, s: Short): Clip[] => applyEdits(baseShortClips(p, s.round), s.edits);
+
+/** A clip made straight into a short, or one whose kill feed isn't read: all of it, one piece (cut it down in the short's editor). */
+function wholeClipShort(p: Project, round: number): Clip[] {
+  const src = p.sources?.[round - 1];
+  if (!src) return [];
+  const range: [number, number] = [src.offset, src.offset + src.info.duration];
+  return [{ round, start: range[0], end: range[1], momentIds: [], label: src.name, bounds: range }];
+}
+
+/**
+ * One clip made straight into a short: a clips project of just that clip, its
+ * short made at once (the whole clip, see directShortClips). Reading the clip
+ * (analyzeClips) adds its kill feed and what the titles are written from.
+ */
+export function createDirectShort(path: string, readKillfeed = true): { project: Project; short: Short } {
+  const p = createClipsProject([path], readKillfeed);
+  p.direct = true;
+  p.name = `Short · ${basename(path, extname(path))}`;
+  const short = createShort(p, 1);
+  saveProject(p);
+  return { project: p, short };
+}
 
 /** Cut-out kill-feed entries, cached per project. */
 export const feedImagesDir = (p: Project) => join(DATA_DIR, 'killfeed', p.id);
@@ -490,6 +542,8 @@ export function shortFeedImages(p: Project, kills: FeedKill[], signal?: AbortSig
 
 /** My kills in a short's round, for its kill feed. */
 export function shortKills(p: Project, round: number): FeedKill[] {
+  if (clipsMode(p) && !readsKillfeed(p)) return [];
+  if (p.direct) return p.sources?.[0] ? sourceShortKills(p.sources[0]) : [];
   if (clipsMode(p)) return p.sources?.[round - 1] ? sourceShortKills(p.sources[round - 1]) : [];
   return p.sync ? matchShortKills(p.match, p.settings.steamId, p.sync, round) : [];
 }
@@ -506,54 +560,94 @@ export function createShort(p: Project, round: number): Short {
   return s;
 }
 
-export function defaultShortPath(p: Project, s: Short) {
-  return defaultOutputPath(p).replace(/(_highlights|_captions|_edited)?\.mp4$/, `_short_r${s.round}.mp4`);
+export function defaultShortPath(p: Project, s: Short, social = false) {
+  return defaultOutputPath(p).replace(/(_highlights|_captions|_edited)?\.mp4$/, `_short_r${s.round}${social ? '_social' : ''}.mp4`);
 }
 
-/** Renders a short: the source's codec, bitrate and frame rate, at 9:16, captions placed for the vertical frame, no cards or bumpers. */
-export async function renderShort(p: Project, s: Short, onProgress?: (f: number) => void, signal?: AbortSignal): Promise<string> {
+/** Where a short goes: its YouTube export (the recording's own quality), or its 1080p one for Instagram, TikTok and Facebook. */
+export const shortOutputPath = (p: Project, s: Short, social = false) => (social ? s.socialOutputPath : s.outputPath) ?? defaultShortPath(p, s, social);
+
+/** A short's frame for social media: 1080 wide (see SOCIAL), the same 9:16 shape. */
+export const socialFrame = (frame: { width: number; height: number }) => ({ width: SOCIAL.width, height: Math.round((SOCIAL.width * frame.height) / frame.width / 2) * 2 });
+
+/**
+ * Renders a short at 9:16, captions placed for the vertical frame, no cards or
+ * bumpers: for YouTube, the source's codec, bitrate and frame rate at the
+ * recording's own size; `social`, 1080 wide and made for Instagram, TikTok
+ * and Facebook (see SOCIAL). Everything on it is laid out for the size it's made at.
+ */
+export async function renderShort(p: Project, s: Short, onProgress?: (f: number) => void, signal?: AbortSignal, social = false): Promise<string> {
   const edited = shortClipsFor(p, s);
   if (edited.length === 0) throw new Error('Nothing left in this short');
-  // a looping short opens on its final kill and ends right before it (pieces reordered, nothing re-encoded)
-  const clips = shortLoopOrder(p, s, edited) ?? edited;
-  const frame = shortFrame(p.video);
+  // a looping short opens on the reaction after its final kill and ends on that kill (pieces reordered)
+  const looped = shortLoopOrder(p, s, edited);
+  const clips = looped ?? edited;
+  // the opening reaction (from the loop's cut on) shows every kill of the round, held up
+  const loopCut = looped?.[0].start ?? null;
+  const frame = social ? socialFrame(shortFrame(p.video)) : shortFrame(p.video);
   const caps = { ...p.settings.captions, ...p.settings.shortCaptions };
   const lines = (p.transcript ?? []).filter((l) => !l.removed);
   const font = caps.enabled && lines.length ? resolveFont(caps.font) : '';
   const feed = p.settings.shortKillfeed;
   const kills = feed.enabled ? shortKills(p, s.round) : [];
   const sortedKills = [...kills].sort((a, b) => a.at - b.at); // the order rows (and images) are in
-  const feedTop = feedTopPct(feed.positionPct, s.layout.split);
+  const shortLayout = fitLayout(s.layout, p.video);
+  // where the gameplay starts: under the camera, or under the top safe band with no camera
+  const seam = gameplayTop(frame, shortLayout);
+  const feedTop = feedTopPct(feed.positionPct, seam);
   // the game's own entries where they can be found; the others are drawn
   const images = kills.length ? await shortFeedImages(p, kills, signal) : [];
-  const feedScale = fitFeedScale(images, frame, feed.scale);
+  const feedSide = feedMargin(feed.sidePct);
+  const feedScale = fitFeedScale(images, frame, feed.scale, feed.align, feedSide);
+  const stay = feedStay(feed.stay);
+  const rowStep = feedTextSize(frame, feedScale) * FEED_ROW;
+  // the feed runs on the short's own clock: a row is up for `stay` seconds of what's watched, cuts or not
+  // (except the looping short's opening reaction: every kill of the round stays up there, see holdKills)
+  const onScreen = (c: Clip) => {
+    const on = feedOnScreen(sortedKills, clips, Math.max(0, clips.indexOf(c)));
+    return holdsFeed(c.start, loopCut) ? { kills: holdKills(sortedKills, c.end, on.clip.start - 1), clip: on.clip, stay: 0 } : { ...on, stay };
+  };
   const over = p.settings.shortOverlay;
   const badge = over.enabled && over.path && existsSync(over.path) ? imageSize(over.path) : null;
-  const outPath = s.outputPath ?? defaultShortPath(p, s);
+  const titleFont = titlePreset(p.settings.shortTitle.preset).font;
+  // where the title goes: kept above the gameplay, that's where this short's gameplay starts
+  const titleStyle = placeTitle(s.title ?? '', p.settings.shortTitle, frame, fontMetrics(titleFont), seam);
+  const outPath = shortOutputPath(p, s, social);
   await renderReel(
     {
       videoPath: p.videoPath, info: p.video, clips, cards: new Map(), outPath,
-      // its own folder: rendering clears it, and the reel may be rendering at the same time
-      workDir: join(DATA_DIR, 'work', `${p.id}-short-${s.id}`),
+      // its own folder: rendering clears it, and the reel (or the short's other export) may be rendering at the same time
+      workDir: join(DATA_DIR, 'work', `${p.id}-short-${s.id}${social ? '-social' : ''}`),
+      social,
       // the kill feed under the captions, should they meet
       captions: (c) => [
-        kills.length ? killfeedAss(kills, c, frame, feedTop, (i) => !images[i], feedScale, feed.align) : null,
+        kills.length ? killfeedAss(onScreen(c).kills, onScreen(c).clip, frame, feedTop, (i) => !images[i], feedScale, feed.align, feedSide, onScreen(c).stay) : null,
         font ? buildAss(lines, c, frame, caps, font) : null,
+        // the title over everything
+        s.title?.trim() ? titleAss(s.title, titleStyle, c.end - c.start, frame, resolveFont(titleFont), fontMetrics(titleFont)) : null,
       ],
       sourceOf: clipsMode(p) ? (c) => sourceAt(p, c.start) : undefined,
       frame: {
         ...frame,
-        graph: (src) => shortGraph(s.layout, src, frame),
-        overlays: (c) => [
+        // an older short (no bottom band yet) gets it, its gameplay box reshaped to fit
+        graph: (src) => shortGraph(shortLayout, src, frame),
+        overlays: (piece) => {
+          const { kills: shown, clip: c, stay } = onScreen(piece);
+          return [
           ...images.flatMap((img, i) => {
-            const at = sortedKills[i].at;
-            return img && at < c.end
-              ? [{ file: img.file, from: at - c.start, slide: slideFrom(feed.align), ...feedImageRect(img, i, frame, feedTop, feedScale, feed.align) }]
-              : [];
+            const at = shown[i].at;
+            const gone = feedGoneAt(shown[i], stay);
+            if (!img || at >= c.end || gone <= c.start) return [];
+            // gone (faded out) inside this piece; the rows above it going move it up
+            const until = gone < c.end ? { until: gone - c.start, fadeOut: FEED_FADE_S } : {};
+            const above = shown.slice(0, i).map((k) => feedGoneAt(k, stay) - c.start).filter((t) => t < c.end - c.start);
+            const up = above.length ? { up: { at: above, by: rowStep, over: FEED_SHIFT_S } } : {};
+            return [{ file: img.file, from: at - c.start, slide: slideFrom(feed.align), ...until, ...up, ...feedImageRect(img, i, frame, feedTop, feedScale, feed.align, feedSide) }];
           }),
           // the badge / logo, up the whole time, over the kill feed
-          ...(badge ? [{ file: over.path, from: 0, ...overlayRect(over, badge, frame) }] : []),
-        ],
+          ...(badge ? [{ file: over.path, from: 0, opacity: over.opacity, ...overlayRect(over, badge, frame) }] : []),
+          ];
+        },
       },
     },
     onProgress,
@@ -562,10 +656,10 @@ export async function renderShort(p: Project, s: Short, onProgress?: (f: number)
   return outPath;
 }
 
-/** The short's pieces in loop order (see loopOrder), or null when it doesn't loop (off, or no kill left to cut before). */
+/** The short's pieces in loop order (see loopOrder), or null when it doesn't loop (off, or no kill left to cut after). */
 export function shortLoopOrder(p: Project, s: Short, clips = shortClipsFor(p, s)): Clip[] | null {
   const l = p.settings.shortLoop;
-  return l.enabled ? loopOrder(clips, shortKills(p, s.round), l.lead) : null;
+  return l.enabled ? loopOrder(clips, shortKills(p, s.round), l.after) : null;
 }
 
 export async function renderProject(p: Project, onProgress?: (f: number) => void, signal?: AbortSignal): Promise<string> {
@@ -596,4 +690,55 @@ export async function renderProject(p: Project, onProgress?: (f: number) => void
   );
   p.outputPath = outPath;
   return outPath;
+}
+
+/** Titles can be written for a match with a demo and the player picked (not clips or a bare recording). */
+export const titlesPossible = (p: Project) => !clipsMode(p) && !recordingOnly(p) && !!p.settings.steamId && p.match.rounds.length > 0;
+
+/** The match as a story for Claude: the demo's facts, what I said, and which rounds are in the video. */
+export function projectStory(p: Project): MatchStory {
+  return buildStory({
+    match: p.match,
+    me: p.settings.steamId,
+    channel: loadSettings().branding.name,
+    sync: p.sync,
+    moments: p.moments,
+    intros: p.intros,
+    transcript: p.transcript,
+    featured: new Set(clipsFor(p).map((c) => c.round)),
+  });
+}
+
+/** Claude's YouTube titles for the highlight video, from the match story and the creator's profile. */
+export async function writeTitles(p: Project, direction: string, signal?: AbortSignal) {
+  if (!titlesPossible(p)) throw new Error('Titles need a match with a demo and your player picked');
+  const set = await generateTitles(projectStory(p), loadSettings().creatorProfile, direction, signal);
+  return { arc: set.arc, ideas: set.ideas, best: set.best, generatedAt: new Date().toISOString(), direction: direction.trim() };
+}
+
+/** A short's round as a story for Claude: from the match (demo), or from the clip's kill feed and HUD (clips). */
+export function projectShortStory(p: Project, s: Short): ShortStory {
+  if (clipsMode(p)) {
+    const src = p.sources?.[s.round - 1];
+    if (!src) throw new Error(`Clip ${s.round} not found`);
+    const round = src.analysis ? lastRoundKills(src.analysis) : null;
+    // the score on the HUD during the round (before it ends)
+    const hud = src.analysis?.hud.find((h) => round && h.t >= round.start && h.left !== null && h.right !== null);
+    return shortStoryFromClip({
+      name: p.settings.playerName,
+      channel: loadSettings().branding.name,
+      round: s.round,
+      kills: sourceShortKills(src),
+      died: !!round?.death,
+      scoreOnScreen: hud ? `${hud.left}-${hud.right}` : null,
+    });
+  }
+  if (!titlesPossible(p)) throw new Error('Titles need a match with a demo and your player picked');
+  return shortStoryFromMatch(projectStory(p), s.round);
+}
+
+/** Claude's YouTube Shorts titles and thumbnail text for a short. */
+export async function writeShortTitles(p: Project, s: Short, direction: string, signal?: AbortSignal) {
+  const set = await generateShortTitles(projectShortStory(p, s), loadSettings().creatorProfile, direction, signal);
+  return { arc: set.arc, ideas: set.ideas, best: set.best, generatedAt: new Date().toISOString(), direction: direction.trim() };
 }

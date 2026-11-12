@@ -1,16 +1,23 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api, fmtTime, locator, waitJob, type Edits, type FeedKill, type Job, type ProjectView, type Rect, type Settings, type ShortLayout, type ShortView } from './api.ts';
+import { api, fmtTime, locator, waitJob, type Clip, type Edits, type FeedKill, type Job, type ProjectView, type Rect, type Settings, type ShortLayout, type ShortView } from './api.ts';
+import type { WebcamMode } from '../../server/types.ts';
 import { TimelineEditor } from './Editor.tsx';
 import { ReelStage, type ReelPlayer } from './reel.tsx';
 import { Progress } from './ui.tsx';
 import { captionChunks, wordClass } from './CaptionPreview.tsx';
 import { captionChars } from '../../server/captions/ass.ts';
-import { bandAspects, clampRect, fitLayout, MAX_SPLIT, MIN_SPLIT, overlayRect, resizeRect, type OverlayAlign } from '../../server/shorts/layout.ts';
+import {
+  clampRect, DEFAULT_SAFE_BOTTOM, DEFAULT_SAFE_TOP, gameplayTop, hasCamera, layoutAspects, layoutBands, MAX_PIP_W, MAX_SAFE_TOP, MIN_PIP_W, PIP_SHADOW_ALPHA, pipRect, pipStyle, webcamMode, fitLayout, MAX_SAFE_BOTTOM, MAX_SPLIT, MIN_SPLIT, overlayRect, resizeRect, SAFE_BLUR, SAFE_DIM, safeBottom, type OverlayAlign,
+} from '../../server/shorts/layout.ts';
 import { DEFAULT_SETTINGS } from '../../server/types.ts';
 import { FilePicker } from './FilePicker.tsx';
+import { TitlesPanel } from './Titles.tsx';
 import {
-  BORDER as FEED_BORDER, FEED_BG, feedImageRect, fitFeedScale, FEED_MARGIN, slideFrom, type FeedAlign, FEED_MUTED, FEED_RED, FEED_ROW, feedTextSize, feedTopPct, killMarks, MAX_FEED_SCALE, MIN_FEED_SCALE, PAD as FEED_PAD, SIDE_COLOR, weaponName,
+  BORDER as FEED_BORDER, FEED_BG, feedAlpha, feedImageRect, feedMargin, feedOnScreen, feedSlot, holdKills, holdsFeed, feedStay, fitFeedScale, MAX_FEED_STAY, FEED_MARGIN, MAX_FEED_MARGIN, slideFrom, type FeedAlign, FEED_MUTED, FEED_RED, FEED_ROW, feedTextSize, feedTopPct, killMarks, MAX_FEED_SCALE, MIN_FEED_SCALE, PAD as FEED_PAD, SIDE_COLOR, weaponName,
 } from '../../server/shorts/killfeed.ts';
+import {
+  MAX_LINE_HEIGHT, MAX_TITLE_SIZE, MAX_WORD_SPACING, MIN_LINE_HEIGHT, MIN_TITLE_SIZE, MIN_WORD_SPACING, placeTitle, TITLE_PRESETS, TITLE_WIDTH, titleBoxes, titlePreset, titleWarnings, titleWords, wrapTitle, type TitleFont, type TitlePreset,
+} from '../../server/shorts/title.ts';
 
 /** canvas width of the 9:16 preview (half of a 1080-wide short) */
 const PREVIEW_W = 540;
@@ -18,10 +25,17 @@ const SAVE_DELAY_MS = 400;
 
 type Video = { width: number; height: number };
 const FEED_SCALE_STEP = 0.1;
-/** how long before the final kill a looping short may open */
-const MIN_LOOP_LEAD = 0.3;
-const MAX_LOOP_LEAD = 5;
+const WEBCAM_MODES: [WebcamMode, string, string][] = [
+  ['off', 'Off', 'No webcam: the gameplay between a top and a bottom safe area'],
+  ['float', 'Floating', 'The webcam in a box on top of the short: drag it anywhere, drag its corner to resize it'],
+  ['band', 'Band on top', 'The webcam in its own band above the gameplay'],
+];
+/** how long after the final kill a looping short may open (on the reaction) */
+const MAX_LOOP_AFTER = 5;
 const DEFAULT_OVERLAY = DEFAULT_SETTINGS.shortOverlay;
+const TITLE_DEFAULTS = DEFAULT_SETTINGS.shortTitle;
+/** the overlay can be made this faint, but not invisible */
+const MIN_OPACITY = 0.1;
 const OVERLAY_ALIGNS: [OverlayAlign, string, string][] = [
   ['left', 'Left', 'Against the left edge (with a small margin)'],
   ['center', 'Center', 'Exactly in the middle, and kept there when resized'],
@@ -74,12 +88,33 @@ export function ShortScreen({ id, sid }: { id: string; sid: string }) {
   const [feed, setFeedState] = useState<Settings['shortKillfeed'] | null>(null);
   const [overlay, setOverlayState] = useState<Settings['shortOverlay'] | null>(null);
   const [loop, setLoopState] = useState<Settings['shortLoop'] | null>(null);
+  const [title, setTitleState] = useState('');
+  const [titleStyle, setTitleStyleState] = useState<Settings['shortTitle'] | null>(null);
   // the game's own kill-feed entries, cut out of the recording (takes a moment the first time)
   const [feedImages, setFeedImages] = useState<FeedImages>(null);
+  // a clip made straight into a short: its kill feed being read; once done, the kills (and their entries) come in
+  const [readJob, setReadJob] = useState<Job | null>(null);
+  const [kills, setKillsVersion] = useState(0);
   useEffect(() => {
     api.shortFeed(id, sid).then(setFeedImages).catch(() => setFeedImages([]));
-  }, [id, sid]);
+  }, [id, sid, kills]);
+  useEffect(() => {
+    if (readJob?.status !== 'running') return;
+    let live = true;
+    waitJob(readJob.id, (j) => live && setReadJob(j))
+      .then(async () => {
+        if (!live) return;
+        setV(await api.short(id, sid));
+        setKillsVersion((n) => n + 1);
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [readJob?.id]); // eslint-disable-line react-hooks/exhaustive-deps
   const [job, setJob] = useState<Job | null>(null);
+  // the 1080p export for Instagram, TikTok and Facebook
+  const [socialJob, setSocialJob] = useState<Job | null>(null);
   // the last save in flight, so an export waits for it
   const saving = useRef<Promise<unknown>>(Promise.resolve());
 
@@ -93,9 +128,14 @@ export function ShortScreen({ id, sid }: { id: string; sid: string }) {
         setFeedState(proj.settings.shortKillfeed);
         setOverlayState(proj.settings.shortOverlay);
         setLoopState(proj.settings.shortLoop);
+        setTitleState(short.short.title ?? '');
+        setTitleStyleState(proj.settings.shortTitle);
         setJob(short.renderJob);
+        setSocialJob(short.socialJob);
+        setReadJob(short.readJob);
         // an export still running from before: follow it
-        if (short.renderJob?.status === 'running') void follow(short.renderJob.id);
+        if (short.renderJob?.status === 'running') void follow(short.renderJob.id, setJob);
+        if (short.socialJob?.status === 'running') void follow(short.socialJob.id, setSocialJob);
       })
       .catch((e) => setError(e.message));
   }, [id, sid]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -141,45 +181,57 @@ export function ShortScreen({ id, sid }: { id: string; sid: string }) {
     setOverlayState(o);
     later({ overlay: o });
   };
+  const setTitle = (t: string) => {
+    setTitleState(t);
+    later({ title: t });
+  };
+  const setTitleStyle = (t: Settings['shortTitle']) => {
+    setTitleStyleState(t);
+    later({ titleStyle: t });
+  };
   // saved at once: the short's length depends on it
   const setLoop = (l: Settings['shortLoop']) => {
     setLoopState(l);
     patch({ loop: l });
   };
 
-  const follow = async (jobId: string) => {
-    const done = await waitJob(jobId, setJob);
+  const follow = async (jobId: string, set: (j: Job) => void) => {
+    const done = await waitJob(jobId, set);
     if (done.status === 'error') setError(done.error ?? 'Export failed');
     setV(await api.short(id, sid));
   };
-  const exportShort = async (flushEdits: () => void) => {
+  // social: the 1080p export for Instagram, TikTok and Facebook
+  const exportShort = async (flushEdits: () => void, social = false) => {
     flushEdits();
     flushPending();
     await saving.current;
+    const set = social ? setSocialJob : setJob;
     try {
-      const j = await api.renderShort(id, sid);
-      setJob(j);
-      await follow(j.id);
+      const j = await api.renderShort(id, sid, social);
+      set(j);
+      await follow(j.id, set);
     } catch (e: any) {
       setError(e.message);
     }
   };
 
   const locate = useMemo(() => (p ? locator(p) : null), [p]);
-  if (!p || !v || !layout || !caps || !feed || !overlay || !loop || !locate) {
+  if (!p || !v || !layout || !caps || !feed || !overlay || !loop || !titleStyle || !locate) {
     return <main className="home">{error ? <div className="error">{error}</div> : <div className="muted">Loading…</div>}</main>;
   }
 
   const clips = p.mode === 'clips';
-  const name = clips ? `Clip ${v.short.round}` : `Round ${v.short.round}`;
+  const name = v.direct ? p.name.replace(/^Short · /, '') : clips ? `Clip ${v.short.round}` : `Round ${v.short.round}`;
   const running = job?.status === 'running';
+  const socialRunning = socialJob?.status === 'running';
 
   return (
-    <main className="project">
+    <main className="project short-page">
       <div className="project-head">
         <div>
-          <a className="muted small" href={`#${id}`}>
-            ← {p.name}
+          {/* a clip made straight into a short has no project page: back home */}
+          <a className="muted small" href={v.direct ? '#' : `#${id}`}>
+            ← {v.direct ? 'Home' : p.name}
           </a>
           <h1>{name} · Short</h1>
           <div className="muted">
@@ -188,6 +240,18 @@ export function ShortScreen({ id, sid }: { id: string; sid: string }) {
         </div>
       </div>
       {error && <div className="error">{error}</div>}
+      {v.direct && readJob?.status === 'running' && (
+        <div className="muted small">
+          Reading the clip's kill feed… your kills show up in the short's kill feed when it's done ({Math.round((readJob.progress ?? 0) * 100)}%).
+        </div>
+      )}
+      {v.direct && readJob?.status === 'error' && <div className="error">Couldn't read the clip's kill feed: {readJob.error}</div>}
+      {v.direct && v.killfeed && !readJob && v.kills.length === 0 && (
+        <div className="muted small">No kill feed: put ANTHROPIC_API_KEY in the app's .env and restart it to have your kills read from the clip.</div>
+      )}
+      {v.direct && readJob?.status === 'done' && v.kills.length === 0 && (
+        <div className="muted small">No kills of yours were found in this clip's kill feed (check your in-game name on the home page).</div>
+      )}
 
       <TimelineEditor
         id={id}
@@ -201,20 +265,56 @@ export function ShortScreen({ id, sid }: { id: string; sid: string }) {
         what="Short"
         empty="No kills were found in this round."
         actions={(flush) => (
-          <button className="btn btn-primary" disabled={running} onClick={() => exportShort(flush)}>
-            {running ? 'Exporting…' : 'Export short'}
-          </button>
+          <>
+            <button className="btn" disabled={socialRunning} onClick={() => exportShort(flush, true)} title="1080p, made for Instagram Reels, TikTok and Facebook Reels">
+              {socialRunning ? 'Exporting for social…' : 'Export for Instagram · TikTok · Facebook'}
+            </button>
+            <button className="btn btn-primary" disabled={running} onClick={() => exportShort(flush)} title="The recording's own quality, for YouTube Shorts">
+              {running ? 'Exporting…' : 'Export short'}
+            </button>
+          </>
         )}
         stage={(player, badge) => (
           <div className="short-stage">
             <div className="short-source">
               <ReelStage player={player}>
                 {badge}
-                <CropBox label="Camera" kind="camera" rect={layout.camera} aspect={bandAspects(p.video, layout.split).camera} video={p.video} onChange={(camera) => setLayout({ ...layout, camera })} />
-                <CropBox label="Gameplay" kind="gameplay" rect={layout.gameplay} aspect={bandAspects(p.video, layout.split).gameplay} video={p.video} onChange={(gameplay) => setLayout({ ...layout, gameplay })} />
+                {webcamMode(layout) !== 'off' && (
+                  <CropBox
+                    label="Camera"
+                    kind="camera"
+                    rect={layout.camera}
+                    // floating, the crop takes any shape (the box on the short follows it); in its band, the band's
+                    aspect={webcamMode(layout) === 'float' ? null : layoutAspects(p.video, layout).camera}
+                    video={p.video}
+                    onChange={(camera) => setLayout({ ...layout, camera })}
+                  />
+                )}
+                <CropBox label="Gameplay" kind="gameplay" rect={layout.gameplay} aspect={layoutAspects(p.video, layout).gameplay} video={p.video} onChange={(gameplay) => setLayout({ ...layout, gameplay })} />
               </ReelStage>
+              <div className="row wrap small">
+                <span>Webcam</span>
+                <div className="seg" role="radiogroup" aria-label="Webcam">
+                  {WEBCAM_MODES.map(([m, label, hint]) => (
+                    <button
+                      key={m}
+                      role="radio"
+                      aria-checked={webcamMode(layout) === m}
+                      className={`btn btn-xs ${webcamMode(layout) === m ? 'on' : ''}`}
+                      title={hint}
+                      onClick={() => setLayout(fitLayout({ ...layout, webcam: m }, p.video))}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              </div>
               <div className="muted small">
-                Drag the boxes over your facecam and the gameplay; drag a box's corner to resize it. Each box keeps its band's shape, so nothing stretches.
+                {webcamMode(layout) === 'off'
+                  ? 'Drag the box over the gameplay; drag its corner to resize it. It keeps its band’s shape, so nothing stretches.'
+                  : webcamMode(layout) === 'float'
+                    ? 'Drag the boxes over your facecam and the gameplay; drag a box’s corner to resize it. Then move and resize the webcam on the short itself.'
+                    : 'Drag the boxes over your facecam and the gameplay; drag a box’s corner to resize it. Each box keeps its band’s shape, so nothing stretches.'}
               </div>
             </div>
             <ShortPreview
@@ -226,11 +326,19 @@ export function ShortScreen({ id, sid }: { id: string; sid: string }) {
               caps={caps}
               setCaps={setCaps}
               kills={v.kills}
+              pieces={v.clips}
+              loopCut={loop.enabled ? v.loopCut : null}
               feedImages={feedImages}
               feed={feed}
               setFeed={setFeed}
               overlay={overlay}
               setOverlay={setOverlay}
+              title={title}
+              setTitle={setTitle}
+              titleStyle={titleStyle}
+              setTitleStyle={setTitleStyle}
+              titleFonts={v.titleFonts}
+              killfeed={v.killfeed}
             />
           </div>
         )}
@@ -238,12 +346,21 @@ export function ShortScreen({ id, sid }: { id: string; sid: string }) {
 
       <section className="card">
         <h2>Export</h2>
-        <div className="muted small mono">{v.short.outputPath ?? v.defaultOutputPath}</div>
+        <div className="short-exports small">
+          <span>YouTube Shorts</span>
+          <span className="muted">
+            the recording's own quality ({v.frame.width}×{v.frame.height}, its codec and bitrate)
+          </span>
+          <span className="muted mono">{v.short.outputPath ?? v.defaultOutputPath}</span>
+          <span>Instagram · TikTok · Facebook</span>
+          <span className="muted">1080×1920, H.264 High, up to 60 fps, ~16 Mbps, AAC 48 kHz: what their apps re-encode cleanly</span>
+          <span className="muted mono">{v.short.socialOutputPath ?? v.defaultSocialPath}</span>
+        </div>
         <label className="row small">
-          <input type="checkbox" checked={loop.enabled} disabled={running} onChange={(e) => setLoop({ ...loop, enabled: e.target.checked })} />
+          <input type="checkbox" checked={loop.enabled} disabled={running || socialRunning} onChange={(e) => setLoop({ ...loop, enabled: e.target.checked })} />
           <span>Seamless loop</span>
           <span className="muted">
-            opens on the final kill, plays the round from the start and ends right before that kill, so a replay runs straight on
+            opens on the reaction after the final kill, blends into the round's start and ends on that kill, so a replay runs straight into the reaction
             {loop.enabled && v.loopCut === null && ' (no kill left in this short to loop on)'}
           </span>
         </label>
@@ -254,29 +371,76 @@ export function ShortScreen({ id, sid }: { id: string; sid: string }) {
               className="input"
               style={{ width: 64 }}
               type="number"
-              min={MIN_LOOP_LEAD}
-              max={MAX_LOOP_LEAD}
+              min={0}
+              max={MAX_LOOP_AFTER}
               step={0.1}
-              value={loop.lead}
-              disabled={running}
-              onChange={(e) => setLoop({ ...loop, lead: Math.min(MAX_LOOP_LEAD, Math.max(MIN_LOOP_LEAD, Number(e.target.value) || 1)) })}
+              value={loop.after}
+              disabled={running || socialRunning}
+              onChange={(e) => setLoop({ ...loop, after: Math.min(MAX_LOOP_AFTER, Math.max(0, Number(e.target.value) || 0)) })}
             />
-            <span className="muted">s before the final kill{v.loopCut !== null && ` (cut at ${fmtTime(v.loopCut)} in the recording)`}</span>
+            <span className="muted">s after the final kill, on the reaction{v.loopCut !== null && ` (cut at ${fmtTime(v.loopCut)} in the recording)`}</span>
           </label>
         )}
-        {job && running && <Progress value={job.progress} />}
-        {job?.status === 'cancelled' && <div className="muted small">Export cancelled.</div>}
-        {v.short.outputPath && !running && (
-          // plays on repeat, as on a phone, so the loop point can be checked
-          <video className="short-output" controls loop src={`/api/projects/${id}/shorts/${sid}/output?t=${job?.id ?? ''}`} />
+        {job && running && (
+          <div className="small">
+            YouTube export <Progress value={job.progress} />
+          </div>
         )}
+        {socialJob && socialRunning && (
+          <div className="small">
+            Social export <Progress value={socialJob.progress} />
+          </div>
+        )}
+        {job?.status === 'cancelled' && <div className="muted small">YouTube export cancelled.</div>}
+        {socialJob?.status === 'cancelled' && <div className="muted small">Social export cancelled.</div>}
+        <div className="row wrap short-outputs">
+          {v.short.outputPath && !running && (
+            <figure>
+              {/* plays on repeat, as on a phone, so the loop point can be checked */}
+              <video className="short-output" controls loop src={`/api/projects/${id}/shorts/${sid}/output?t=${job?.id ?? ''}`} />
+              <figcaption className="muted small">YouTube</figcaption>
+            </figure>
+          )}
+          {v.short.socialOutputPath && !socialRunning && (
+            <figure>
+              <video className="short-output" controls loop src={`/api/projects/${id}/shorts/${sid}/output?for=social&t=${socialJob?.id ?? ''}`} />
+              <figcaption className="muted small">Instagram · TikTok · Facebook</figcaption>
+            </figure>
+          )}
+        </div>
       </section>
+
+      {/* written from the CS2 round (demo or kill feed): not for clips of other games */}
+      {v.killfeed && (
+      <TitlesPanel
+        heading="YouTube Shorts titles"
+        intro={
+          clips
+            ? 'Claude reads this clip (your kills, whether you died, the score on screen) and writes Shorts titles with you as the hero, each with thumbnail text to go with it.'
+            : `Claude reads this round from the demo (your kills in order, a clutch, the score and what was at stake${p.transcript?.length ? ', what you said' : ''}) and writes Shorts titles with you as the hero, each with thumbnail text to go with it.`
+        }
+        available={v.titlesAvailable}
+        profile={v.creatorProfile}
+        saveProfile={async (creatorProfile) => {
+          await api.patch(id, { settings: { creatorProfile } });
+          setV(await api.short(id, sid));
+        }}
+        titles={v.short.titles}
+        job={v.titlesJob}
+        start={(direction) => api.writeShortTitles(id, sid, direction)}
+        done={async () => setV(await api.short(id, sid))}
+        fits={[25, 50]}
+        placeholder="Direction for this batch (optional), e.g. focus on the AWP, or that it was match point"
+        useThumbnail={(text) => setTitle(text)}
+      />
+      )}
     </main>
   );
 }
 
 /** A framed region on the recording: drag to move, drag the corner to resize (at the band's aspect). */
-function CropBox({ label, kind, rect, aspect, video, onChange }: { label: string; kind: string; rect: Rect; aspect: number; video: Video; onChange: (r: Rect) => void }) {
+/** A crop on the source. `aspect` (width / height, pixels) is kept when resizing; null: any shape (the corner sets width and height). */
+function CropBox({ label, kind, rect, aspect, video, onChange }: { label: string; kind: string; rect: Rect; aspect: number | null; video: Video; onChange: (r: Rect) => void }) {
   const drag = useRef<{ resize: boolean; x0: number; y0: number; r0: Rect; w: number; h: number } | null>(null);
   const onDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (e.button !== 0) return;
@@ -291,7 +455,8 @@ function CropBox({ label, kind, rect, aspect, video, onChange }: { label: string
     if (!d) return;
     const dx = (e.clientX - d.x0) / d.w;
     const dy = (e.clientY - d.y0) / d.h;
-    onChange(d.resize ? resizeRect(d.r0, d.r0.w + dx, aspect, video) : clampRect({ ...d.r0, x: d.r0.x + dx, y: d.r0.y + dy }));
+    const free = (r: Rect) => ({ ...r, w: Math.max(0.05, Math.min(1 - r.x, d.r0.w + dx)), h: Math.max(0.05, Math.min(1 - r.y, d.r0.h + dy)) });
+    onChange(d.resize ? (aspect === null ? free(d.r0) : resizeRect(d.r0, d.r0.w + dx, aspect, video)) : clampRect({ ...d.r0, x: d.r0.x + dx, y: d.r0.y + dy }));
   };
   const onUp = () => (drag.current = null);
   return (
@@ -325,11 +490,19 @@ function ShortPreview({
   caps,
   setCaps,
   kills,
+  pieces,
+  loopCut,
   feedImages,
   feed,
   setFeed,
   overlay,
   setOverlay,
+  title,
+  setTitle,
+  titleStyle,
+  setTitleStyle,
+  titleFonts,
+  killfeed,
 }: {
   player: ReelPlayer;
   p: ProjectView;
@@ -339,16 +512,44 @@ function ShortPreview({
   caps: Settings['shortCaptions'];
   setCaps: (c: Settings['shortCaptions']) => void;
   kills: FeedKill[];
+  /** the short's pieces, in the order they play */
+  pieces: Clip[];
+  /** a looping short: where its opening reaction starts in the recording (the feed holds every kill from there) */
+  loopCut: number | null;
   feedImages: FeedImages;
   feed: Settings['shortKillfeed'];
   setFeed: (f: Settings['shortKillfeed']) => void;
   overlay: Settings['shortOverlay'];
   setOverlay: (o: Settings['shortOverlay']) => void;
+  title: string;
+  setTitle: (t: string) => void;
+  titleStyle: Settings['shortTitle'];
+  setTitleStyle: (t: Settings['shortTitle']) => void;
+  titleFonts: ShortView['titleFonts'];
+  /** the kill feed is known (CS2); off, any game: no kill-feed settings */
+  killfeed: boolean;
 }) {
   const canvas = useRef<HTMLCanvasElement>(null);
   const live = useRef({ player, layout });
   live.current = { player, layout };
   const H = Math.round((PREVIEW_W * frame.height) / frame.width);
+  // the settings tab, remembered on this computer
+  const [tab, setTab] = useState<SettingsTab>(() => {
+    try {
+      const t = localStorage.getItem(TAB_KEY);
+      return SETTINGS_TABS.some(([x]) => x === t && (killfeed || x !== 'feed')) ? (t as SettingsTab) : 'title';
+    } catch {
+      return 'title';
+    }
+  });
+  const pickTab = (t: SettingsTab) => {
+    setTab(t);
+    try {
+      localStorage.setItem(TAB_KEY, t);
+    } catch {
+      // not saved: fine
+    }
+  };
 
   useEffect(() => {
     let raf = 0;
@@ -361,10 +562,63 @@ function ShortPreview({
       const g = c.getContext('2d')!;
       const vw = vid.videoWidth;
       const vh = vid.videoHeight;
-      const camH = Math.round(H * l.split);
+      // the bands as the export stacks them (camera or top safe band, gameplay, bottom safe band)
+      const bands = layoutBands({ width: PREVIEW_W, height: H }, l);
+      const camH = bands.camera;
+      const topH = bands.top;
+      const safeH = bands.safe;
+      const gameH = bands.gameplay;
+      const gameY = camH + topH;
       const band = (r: Rect, y: number, h: number) => g.drawImage(vid, r.x * vw, r.y * vh, r.w * vw, r.h * vh, 0, y, PREVIEW_W, h);
-      band(l.camera, 0, camH);
-      band(l.gameplay, camH, H - camH);
+      if (camH) band(l.camera, 0, camH);
+      band(l.gameplay, gameY, gameH);
+      const r = l.gameplay;
+      const blur = SAFE_BLUR * PREVIEW_W;
+      // drawn a blur's width past the band on every side, so its edges blur into picture, not into nothing
+      const m = Math.ceil(blur * 2);
+      // a safe band as the export makes it: the gameplay's edge at `seam` mirrored over it, blurred and dimmed
+      const mirrored = (seam: number, h: number, below: boolean) => {
+        const share = Math.min(1, (h + m) / gameH); // of the gameplay box, from that edge
+        g.save();
+        g.beginPath();
+        g.rect(0, below ? seam : seam - h, PREVIEW_W, h);
+        g.clip();
+        g.filter = `blur(${blur}px) brightness(${SAFE_DIM})`;
+        g.translate(0, 2 * seam);
+        g.scale(1, -1);
+        if (below) g.drawImage(vid, r.x * vw, (r.y + r.h * (1 - share)) * vh, r.w * vw, r.h * share * vh, -m, seam - h - m, PREVIEW_W + 2 * m, h + 2 * m);
+        else g.drawImage(vid, r.x * vw, r.y * vh, r.w * vw, r.h * share * vh, -m, seam - m, PREVIEW_W + 2 * m, h + 2 * m);
+        g.restore();
+      };
+      if (topH > 0) mirrored(gameY, topH, false);
+      if (safeH > 0) mirrored(gameY + gameH, safeH, true);
+
+      // the floating webcam as the export draws it: a soft shadow, a white border, rounded corners
+      const pip = pipRect(l, frame, p.video);
+      if (pip) {
+        const k = PREVIEW_W / frame.width;
+        const s = pipStyle(pip, frame);
+        const [x, y, w, h] = [pip.x * k, pip.y * k, pip.w * k, pip.h * k];
+        const b = s.border * k;
+        const rounded = (rx: number, ry: number, rw: number, rh: number, rr: number) => {
+          g.beginPath();
+          g.roundRect(rx, ry, rw, rh, rr);
+        };
+        g.save();
+        g.shadowColor = `rgba(0, 0, 0, ${PIP_SHADOW_ALPHA})`;
+        g.shadowBlur = s.shadow * k;
+        g.shadowOffsetY = s.drop * k;
+        g.fillStyle = '#fff';
+        rounded(x - b, y - b, w + 2 * b, h + 2 * b, (s.radius + s.border) * k);
+        g.fill();
+        g.restore();
+        g.save();
+        rounded(x, y, w, h, s.radius * k);
+        g.clip();
+        const c = l.camera;
+        g.drawImage(vid, c.x * vw, c.y * vh, c.w * vw, c.h * vh, x, y, w, h);
+        g.restore();
+      }
     };
     raf = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(raf);
@@ -381,8 +635,14 @@ function ShortPreview({
   const onSplitMove = (e: React.PointerEvent) => {
     const s = split.current;
     if (!s) return;
-    const at = Math.min(MAX_SPLIT, Math.max(MIN_SPLIT, (e.clientY - s.top) / s.h));
-    setLayout(fitLayout({ ...s.base, split: at }, p.video));
+    const at = (e.clientY - s.top) / s.h;
+    // with no camera, the line is the top safe band's edge
+    setLayout(
+      fitLayout(
+        hasCamera(s.base) ? { ...s.base, split: Math.min(MAX_SPLIT, Math.max(MIN_SPLIT, at)) } : { ...s.base, top: Math.round(Math.min(MAX_SAFE_TOP, Math.max(0, at)) * 100) / 100 },
+        p.video,
+      ),
+    );
   };
   const onSplitUp = () => (split.current = null);
 
@@ -391,18 +651,57 @@ function ShortPreview({
   const lines = useMemo(() => (p.transcript ?? []).filter((l) => !l.removed), [p.transcript]);
   const maxChars = captionChars(style, frame);
   // as the export: smaller than asked when the widest entry wouldn't fit
-  const shownScale = fitFeedScale(feedImages ?? [], frame, feed.scale);
+  const feedSide = feedMargin(feed.sidePct);
+  const shownScale = fitFeedScale(feedImages ?? [], frame, feed.scale, feed.align, feedSide);
   const chunks = useMemo(() => captionChunks(lines, style.wordsPerCaption, maxChars, style.pauseS), [lines, style.wordsPerCaption, maxChars, style.pauseS]);
   const rec = player.recNow();
   const shown = style.enabled ? chunks.find((c) => rec >= c.start && rec < c.end) : undefined;
 
+  const feedHint = feed.enabled ? `${kills.length} kills` : 'off';
+
+  // the title measured as the export measures it, and where it would be hard to see or in the way
+  const titleFont = useTitleFont(titlePreset(titleStyle.preset).font, titleFonts);
+  // where the export puts it: kept above the gameplay, that's where this short's gameplay starts
+  const seam = gameplayTop(frame, layout);
+  const placedTitle = useMemo(() => placeTitle(title, titleStyle, frame, titleFont, seam), [title, titleStyle, frame, titleFont, seam]);
+  const titleNotes = useMemo(() => {
+    const boxes = titleBoxes(wrapTitle(title, placedTitle, frame, titleFont), placedTitle, frame, titleFont);
+    if (!boxes.length) return [];
+    const extent = { top: boxes[0].y / frame.height, bottom: (boxes.at(-1)!.y + boxes.at(-1)!.h) / frame.height };
+    const feedTop = feedTopPct(feed.positionPct, seam) / 100;
+    const feedRows = Math.min(5, Math.max(1, kills.length));
+    const feedBox = feed.enabled ? { top: feedTop, bottom: feedTop + (feedRows * FEED_ROW * feedTextSize(frame, shownScale)) / frame.height } : null;
+    return titleWarnings(extent, { split: seam, bottom: layoutBands(frame, layout).safe / frame.height }, feedBox);
+  }, [title, placedTitle, frame, titleFont, feed.enabled, feed.positionPct, layout, kills.length, shownScale]);
+  const titleInput = useRef<HTMLTextAreaElement>(null);
+  // the selected words wrapped in stars (or the stars taken off them): they show in the preset's accent
+  const emphasise = () => {
+    const el = titleInput.current;
+    if (!el) return;
+    let { selectionStart: a, selectionEnd: b } = el;
+    // nothing selected: the word at the cursor
+    if (a === b) {
+      while (a > 0 && !/\s/.test(title[a - 1])) a--;
+      while (b < title.length && !/\s/.test(title[b])) b++;
+    }
+    const picked = title.slice(a, b);
+    if (!picked.trim()) return;
+    const starred = /^\*.*\*$/s.test(picked);
+    const next = starred ? picked.slice(1, -1) : `*${picked.replace(/\*/g, '')}*`;
+    setTitle(title.slice(0, a) + next + title.slice(b));
+    requestAnimationFrame(() => {
+      el.focus();
+      el.setSelectionRange(a, a + next.length);
+    });
+  };
   return (
+    <>
     <div className="short-side">
       <div className="short-preview" style={{ aspectRatio: `${frame.width} / ${frame.height}` }}>
         <canvas ref={canvas} width={PREVIEW_W} height={H} onClick={player.togglePlay} />
         <div
           className="short-split"
-          style={{ top: `${layout.split * 100}%` }}
+          style={{ top: `${seam * 100}%` }}
           title="Drag to change how tall the camera is"
           onPointerDown={onSplitDown}
           onPointerMove={onSplitMove}
@@ -412,15 +711,22 @@ function ShortPreview({
         {feed.enabled && (
           <KillFeed
             kills={kills}
+            pieces={pieces}
+            loopCut={loopCut}
             images={feedImages}
             rec={rec}
             frame={frame}
-            topPct={feedTopPct(feed.positionPct, layout.split)}
+            topPct={feedTopPct(feed.positionPct, seam)}
             scale={shownScale}
             align={feed.align}
+            margin={feedSide}
+            stay={feedStay(feed.stay)}
           />
         )}
+        {webcamMode(layout) === 'float' && <WebcamPip layout={layout} setLayout={setLayout} frame={frame} video={p.video} />}
         {overlay.enabled && overlay.path && <OverlayPicture overlay={overlay} setOverlay={setOverlay} frame={frame} />}
+        {/* dragged, it's placed by hand from where it's shown */}
+        {title.trim() && <TitleText text={title} style={placedTitle} setStyle={(t) => setTitleStyle({ ...t, aboveGameplay: false })} frame={frame} font={titleFont} />}
         {shown && (
           <div className="caption-overlay" style={{ ['--pos' as string]: `${style.positionPct}%`, ['--size' as string]: `${(style.sizePct * frame.height) / frame.width}cqw` }}>
             <div className={`caption-sample style-${style.style}`} style={{ fontFamily: `'${style.font}', 'Arial Black', sans-serif` }}>
@@ -433,13 +739,145 @@ function ShortPreview({
           </div>
         )}
       </div>
-      <div className="short-caption-settings small">
-        <div className="short-overlay-settings">
+      <div className="muted small short-hint">Click to play · drag the line to resize the {hasCamera(layout) ? 'camera' : 'top safe area'} · drag the title, overlay to move them</div>
+    </div>
+      <div className="short-settings small">
+        <style>{[...new Set(TITLE_PRESETS.map((t) => t.font))].map((font) => `@font-face{font-family:'${font}';src:url('/api/fonts/${encodeURIComponent(font)}')}`).join('')}</style>
+        <div className="settings-tabs" role="tablist">
+          {SETTINGS_TABS.filter(([t]) => killfeed || t !== 'feed').map(([t, label]) => (
+            <button key={t} role="tab" aria-selected={tab === t} className={`settings-tab ${tab === t ? 'on' : ''}`} onClick={() => pickTab(t)}>
+              {label}
+              {t === 'feed' && <span className="tab-note">{feedHint}</span>}
+              {t === 'overlay' && <span className="tab-note">{overlay.enabled && overlay.path ? 'on' : 'off'}</span>}
+            </button>
+          ))}
+        </div>
+        {tab === 'title' && (
+        <div className="settings-panel">
+          <label className="field">
+            <span>Title</span>
+            <textarea
+              ref={titleInput}
+              className="input short-title-input"
+              rows={2}
+              maxLength={200}
+              placeholder="What the short is about, e.g. THAT WAS *INSANE* (Enter for a new line)"
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+            />
+          </label>
+          <div className="row title-emphasis">
+            <button className="btn btn-xs" onClick={emphasise} title="Wrap the selected words (or the word at the cursor) in *stars*; again to take them off">
+              Emphasise
+            </button>
+            <span className="muted">
+              Words in <span className="mono">*stars*</span> show in the preset's accent colour
+            </span>
+          </div>
+          <div className="title-presets" role="radiogroup" aria-label="Title style">
+            {TITLE_PRESETS.map((t) => (
+              <button
+                key={t.id}
+                role="radio"
+                className={`title-preset ${titleStyle.preset === t.id ? 'on' : ''}`}
+                aria-checked={titleStyle.preset === t.id}
+                title={t.name}
+                onClick={() => setTitleStyle({ ...titleStyle, preset: t.id })}
+              >
+                <PresetSample t={t} />
+                <em>{t.name}</em>
+              </button>
+            ))}
+          </div>
+          <label className="row setting">
+            <span className="muted">Size</span>
+            <input
+              className="input"
+              type="number"
+              min={MIN_TITLE_SIZE}
+              max={MAX_TITLE_SIZE}
+              step={0.5}
+              value={titleStyle.sizePct}
+              onChange={(e) => setTitleStyle({ ...titleStyle, sizePct: Math.min(MAX_TITLE_SIZE, Math.max(MIN_TITLE_SIZE, Number(e.target.value) || MIN_TITLE_SIZE)) })}
+            />
+            <span className="muted">% of the height</span>
+          </label>
+          <label className="row setting">
+            <span className="muted">From top</span>
+            <input
+              className="input"
+              type="number"
+              min={0}
+              max={90}
+              step={1}
+              value={Math.round(placedTitle.positionPct)}
+              onChange={(e) => setTitleStyle({ ...titleStyle, aboveGameplay: false, positionPct: Math.min(90, Math.max(0, Number(e.target.value) || 0)) })}
+            />
+            <span className="muted">%{title.trim() ? ', or drag it' : ''}</span>
+          </label>
+          <label className="row">
+            <input
+              type="checkbox"
+              checked={!!titleStyle.aboveGameplay}
+              onChange={(e) => setTitleStyle({ ...titleStyle, aboveGameplay: e.target.checked, positionPct: placedTitle.positionPct })}
+            />
+            <span title="Its bottom sits on the camera's lower edge, just above the gameplay: the same place in every short, clear of the crosshair">
+              Keep it just above the gameplay
+            </span>
+          </label>
+          {title.trim() && titleNotes.map((n) => (
+            <div key={n} className="warn-text small">
+              {n}
+            </div>
+          ))}
+          <label className="row setting">
+            <span className="muted">Line height</span>
+            <input
+              className="input"
+              type="number"
+              min={MIN_LINE_HEIGHT}
+              max={MAX_LINE_HEIGHT}
+              step={0.05}
+              value={titleStyle.lineHeight}
+              onChange={(e) =>
+                setTitleStyle({ ...titleStyle, lineHeight: Math.min(MAX_LINE_HEIGHT, Math.max(MIN_LINE_HEIGHT, Number(e.target.value) || 1)) })
+              }
+            />
+            <span className="muted">× (1 = the font's own)</span>
+          </label>
+          <label className="row setting">
+            <span className="muted">Word spacing</span>
+            <input
+              className="input"
+              type="number"
+              min={MIN_WORD_SPACING}
+              max={MAX_WORD_SPACING}
+              step={0.25}
+              value={titleStyle.wordSpacing}
+              onChange={(e) =>
+                setTitleStyle({ ...titleStyle, wordSpacing: Math.min(MAX_WORD_SPACING, Math.max(MIN_WORD_SPACING, Number(e.target.value) || 1)) })
+              }
+            />
+            <span className="muted">× (1 = normal)</span>
+          </label>
+          <div>
+            <button
+              className="btn btn-xs"
+              title={`Size ${TITLE_DEFAULTS.sizePct}%, ${TITLE_DEFAULTS.positionPct}% from the top, line height ${TITLE_DEFAULTS.lineHeight}, word spacing ${TITLE_DEFAULTS.wordSpacing} (keeps the style)`}
+              onClick={() => setTitleStyle({ ...TITLE_DEFAULTS, preset: titleStyle.preset })}
+            >
+              Reset to TEYE defaults
+            </button>
+          </div>
+        </div>
+        )}
+        {tab === 'overlay' && (
+        <div className="settings-panel">
           <label className="row">
             <input type="checkbox" checked={overlay.enabled} onChange={(e) => setOverlay({ ...overlay, enabled: e.target.checked })} />
-            <span>Overlay</span>
-            <span className="muted">{overlay.path ? 'drag it in the preview; drag its corner to resize' : 'a picture shown on top (PNG / WebP with transparency)'}</span>
+            <span>Show an overlay picture</span>
           </label>
+          <div className="muted">{overlay.path ? 'Drag it in the preview; drag its corner to resize it.' : 'A picture on top of the short, such as a "follow me" badge (PNG or WebP with transparency).'}</div>
           {overlay.enabled && (
             <div className="row wrap">
               <FilePicker kind="image" value={overlay.path} onChange={(path) => setOverlay({ ...overlay, path })} />
@@ -460,7 +898,7 @@ function ShortPreview({
             </div>
           )}
           {overlay.enabled && overlay.path && (
-            <div className="row">
+            <div className="row setting">
               <span className="muted">Align</span>
               <span className="segmented">
                 {OVERLAY_ALIGNS.map(([a, label, hint]) => (
@@ -478,30 +916,49 @@ function ShortPreview({
               {overlay.align === 'free' && <span className="muted">placed by hand</span>}
             </div>
           )}
+          {overlay.enabled && overlay.path && (
+            <label className="row setting">
+              <span className="muted">Opacity</span>
+              <input
+                type="range"
+                min={MIN_OPACITY}
+                max={1}
+                step={0.05}
+                value={overlay.opacity}
+                onChange={(e) => setOverlay({ ...overlay, opacity: Number(e.target.value) })}
+                onDoubleClick={() => setOverlay({ ...overlay, opacity: 1 })}
+                title="Double-click for solid"
+              />
+              <span className="mono">{Math.round(overlay.opacity * 100)}%</span>
+            </label>
+          )}
         </div>
+        )}
+        {tab === 'feed' && (
+        <div className="settings-panel">
         <label className="row">
           <input type="checkbox" checked={feed.enabled} onChange={(e) => setFeed({ ...feed, enabled: e.target.checked })} />
-          <span>Kill feed</span>
-          <span className="muted">({kills.length} kills)</span>
+          <span>Show my kills</span>
+          <span className="muted">({kills.length} in this round)</span>
         </label>
         {feed.enabled && (
-          <label className="row">
-            <span className="muted">Feed at</span>
+          <label className="row setting">
+            <span className="muted">From top</span>
             <input
               className="input"
               type="number"
               min={0}
               max={90}
               step={1}
-              placeholder={String(Math.round(feedTopPct(null, layout.split)))}
+              placeholder={String(Math.round(feedTopPct(null, seam)))}
               value={feed.positionPct ?? ''}
               onChange={(e) => setFeed({ ...feed, positionPct: e.target.value === '' ? null : Number(e.target.value) })}
             />
-            <span className="muted">% from top{feed.positionPct === null ? ' (under the camera)' : ''}</span>
+            <span className="muted">%{feed.positionPct === null ? ' (under the camera)' : ''}</span>
           </label>
         )}
         {feed.enabled && (
-          <div className="row">
+          <div className="row setting">
             <span className="muted">Align</span>
             <span className="segmented">
               {FEED_ALIGNS.map(([a, label]) => (
@@ -512,9 +969,40 @@ function ShortPreview({
             </span>
           </div>
         )}
+        {feed.enabled && feed.align !== 'center' && (
+          <label className="row setting">
+            <span className="muted">Padding {feed.align}</span>
+            <input
+              type="range"
+              min={0}
+              max={MAX_FEED_MARGIN * 100}
+              step={0.5}
+              value={feedSide * 100}
+              onChange={(e) => setFeed({ ...feed, sidePct: Number(e.target.value) })}
+              onDoubleClick={() => setFeed({ ...feed, sidePct: FEED_MARGIN * 100 })}
+              title="Double-click for the default"
+            />
+            <span className="mono">{(feedSide * 100).toFixed(1)}%</span>
+          </label>
+        )}
         {feed.enabled && (
-          <label className="row">
-            <span className="muted">Feed size</span>
+          <label className="row setting">
+            <span className="muted">Fade out after</span>
+            <input
+              className="input"
+              type="number"
+              min={0}
+              max={MAX_FEED_STAY}
+              step={0.5}
+              value={feedStay(feed.stay)}
+              onChange={(e) => setFeed({ ...feed, stay: Number(e.target.value) })}
+            />
+            <span className="muted">s{feedStay(feed.stay) === 0 ? ' (0: they stay up)' : ' of the short'}</span>
+          </label>
+        )}
+        {feed.enabled && (
+          <label className="row setting">
+            <span className="muted">Size</span>
             <button className="btn btn-xs" disabled={feed.scale <= MIN_FEED_SCALE} onClick={() => setFeed({ ...feed, scale: stepScale(feed.scale, -1) })} title="Smaller">
               −
             </button>
@@ -537,45 +1025,121 @@ function ShortPreview({
         {feed.enabled && shownScale < feed.scale - 0.005 && (
           <div className="muted">The widest entry fills the frame at {Math.round(shownScale * 100)}%, so the feed stops growing there.</div>
         )}
-        <label className="row">
-          <span className="muted">Caption size</span>
+        </div>
+        )}
+        {tab === 'frame' && (
+        <div className="settings-panel">
+        {!hasCamera(layout) && (
+          <>
+            <h4>Top safe area</h4>
+            <label className="row setting">
+              <span className="muted">Height</span>
+              <input
+                type="range"
+                min={0}
+                max={MAX_SAFE_TOP}
+                step={0.01}
+                value={layout.top ?? DEFAULT_SAFE_TOP}
+                onChange={(e) => setLayout(fitLayout({ ...layout, top: Number(e.target.value) }, p.video))}
+                onDoubleClick={() => setLayout(fitLayout({ ...layout, top: DEFAULT_SAFE_TOP }, p.video))}
+                title="Double-click for the default"
+              />
+              <span className="mono">{Math.round((layout.top ?? DEFAULT_SAFE_TOP) * 100)}%</span>
+            </label>
+            <div className="muted">
+              With no webcam, the gameplay starts below this, clear of the phone's status bar and YouTube's top buttons; the band shows the gameplay blurred. You can also drag the line in the preview.
+            </div>
+          </>
+        )}
+        <h4>Bottom safe area</h4>
+        <label className="row setting">
+          <span className="muted">Height</span>
+          <input
+            type="range"
+            min={0}
+            max={MAX_SAFE_BOTTOM}
+            step={0.01}
+            value={layout.bottom ?? 0}
+            onChange={(e) => setLayout(fitLayout({ ...layout, bottom: Number(e.target.value) }, p.video))}
+            onDoubleClick={() => setLayout(fitLayout({ ...layout, bottom: DEFAULT_SAFE_BOTTOM }, p.video))}
+            title="Double-click for the default"
+          />
+          <span className="mono">{Math.round((layout.bottom ?? 0) * 100)}%</span>
+        </label>
+        <div className="muted">
+          The gameplay stops above this, so YouTube's title and buttons don't cover the HUD; the band shows the gameplay blurred.
+        </div>
+        <h4>Captions</h4>
+        <label className="row setting">
+          <span className="muted">Size</span>
           <input className="input" type="number" min={1} max={15} step={0.5} value={caps.sizePct} onChange={(e) => setCaps({ ...caps, sizePct: Number(e.target.value) })} />
           <span className="muted">%</span>
         </label>
-        <label className="row">
-          <span className="muted">Position</span>
+        <label className="row setting">
+          <span className="muted">From top</span>
           <input className="input" type="number" min={5} max={95} step={1} value={caps.positionPct} onChange={(e) => setCaps({ ...caps, positionPct: Number(e.target.value) })} />
-          <span className="muted">% from top</span>
+          <span className="muted">%</span>
         </label>
         {!style.enabled ? (
           <div className="muted">Captions are off (Captions step), so the short won't have them.</div>
         ) : (
           lines.length === 0 && <div className="muted">No transcript in this project, so the short has no captions.</div>
         )}
+        </div>
+        )}
       </div>
-    </div>
+    </>
   );
 }
+
+type SettingsTab = 'title' | 'feed' | 'overlay' | 'frame';
+const SETTINGS_TABS: [SettingsTab, string][] = [
+  ['title', 'Title'],
+  ['feed', 'Kill feed'],
+  ['overlay', 'Overlay'],
+  ['frame', 'Frame & captions'],
+];
+const TAB_KEY = 'shortSettingsTab';
 
 /** The short's kill feed as it will be exported: the game's own entries where found, drawn rows for the rest. */
 function KillFeed({
   kills,
+  pieces,
+  loopCut,
   images,
   rec,
   frame,
   topPct,
   scale,
   align,
+  margin,
+  stay,
 }: {
   kills: FeedKill[];
+  /** the short's pieces, in the order they play */
+  pieces: Clip[];
+  loopCut: number | null;
   images: FeedImages;
   rec: number;
   frame: Video;
   topPct: number;
   scale: number;
   align: FeedAlign;
+  /** the side padding, a fraction of the width */
+  margin: number;
+  /** seconds a row stays up after its kill; 0 = for good */
+  stay: number;
 }) {
   const sorted = useMemo(() => [...kills].sort((a, b) => a.at - b.at), [kills]);
+  // on the short's own clock, as the export: the piece on screen (or, looking at cut footage, the one before it)
+  const inPiece = pieces.findIndex((p) => rec >= p.start && rec < p.end);
+  const n = inPiece >= 0 ? inPiece : pieces.reduce((m, p, i) => (p.start <= rec ? i : m), 0);
+  const live = pieces.length ? feedOnScreen(sorted, pieces, n) : { kills: sorted, clip: { start: 0, end: Infinity } };
+  const now = pieces.length ? live.clip.start + Math.min(rec, pieces[n].end) - pieces[n].start : rec;
+  // a looping short's opening reaction (played here after the final kill): every kill held up, as the export opens
+  const held = holdsFeed(rec, loopCut);
+  const shown = held ? holdKills(sorted, Infinity, now - 1) : live.kills;
+  if (held) stay = 0;
   // text height in container widths, as the export sizes it from the frame height
   const size = (feedTextSize(frame, scale) * 100) / frame.width;
   const pct = (n: number, of: number) => `${(n * 100) / of}%`;
@@ -587,26 +1151,38 @@ function KillFeed({
     <>
       {sorted.map((k, i) => {
         const img = images?.[i];
-        if (k.at > rec || !img) return null;
-        const r = feedImageRect(img, i, frame, topPct, scale, align);
+        const alpha = feedAlpha(shown[i], now, stay);
+        if (shown[i].at > now || !img || alpha <= 0) return null;
+        // in its slot: the rows above it that are gone have closed up
+        const r = feedImageRect(img, feedSlot(shown, i, now, stay), frame, topPct, scale, align, margin);
         return (
           <img
             key={i}
             className="feed-img"
             src={img.url}
             alt=""
-            style={{ left: pct(r.x, frame.width), top: pct(r.y, frame.height), width: pct(r.w, frame.width), fontSize: `${size}cqw`, ...slide }}
+            style={{ left: pct(r.x, frame.width), top: pct(r.y, frame.height), width: pct(r.w, frame.width), fontSize: `${size}cqw`, opacity: alpha, ...slide }}
           />
         );
       })}
-      <div className="short-feed" style={{ top: `${topPct}%`, left: `${FEED_MARGIN * 100}%`, right: `${FEED_MARGIN * 100}%`, fontSize: `${size}cqw` }}>
+      <div
+        className="short-feed"
+        style={{
+          top: `${topPct}%`,
+          // the side padding on the aligned side, the default gap on the other
+          left: `${(align === 'left' ? margin : FEED_MARGIN) * 100}%`,
+          right: `${(align === 'right' ? margin : FEED_MARGIN) * 100}%`,
+          fontSize: `${size}cqw`,
+        }}
+      >
         {sorted.map((k, i) =>
-          k.at <= rec && images !== null && !images[i] ? (
+          shown[i].at <= now && images !== null && !images[i] && feedAlpha(shown[i], now, stay) > 0 ? (
             <div
               key={i}
               className="feed-row"
               style={{
-                top: `${i * FEED_ROW}em`,
+                top: `${feedSlot(shown, i, now, stay) * FEED_ROW}em`,
+                opacity: feedAlpha(shown[i], now, stay),
                 padding: `${FEED_PAD}em`,
                 outlineWidth: `${FEED_BORDER}em`,
                 background: FEED_BG,
@@ -634,7 +1210,63 @@ function KillFeed({
  * it to move it, drag its corner to resize it (its shape is kept). Placed
  * with the same rule as the export, so it can't leave the frame.
  */
-function OverlayPicture({ overlay, setOverlay, frame }: { overlay: Settings['shortOverlay']; setOverlay: (o: Settings['shortOverlay']) => void; frame: Video }) {
+/**
+ * The floating webcam's handle on the short: drawn by the preview's canvas
+ * (as the export draws it), moved by dragging it and resized from its corner;
+ * the arrow keys nudge it (Shift: 10 px). Its height follows the camera crop.
+ */
+function WebcamPip({ layout, setLayout, frame, video }: { layout: ShortLayout; setLayout: (l: ShortLayout) => void; frame: Video; video: Video }) {
+  const r = pipRect(layout, frame, video);
+  const drag = useRef<{ resize: boolean; x0: number; y0: number; p0: { x: number; y: number; w: number }; w: number; h: number } | null>(null);
+  if (!r) return null;
+  // where it is now, as set (kept in the frame)
+  const here = { x: r.x / frame.width, y: r.y / frame.height, w: r.w / frame.width };
+  const place = (pip: { x: number; y: number; w: number }) => setLayout({ ...layout, pip: { ...pip, w: Math.min(MAX_PIP_W, Math.max(MIN_PIP_W, pip.w)) } });
+  const onDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    e.currentTarget.focus();
+    const box = e.currentTarget.parentElement!.getBoundingClientRect();
+    drag.current = { resize: (e.target as HTMLElement).classList.contains('crop-handle'), x0: e.clientX, y0: e.clientY, p0: here, w: box.width, h: box.height };
+  };
+  const onMove = (e: React.PointerEvent) => {
+    const d = drag.current;
+    if (!d) return;
+    const dx = (e.clientX - d.x0) / d.w;
+    const dy = (e.clientY - d.y0) / d.h;
+    place(d.resize ? { ...d.p0, w: d.p0.w + dx } : { ...d.p0, x: d.p0.x + dx, y: d.p0.y + dy });
+  };
+  const onUp = () => (drag.current = null);
+  const onKey = (e: React.KeyboardEvent) => {
+    const step = e.shiftKey ? 10 : 1;
+    const dx = e.key === 'ArrowLeft' ? -step : e.key === 'ArrowRight' ? step : 0;
+    const dy = e.key === 'ArrowUp' ? -step : e.key === 'ArrowDown' ? step : 0;
+    if (!dx && !dy) return;
+    e.preventDefault();
+    e.stopPropagation();
+    place({ ...here, x: here.x + dx / frame.width, y: here.y + dy / frame.height });
+  };
+  const pct = (n: number, of: number) => `${(n * 100) / of}%`;
+  return (
+    <div
+      className="pip-box"
+      tabIndex={0}
+      style={{ left: pct(r.x, frame.width), top: pct(r.y, frame.height), width: pct(r.w, frame.width), height: pct(r.h, frame.height) }}
+      title="Your webcam: drag to move, drag the corner to resize; click it, then the arrow keys nudge it (Shift: 10 px)"
+      onPointerDown={onDown}
+      onPointerMove={onMove}
+      onPointerUp={onUp}
+      onPointerCancel={onUp}
+      onKeyDown={onKey}
+      onClick={(e) => e.stopPropagation()}
+    >
+      <i className="crop-handle" />
+    </div>
+  );
+}
+
+function OverlayPicture({ overlay, setOverlay, frame }:{ overlay: Settings['shortOverlay']; setOverlay: (o: Settings['shortOverlay']) => void; frame: Video }) {
   const [natural, setNatural] = useState<{ w: number; h: number } | null>(null);
   useEffect(() => setNatural(null), [overlay.path]);
   const drag = useRef<{ resize: boolean; x0: number; y0: number; o0: Settings['shortOverlay']; w: number; h: number } | null>(null);
@@ -696,8 +1328,198 @@ function OverlayPicture({ overlay, setOverlay, frame }: { overlay: Settings['sho
       onKeyDown={onKey}
       onClick={(e) => e.stopPropagation()}
     >
-      <img src={`/api/image?path=${encodeURIComponent(overlay.path)}`} alt="" draggable={false} onLoad={(e) => setNatural({ w: e.currentTarget.naturalWidth, h: e.currentTarget.naturalHeight })} />
+      <img src={`/api/image?path=${encodeURIComponent(overlay.path)}`} alt="" draggable={false} style={{ opacity: overlay.opacity }} onLoad={(e) => setNatural({ w: e.currentTarget.naturalWidth, h: e.currentTarget.naturalHeight })} />
       <i className="crop-handle" />
     </div>
   );
+}
+
+/** "#RRGGBB" and an ASS-style alpha (0 = solid, 1 = gone) as CSS */
+const rgba = (hex: string, alpha: number) => {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${(1 - alpha).toFixed(2)})`;
+};
+
+/**
+ * A title preset's letters in CSS, matching the export's ASS. The export's
+ * sizes are shares of its font size, which is `1 / scale` em here (see assScale).
+ */
+function titleCss(t: TitlePreset, scale = 1): React.CSSProperties {
+  const em = (n: number) => `${n / scale}em`;
+  const shadow = t.shadow && !t.box ? t.shadow : null;
+  return {
+    fontFamily: `'${t.font}', Impact, 'Arial Black', sans-serif`,
+    color: t.color,
+    // the export's outline is outside the letters: a centred stroke twice as wide, drawn under the fill
+    ...(t.outline ? { WebkitTextStroke: `${em(t.outlineW * 2)} ${t.outline}`, paintOrder: 'stroke fill' } : {}),
+    // the export's shadow is of the outlined letters: a drop shadow of what's drawn, stroke and all
+    ...(shadow ? { filter: `drop-shadow(${em(shadow.offset)} ${em(shadow.offset)} 0 ${rgba(shadow.color, shadow.alpha)})` } : {}),
+  };
+}
+
+/** A box preset's box in CSS, around text at `scale` (for the preset cards; the preview draws titleBoxes). */
+function titleBoxCss(t: TitlePreset, scale = 1): React.CSSProperties {
+  if (!t.box) return {};
+  const em = (n: number) => `${n / scale}em`;
+  return {
+    background: t.box,
+    padding: `${em(t.pad.y * 0.6)} ${em(t.pad.x)}`,
+    borderRadius: em(t.radius),
+    ...(t.shadow ? { boxShadow: `${em(t.shadow.offset)} ${em(t.shadow.offset)} 0 ${rgba(t.shadow.color, t.shadow.alpha)}` } : {}),
+  };
+}
+
+/** A line's words, the *starred* ones in the preset's accent. */
+/** A preset card's sample line, in the preset's look, its capitals in the middle of its box. */
+function PresetSample({ t }: { t: TitlePreset }) {
+  const box = useFontBox(t.font);
+  return (
+    <span className="title-preset-sample">
+      <span style={{ ...titleCss(t), ...titleBoxCss(t), display: 'inline-block', transform: t.tilt ? `rotate(${t.tilt}deg)` : undefined }}>
+        <span style={{ position: 'relative', top: `${capCentreShift(box)}em` }}>
+          <TitleWords line={t.sample} preset={t} />
+        </span>
+      </span>
+    </span>
+  );
+}
+
+function TitleWords({ line, preset }: { line: string; preset: TitlePreset }) {
+  return (
+    <>
+      {titleWords(line).map((w, i) => (
+        <span key={i}>
+          {i > 0 && ' '}
+          {w.em ? <span style={{ color: preset.accent }}>{w.text}</span> : w.text}
+        </span>
+      ))}
+    </>
+  );
+}
+
+/** A title font as the export measures it: its scale, baseline and capital height from the server, widths from the browser. */
+function useTitleFont(font: string, fonts: ShortView['titleFonts'] | undefined): TitleFont {
+  const width = useFontWidth(font);
+  const m = fonts?.[font];
+  return useMemo(() => ({ scale: m?.scale ?? 1, width, ascent: m?.ascent ?? undefined, cap: m?.cap ?? undefined }), [m?.scale, m?.ascent, m?.cap, width]);
+}
+
+/** The short's title where the export puts it, over its rounded boxes; dragged up or down to move it. */
+function TitleText({ text, style, setStyle, frame, font }: { text: string; style: Settings['shortTitle']; setStyle: (t: Settings['shortTitle']) => void; frame: Video; font: TitleFont }) {
+  const preset = titlePreset(style.preset);
+  const { scale } = font;
+  const cssBox = useFontBox(preset.font);
+  // broken into lines the way the export breaks them, its boxes where the export draws them
+  const lines = wrapTitle(text, style, frame, font);
+  const boxes = preset.box ? titleBoxes(lines, style, frame, font) : [];
+  const drag = useRef<{ y0: number; pos0: number; h: number } | null>(null);
+  const onDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    drag.current = { y0: e.clientY, pos0: style.positionPct, h: e.currentTarget.parentElement!.getBoundingClientRect().height };
+  };
+  const onMove = (e: React.PointerEvent) => {
+    const d = drag.current;
+    if (!d) return;
+    const pos = Math.min(90, Math.max(0, d.pos0 + ((e.clientY - d.y0) / d.h) * 100));
+    setStyle({ ...style, positionPct: Math.round(pos * 10) / 10 });
+  };
+  const onUp = () => (drag.current = null);
+  const pctW = (n: number) => `${(n * 100) / frame.width}%`;
+  const pctH = (n: number) => `${(n * 100) / frame.height}%`;
+  const cqw = (n: number) => `${(n * 100) / frame.width}cqw`;
+  const size = (frame.height * style.sizePct) / 100;
+  const boxShadow = preset.shadow ? Math.max(1, size * preset.shadow.offset) : 0;
+  return (
+    <>
+      {boxes.map((b, i) => (
+        <div
+          key={i}
+          className="short-title-box"
+          style={{
+            left: pctW(b.x),
+            top: pctH(b.y),
+            width: pctW(b.w),
+            height: pctH(b.h),
+            borderRadius: cqw(b.r),
+            background: preset.box!,
+            boxShadow: preset.shadow ? `${cqw(boxShadow)} ${cqw(boxShadow)} 0 ${rgba(preset.shadow.color, preset.shadow.alpha)}` : undefined,
+          }}
+        />
+      ))}
+      <div
+        className="short-title"
+        style={{
+          // each line's baseline where the export puts it (the browser would put it a little higher or lower)
+          top: `calc(${style.positionPct}% + ${baselineShift(cssBox, 1 / scale, (font.ascent ?? 0.8) / scale)}em)`,
+          // the export's letters: its font size times this font's scale; a line is the whole font size tall, as in the export
+          fontSize: `${(style.sizePct * frame.height * scale) / frame.width}cqw`,
+          lineHeight: 1 / scale,
+          // added to each space, in em of the letters: the export stretches the space itself
+          wordSpacing: `${((style.wordSpacing ?? 1) - 1) * font.width(' ')}em`,
+          width: `${TITLE_WIDTH * 100}%`,
+          // the export turns the title about its middle
+          transform: `translateX(-50%)${preset.tilt ? ` rotate(${preset.tilt}deg)` : ''}`,
+        }}
+        title="Drag up or down to move the title"
+        onPointerDown={onDown}
+        onPointerMove={onMove}
+        onPointerUp={onUp}
+        onPointerCancel={onUp}
+        onClick={(e) => e.stopPropagation()}
+      >
+        {lines.map((l, i) => (
+          // as the export: each line's top is a line height below the one before (the last keeps its own height)
+          <div key={i} style={{ height: i < lines.length - 1 ? `${(style.lineHeight ?? 1) / scale}em` : undefined, whiteSpace: 'nowrap' }}>
+            <span style={titleCss(preset, scale)}>
+              <TitleWords line={l} preset={preset} />
+            </span>
+          </div>
+        ))}
+      </div>
+    </>
+  );
+}
+
+/**
+ * Where the browser puts a font's baseline: its ascent and descent (em) as it
+ * lays out a line, and a capital's height. These can differ from what the
+ * export uses (libass places the baseline by the font's win ascent; Chrome by
+ * its hhea ascent, centred in the line height), so the preview moves its
+ * letters by the difference.
+ */
+function useFontBox(font: string) {
+  const width = useFontWidth(font); // changes once the font is in
+  return useMemo(() => {
+    const ctx = document.createElement('canvas').getContext('2d')!;
+    ctx.font = `100px '${font}', Impact, 'Arial Black', sans-serif`;
+    const m = ctx.measureText('H');
+    return { ascent: m.fontBoundingBoxAscent / 100, descent: m.fontBoundingBoxDescent / 100, cap: m.actualBoundingBoxAscent / 100 };
+  }, [font, width]);
+}
+
+/** How far down (em) the browser must move a line `lineEm` tall for its baseline to land `baselineEm` below the line's top. */
+const baselineShift = (box: { ascent: number; descent: number }, lineEm: number, baselineEm: number) =>
+  baselineEm - ((lineEm - box.ascent - box.descent) / 2 + box.ascent);
+
+/** How far down (em) to move a line so its capitals sit in the middle of its line box (whatever the line height). */
+const capCentreShift = (box: { ascent: number; descent: number; cap: number }) => (box.descent - box.ascent + box.cap) / 2;
+
+/** A font's text width in em, measured by the browser (the same glyph advances the export wraps with). */
+function useFontWidth(font: string) {
+  const [loaded, setLoaded] = useState(0);
+  useEffect(() => {
+    let live = true;
+    // measured again once the font is in, not with the fallback it's drawn in meanwhile
+    document.fonts.load(`100px '${font}'`).then(() => live && setLoaded((n) => n + 1), () => {});
+    return () => {
+      live = false;
+    };
+  }, [font]);
+  return useMemo(() => {
+    const ctx = document.createElement('canvas').getContext('2d')!;
+    ctx.font = `100px '${font}', 'Arial Black', sans-serif`;
+    return (t: string) => ctx.measureText(t).width / 100;
+  }, [font, loaded]); // eslint-disable-line react-hooks/exhaustive-deps
 }

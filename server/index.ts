@@ -6,14 +6,17 @@ import { cancelJob, getJob, latestJob, startJob } from './jobs.ts';
 import {
   alignProject, analyzeSpeech, autoSync, cleanupProject, baseClipsFor, clipsFor, createProject, createRecordingTest, defaultOutputPath, editCaption, editsOf, getProject, hasPlayer, listProjects,
   BUMPER_CACHE, loadSettings, peaksFile, reelCaptions, renderProject, saveProject, saveSettings, setPlayer, syncAnchors, transcribeProject, type Project,
-  analyzeClips, buildClipMoments, clipsMode, clipsPeaks, createClipsProject, sourceAt,
-  baseShortClips, createShort, defaultShortPath, feedImagesDir, findShort, renderShort, shortClipsFor, shortFeedImages, shortKills, shortLoopOrder, shortRounds,
+  analyzeClips, buildClipMoments, clipsMode, clipsPeaks, createClipsProject, readsKillfeed, sourceAt,
+  titlesPossible, writeTitles, writeShortTitles,
+  baseShortClips, createDirectShort, createShort, defaultShortPath, feedImagesDir, findShort, renderShort, shortClipsFor, shortFeedImages, shortKills, shortLoopOrder, shortRounds,
 } from './project.ts';
 import { fitLayout, shortFrame } from './shorts/layout.ts';
 import { readerAvailable } from './clips/read.ts';
 import { captionsReady } from './captions/transcribe.ts';
 import { cleanupAvailable } from './captions/cleanup.ts';
-import { availableFonts, fontFile } from './captions/fonts.ts';
+import { titlesAvailable } from './titles/generate.ts';
+import { assScale, availableFonts, fontFile, fontMetrics } from './captions/fonts.ts';
+import { TITLE_PRESETS } from './shorts/title.ts';
 import { manualSync } from './sync/align.ts';
 import { totalDuration } from './edit/plan.ts';
 import { normalizeCuts } from './edit/edits.ts';
@@ -68,6 +71,11 @@ function view(p: Project) {
     peaksJob: latestJob(p.id, 'peaks'),
     analyzeJob: latestJob(p.id, 'analyze'),
     readerAvailable: readerAvailable(),
+    titlesJob: latestJob(p.id, 'titles'),
+    titlesPossible: titlesPossible(p),
+    titlesAvailable: titlesAvailable(),
+    // global, not this project's copy: the same profile for every match
+    creatorProfile: loadSettings().creatorProfile,
     reelCaptions: reelCaptions(p, clips),
     anchors: hasPlayer(p) ? syncAnchors(p) : [],
     shortRounds: shortRounds(p),
@@ -155,6 +163,20 @@ app.post<{ Params: { id: string } }>('/api/projects/:id/captions/cleanup', async
   return startCleanupJob(load(req.params.id).id);
 });
 
+/** Claude writes YouTube titles for the highlight video from the match story. */
+app.post<{ Params: { id: string }; Body: { direction?: string } }>('/api/projects/:id/titles', async (req) => {
+  if (!titlesAvailable()) throw Object.assign(new Error('Set ANTHROPIC_API_KEY and restart the app to write titles'), { statusCode: 400 });
+  const id = load(req.params.id).id;
+  const direction = String(req.body?.direction ?? '').slice(0, 300);
+  return startJob('titles', id, async (_progress, signal) => {
+    const titles = await writeTitles(load(id), direction, signal);
+    const p = load(id); // keep changes made meanwhile
+    p.titles = titles;
+    saveProject(p);
+    return titles.ideas.length;
+  });
+});
+
 /** Minimal local file browser: the browser can't hand us real paths. */
 app.get<{ Querystring: { path?: string } }>('/api/fs', async (req) => {
   const path = req.query.path;
@@ -240,24 +262,47 @@ app.post<{ Body: { videoPath: string } }>('/api/projects/edit-test', async (req)
   return view(p);
 });
 
-/** OBS replay clips, no demo: each clip's last round with kills goes into one video. */
-app.post<{ Body: { paths: string[]; playerName?: string } }>('/api/projects/clips', async (req) => {
-  if (req.body.playerName !== undefined) saveSettings({ ...loadSettings(), playerName: req.body.playerName.trim() });
-  const p = createClipsProject(req.body.paths ?? []);
+/**
+ * Replay clips, no demo, into one video: CS2 clips with `readKillfeed` (each clip's last round with
+ * kills, read by Claude); any game without it (every clip whole).
+ */
+app.post<{ Body: { paths: string[]; playerName?: string; readKillfeed?: boolean } }>('/api/projects/clips', async (req) => {
+  const read = req.body.readKillfeed !== false;
+  if (read && req.body.playerName !== undefined) saveSettings({ ...loadSettings(), playerName: req.body.playerName.trim() });
+  const p = createClipsProject(req.body.paths ?? [], read);
   startSpeechJob(p.id);
   startPeaksJob(p.id);
   return view(p);
 });
 
+/**
+ * One clip straight into a short: the clip opens in the short editor at once
+ * (the whole clip); with `readKillfeed` (CS2), its kill feed is read in the background when Claude can.
+ */
+app.post<{ Body: { path: string; playerName?: string; readKillfeed?: boolean } }>('/api/projects/short', async (req) => {
+  const read = req.body.readKillfeed !== false;
+  if (read && req.body.playerName !== undefined) saveSettings({ ...loadSettings(), playerName: req.body.playerName.trim() });
+  const { project: p, short } = createDirectShort(req.body.path ?? '', read);
+  startSpeechJob(p.id);
+  startPeaksJob(p.id);
+  if (read && readerAvailable()) startAnalyzeJob(p.id, 'unread');
+  return { id: p.id, shortId: short.id };
+});
+
 /** Reads the clips (kill feed and round timer): the unread ones, all `again`, or just the clips `ids`. */
 app.post<{ Params: { id: string }; Body: { again?: boolean; ids?: string[] } }>('/api/projects/:id/analyze', async (req) => {
   const id = load(req.params.id).id;
+  if (!readsKillfeed(load(id))) throw Object.assign(new Error('This project doesn’t read the kill feed'), { statusCode: 400 });
   if (!readerAvailable()) throw Object.assign(new Error('Set ANTHROPIC_API_KEY and restart the app to read clips'), { statusCode: 400 });
+  return startAnalyzeJob(id, req.body?.ids?.length ? req.body.ids : req.body?.again ? 'all' : 'unread');
+});
+
+function startAnalyzeJob(id: string, which: 'unread' | 'all' | string[]) {
   return startJob('analyze', id, async (progress, signal) => {
     const working = load(id);
     return analyzeClips(
       working,
-      req.body?.ids?.length ? req.body.ids : req.body?.again ? 'all' : 'unread',
+      which,
       (src) => {
         // save each clip as it finishes, keeping changes made meanwhile
         const p = load(id);
@@ -269,7 +314,7 @@ app.post<{ Params: { id: string }; Body: { again?: boolean; ids?: string[] } }>(
       signal,
     );
   });
-});
+}
 
 app.get<{ Params: { id: string } }>('/api/projects/:id', async (req) => view(load(req.params.id)));
 
@@ -301,7 +346,7 @@ app.patch<{
     p.settings = { ...p.settings, ...settings, steamId: p.settings.steamId };
     // steamId and voice tracks belong to this match; the rest are defaults for the next one
     // (a short's layout and captions are saved by the short, so this project's older copy never overwrites them)
-    const { steamId: _, voiceTracks: __, shortLayout: ___, shortCaptions: ____, shortKillfeed: _____, shortOverlay: ______, shortLoop: _______, ...shared } = p.settings;
+    const { steamId: _, voiceTracks: __, shortLayout: ___, shortCaptions: ____, shortKillfeed: _____, shortOverlay: ______, shortLoop: _______, shortTitle: ________, ...shared } = p.settings;
     saveSettings({ ...loadSettings(), ...shared });
     if (redetectSpeech) {
       // new voice tracks, new speech: drop lines transcribed from the old tracks (keep hand edits)
@@ -385,16 +430,37 @@ function loadShort(p: Project, sid: string): Short {
 function shortView(p: Project, s: Short) {
   const clips = shortClipsFor(p, s);
   return {
-    short: s,
+    // its layout as it renders (an older one gets the bottom band)
+    short: { ...s, layout: fitLayout(s.layout, p.video) },
     baseClips: baseShortClips(p, s.round),
     clips,
     kills: shortKills(p, s.round),
     duration: totalDuration(clips),
-    // where a looping short is cut (recording seconds): it opens there and ends right before it
+    // where a looping short is cut (recording seconds): it opens there, on the reaction, and ends right before it
     loopCut: shortLoopOrder(p, s, clips)?.[0].start ?? null,
+    // per title font: how much smaller than CSS its letters come out in the export, its baseline and
+    // capital height, so the preview's letters and boxes match the export's
+    titleFonts: Object.fromEntries(
+      TITLE_PRESETS.map((t) => {
+        const m = fontMetrics(t.font);
+        return [t.font, { scale: assScale(t.font), ascent: m.ascent ?? null, cap: m.cap ?? null }];
+      }),
+    ),
     frame: shortFrame(p.video),
     defaultOutputPath: defaultShortPath(p, s),
     renderJob: latestJob(p.id, `short:${s.id}`),
+    // the 1080p export for Instagram, TikTok and Facebook
+    socialJob: latestJob(p.id, `short-social:${s.id}`),
+    // a clip made straight into a short: its kill feed being read (or read: then kills and titles have it)
+    direct: !!p.direct,
+    readJob: p.direct && readsKillfeed(p) ? latestJob(p.id, 'analyze') : null,
+    // the kill feed is read (CS2): a demo, or clips read by Claude; off, it's any game (no kill feed, no titles)
+    killfeed: !clipsMode(p) || readsKillfeed(p),
+    defaultSocialPath: defaultShortPath(p, s, true),
+    titlesJob: latestJob(p.id, `short-titles:${s.id}`),
+    titlesAvailable: titlesAvailable(),
+    // global, not this project's copy: the same profile for every match
+    creatorProfile: loadSettings().creatorProfile,
   };
 }
 
@@ -420,13 +486,22 @@ app.patch<{
     killfeed?: Partial<Settings['shortKillfeed']>;
     overlay?: Partial<Settings['shortOverlay']>;
     loop?: Partial<Settings['shortLoop']>;
+    /** the short's own title text */
+    title?: string;
+    /** how titles look (remembered for the next shorts) */
+    titleStyle?: Partial<Settings['shortTitle']>;
   };
 }>(
   '/api/projects/:id/shorts/:sid',
   async (req) => {
     const p = load(req.params.id);
     const s = loadShort(p, req.params.sid);
-    const { edits, layout, outputPath, captions, killfeed, overlay, loop } = req.body;
+    const { edits, layout, outputPath, captions, killfeed, overlay, loop, title, titleStyle } = req.body;
+    if (title !== undefined) s.title = title.slice(0, 200);
+    if (titleStyle) {
+      p.settings.shortTitle = { ...p.settings.shortTitle, ...titleStyle };
+      saveSettings({ ...loadSettings(), shortTitle: p.settings.shortTitle });
+    }
     if (loop) {
       p.settings.shortLoop = { ...p.settings.shortLoop, ...loop };
       saveSettings({ ...loadSettings(), shortLoop: p.settings.shortLoop });
@@ -456,15 +531,34 @@ app.patch<{
   },
 );
 
-app.post<{ Params: { id: string; sid: string } }>('/api/projects/:id/shorts/:sid/render', async (req) => {
+/** Claude writes YouTube Shorts titles and thumbnail text for the short, from its round's story. */
+app.post<{ Params: { id: string; sid: string }; Body: { direction?: string } }>('/api/projects/:id/shorts/:sid/titles', async (req) => {
+  if (!titlesAvailable()) throw Object.assign(new Error('Set ANTHROPIC_API_KEY and restart the app to write titles'), { statusCode: 400 });
+  const p0 = load(req.params.id);
+  const sid = loadShort(p0, req.params.sid).id;
+  const direction = String(req.body?.direction ?? '').slice(0, 300);
+  return startJob(`short-titles:${sid}`, p0.id, async (_progress, signal) => {
+    const titles = await writeShortTitles(load(p0.id), loadShort(load(p0.id), sid), direction, signal);
+    const p = load(p0.id); // keep changes made meanwhile
+    loadShort(p, sid).titles = titles;
+    saveProject(p);
+    return titles.ideas.length;
+  });
+});
+
+// ?for=social: the 1080p export for Instagram, TikTok and Facebook (its own job, so both can run)
+app.post<{ Params: { id: string; sid: string }; Querystring: { for?: string } }>('/api/projects/:id/shorts/:sid/render', async (req) => {
   const { id, sid } = req.params;
+  const social = req.query.for === 'social';
   loadShort(load(id), sid);
-  return startJob(`short:${sid}`, id, async (progress, signal) => {
+  return startJob(`${social ? 'short-social' : 'short'}:${sid}`, id, async (progress, signal) => {
     const working = load(id);
-    const out = await renderShort(working, loadShort(working, sid), progress, signal);
+    const out = await renderShort(working, loadShort(working, sid), progress, signal, social);
     // re-read so edits made while rendering aren't overwritten
     const p = load(id);
-    loadShort(p, sid).outputPath = out;
+    const s = loadShort(p, sid);
+    if (social) s.socialOutputPath = out;
+    else s.outputPath = out;
     saveProject(p);
     return out;
   });
@@ -486,10 +580,11 @@ app.get<{ Params: { id: string; key: string } }>('/api/projects/:id/killfeed/:ke
   return reply.send(createReadStream(file));
 });
 
-app.get<{ Params: { id: string; sid: string } }>('/api/projects/:id/shorts/:sid/output', (req, reply) => {
+app.get<{ Params: { id: string; sid: string }; Querystring: { for?: string } }>('/api/projects/:id/shorts/:sid/output', (req, reply) => {
   const s = loadShort(load(req.params.id), req.params.sid);
-  if (!s.outputPath || !existsSync(s.outputPath)) return reply.code(404).send({ error: 'Not rendered yet' });
-  return streamFile(s.outputPath, req.headers.range, reply);
+  const path = req.query.for === 'social' ? s.socialOutputPath : s.outputPath;
+  if (!path || !existsSync(path)) return reply.code(404).send({ error: 'Not rendered yet' });
+  return streamFile(path, req.headers.range, reply);
 });
 
 app.get<{ Params: { id: string } }>('/api/jobs/:id', async (req) => getJob(req.params.id));
