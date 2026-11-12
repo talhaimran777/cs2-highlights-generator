@@ -7,7 +7,7 @@ import {
   alignProject, analyzeSpeech, autoSync, cleanupProject, baseClipsFor, clipsFor, createProject, createRecordingTest, defaultOutputPath, editCaption, editsOf, getProject, hasPlayer, listProjects,
   BUMPER_CACHE, loadSettings, peaksFile, reelCaptions, renderProject, saveProject, saveSettings, setPlayer, syncAnchors, transcribeProject, type Project,
   analyzeClips, buildClipMoments, clipsMode, clipsPeaks, createClipsProject, readsKillfeed, sourceAt,
-  titlesPossible, writeTitles, writeShortTitles,
+  titlesPossible, writeTitles, writeShortTitles, projectTeaser, openingPath,
   baseShortClips, createDirectShort, createShort, defaultShortPath, feedImagesDir, findShort, renderShort, shortClipsFor, shortFeedImages, shortKills, shortLoopOrder, shortRounds,
 } from './project.ts';
 import { fitLayout, shortFrame } from './shorts/layout.ts';
@@ -61,6 +61,11 @@ function view(p: Project) {
     baseClips: baseClipsFor(p),
     edits: editsOf(p),
     reelDuration: totalDuration(clips),
+    // the cold open's opening-only test render, its last run
+    openingJob: latestJob(p.id, 'render-opening'),
+    openingPath: openingPath(p),
+    // the cold open's moments (what it would be, even while it's off)
+    teaser: projectTeaser(p, true),
     defaultOutputPath: defaultOutputPath(p),
     hasPlayer: hasPlayer(p),
     exportSettings: exportSettings(p.video),
@@ -408,8 +413,13 @@ app.post<{ Params: { id: string }; Body: { delta: number; round?: number } }>(
   },
 );
 
-app.post<{ Params: { id: string } }>('/api/projects/:id/render', async (req) => {
+// ?only=opening: just the cold open (and the intro after it), to try its look out quickly
+app.post<{ Params: { id: string }; Querystring: { only?: string } }>('/api/projects/:id/render', async (req) => {
   const id = req.params.id;
+  if (req.query.only === 'opening') {
+    load(id);
+    return startJob('render-opening', id, (progress, signal) => renderProject(load(id), progress, signal, true));
+  }
   return startJob('render', id, async (progress, signal) => {
     const out = await renderProject(load(id), progress, signal);
     const p = load(id);
@@ -658,10 +668,12 @@ app.get<{ Params: { id: string }; Querystring: { source?: string } }>('/api/proj
   const src = p.sources?.find((s) => s.id === req.query.source);
   return streamFile(src?.path ?? p.videoPath, req.headers.range, reply);
 });
-app.get<{ Params: { id: string } }>('/api/projects/:id/output', (req, reply) => {
+// ?only=opening: the opening-only test render
+app.get<{ Params: { id: string }; Querystring: { only?: string } }>('/api/projects/:id/output', (req, reply) => {
   const p = load(req.params.id);
-  if (!p.outputPath || !existsSync(p.outputPath)) return reply.code(404).send({ error: 'Not rendered yet' });
-  return streamFile(p.outputPath, req.headers.range, reply);
+  const path = req.query.only === 'opening' ? openingPath(p) : p.outputPath;
+  if (!path || !existsSync(path)) return reply.code(404).send({ error: 'Not rendered yet' });
+  return streamFile(path, req.headers.range, reply);
 });
 
 const webDist = resolve('dist');

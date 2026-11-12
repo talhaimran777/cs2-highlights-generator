@@ -384,7 +384,7 @@ function ProjectScreen({ id }: { id: string }) {
           {step === 'captions' && (
             <CaptionsStep p={p} update={update} playLine={(a, b) => captionPreview.current?.playLine(a, b)} onNext={() => setStep('export')} />
           )}
-          {step === 'export' && <ExportStep p={p} setP={setP} update={update} />}
+          {step === 'export' && <ExportStep p={p} setP={setP} update={update} play={playRange} />}
         </div>
         <aside className="preview">
           {step === 'captions' ? (
@@ -691,13 +691,140 @@ function HighlightsStep({ p, update, preview, onNext }: { p: ProjectView; update
   );
 }
 
-function ExportStep({ p, setP, update }: { p: ProjectView; setP: (p: ProjectView) => void; update: Update }) {
+/**
+ * The cold open ("COMING UP"): the match's best moments as hard-cut shots
+ * before the video, building up to the best one. On or off, how long, the
+ * label; the moments it picked, each playable in the preview.
+ */
+function TeaserSection({ p, setting, play }: { p: ProjectView; setting: (patch: Partial<ProjectView['settings']>) => void; play: (from: number, to: number) => void }) {
+  const t = p.settings.teaser;
+  const [label, setLabel] = useState(t.label);
+  // the opening on its own, rendered as the video will have it, to try its look out
+  const [job, setJob] = useState<Job | null>(p.openingJob);
+  const [error, setError] = useState('');
+  const rendering = job?.status === 'running';
+  const renderOpening = async () => {
+    setError('');
+    try {
+      const j = await api.renderOpening(p.id);
+      setJob(j);
+      const done = await waitJob(j.id, setJob);
+      if (done.status === 'error') setError(done.error ?? 'Render failed');
+    } catch (e: any) {
+      setError(e.message);
+    }
+  };
+  useEffect(() => {
+    if (p.openingJob?.status === 'running') waitJob(p.openingJob.id, setJob).catch(() => {});
+  }, [p.openingJob?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  const shots = p.teaser.flatMap((m) => m.shots);
+  const total = shots.reduce((s, x) => s + x.end - x.start, 0);
+  // the whole open, one shot after another (the preview plays each to its end)
+  const playAll = () => {
+    let at = 0;
+    for (const s of shots) {
+      setTimeout(() => play(s.start, s.end), at * 1000);
+      at += s.end - s.start + 0.15;
+    }
+  };
+  return (
+    <section className="teaser">
+      <h3>Coming up</h3>
+      <label className="row">
+        <input type="checkbox" checked={t.enabled} onChange={(e) => setting({ teaser: { ...t, enabled: e.target.checked } })} />
+        <span>Open the video on its best shots</span>
+        <span className="muted small">like a trailer: your best moment first, then a few different plays, hard cut, before your intro, so viewers know what's coming and stay for it</span>
+      </label>
+      {t.enabled && (
+        <>
+          <div className="row wrap">
+            <label className="row small">
+              <span className="muted">About</span>
+              <input
+                className="input"
+                style={{ width: 64 }}
+                type="number"
+                min={5}
+                max={30}
+                step={1}
+                value={t.seconds}
+                onChange={(e) => setting({ teaser: { ...t, seconds: Math.min(30, Math.max(5, Number(e.target.value) || 12)) } })}
+              />
+              <span className="muted">seconds</span>
+            </label>
+            <label className="row small grow">
+              <span className="muted">Label</span>
+              <input
+                className="input"
+                value={label}
+                maxLength={40}
+                placeholder="MATCH HIGHLIGHTS"
+                onChange={(e) => setLabel(e.target.value)}
+                onBlur={() => label.trim() && label !== t.label && setting({ teaser: { ...t, label: label.trim() } })}
+              />
+              <span className="muted">over the first moment · *stars* = red</span>
+            </label>
+          </div>
+          <label className="row small">
+            <input type="checkbox" checked={!!t.whoosh} onChange={(e) => setting({ teaser: { ...t, whoosh: e.target.checked } })} />
+            <span>Soft whoosh as each moment starts</span>
+            <span className="muted">quiet, no bass, on your first audio track only</span>
+          </label>
+          {p.teaser.length === 0 ? (
+            <div className="muted small">Not enough kills in the video's rounds for an opening (it needs at least two moments).</div>
+          ) : (
+            <>
+              <div className="row small">
+                <span>
+                  {p.teaser.length} moments · {shots.length} shots · {total.toFixed(1)} s
+                </span>
+                <button className="btn btn-xs" onClick={playAll}>
+                  ▶ Play it all
+                </button>
+                <button className="btn btn-xs" disabled={rendering} onClick={renderOpening} title="Just the opening and your intro after it, graded and cut as the video will have it">
+                  {rendering ? 'Rendering the opening…' : 'Render the opening only'}
+                </button>
+              </div>
+              {rendering && job && <Progress value={job.progress} />}
+              {error && <div className="error">{error}</div>}
+              {job?.status === 'done' && (
+                <div className="teaser-test">
+                  <video controls src={`/api/projects/${p.id}/output?only=opening&t=${job.id}`} />
+                  <div className="mono small">{p.openingPath}</div>
+                </div>
+              )}
+              <ol className="teaser-list">
+                {p.teaser.map((m, i) => (
+                  <li key={`${m.round}-${i}`} className={i === 0 ? 'best' : ''}>
+                    <span className="muted small">Round {m.round}</span>
+                    {m.tag ? <span className="title-chip">{m.tag.replace(/\*/g, '')}</span> : <span className="muted small">{m.kills === 1 ? 'kill' : `${m.kills} kills`}</span>}
+                    {i === 0 && <span className="title-chip best">Hook: your best moment</span>}
+                    <span className="grow" />
+                    {m.shots.map((s, j) => (
+                      <button key={j} className="btn btn-xs" title={`${fmtTime(s.start)}, ${(s.end - s.start).toFixed(1)} s`} onClick={() => play(s.start, s.end)}>
+                        ▶ {(s.end - s.start).toFixed(1)}s
+                      </button>
+                    ))}
+                  </li>
+                ))}
+              </ol>
+            </>
+          )}
+        </>
+      )}
+    </section>
+  );
+}
+
+function ExportStep({ p, setP, update, play }: { p: ProjectView; setP: (p: ProjectView) => void; update: Update; play: (from: number, to: number) => void }) {
   const [job, setJob] = useState<Job | null>(null);
   const [out, setOut] = useState(p.outputPath ?? p.defaultOutputPath);
   const stamp = useMemo(() => Date.now(), [job?.status]); // cache-bust after each render
   const st = p.settings;
 
   const setting = (patch: Partial<typeof st>) => update(() => api.patch(p.id, { settings: patch }));
+  // the cold open's length, when the video gets one
+  const opening = st.teaser.enabled && !recordingOnly(p) && p.mode !== 'clips' ? p.teaser.flatMap((m) => m.shots).reduce((s, x) => s + x.end - x.start, 0) : 0;
 
   const render = async () => {
     await api.patch(p.id, { outputPath: out });
@@ -739,6 +866,8 @@ function ExportStep({ p, setP, update }: { p: ProjectView; setP: (p: ProjectView
           </label>
         </div>
         )}
+        {/* a demo match knows every kill: it can open on its best shots */}
+        {!recordingOnly(p) && p.mode !== 'clips' && <TeaserSection p={p} setting={setting} play={play} />}
         {/* a captions test has no cuts to protect; its voice tracks are chosen on the Captions page */}
         {!recordingOnly(p) && <SpeechProtection p={p} setting={setting} update={update} />}
         {p.mode !== 'captions' && <BrandingSection p={p} setting={setting} />}
@@ -755,7 +884,7 @@ function ExportStep({ p, setP, update }: { p: ProjectView; setP: (p: ProjectView
                 ? `Render with captions (${fmtTime(p.reelDuration)})`
                 : p.mode === 'edit'
                   ? `Render edit (${fmtTime(p.reelDuration)})`
-                : `Render ${p.clips.length} clips (${fmtTime(p.reelDuration)})`}
+                : `Render ${p.clips.length} clips (${fmtTime(p.reelDuration)})${opening ? ` + ${Math.round(opening)}s opening` : ''}`}
           </button>
           {job?.status === 'running' && (
             <>

@@ -137,10 +137,14 @@ export interface Clip {
   speech?: { start: number; end: number };
   /** clips mode: the source clip's range on the timeline; added footage never crosses it */
   bounds?: [number, number];
+  /** played at this speed (a cold open's speed ramp; missing = 1) */
+  speed?: number;
   /** a looping short's seam: this edge runs straight on in the recording, so its sound isn't faded there */
   seamless?: 'start' | 'end';
   /** crossfade into this piece from the one before it over this many seconds (picture and sound) */
   blend?: number;
+  /** a shot of the highlight video's cold open ("coming up"): what it shows, and whether it opens it */
+  teaser?: { tag: string; first: boolean; kicker?: boolean; pop: boolean; flashIn?: boolean; flashOut?: boolean };
 }
 
 /** One red-outlined kill-feed entry (it involves me), as read from a replay clip. */
@@ -340,6 +344,8 @@ export interface Settings {
   clutchPreRoll: number;
   mergeGap: number;
   titleCards: boolean;
+  /** the highlight video opens on its best shots, cut hard, the first under `label` ("MATCH HIGHLIGHTS"); about `seconds` long */
+  teaser: { enabled: boolean; seconds: number; label: string; whoosh: boolean };
   /** never cut while someone is talking */
   protectSpeech: boolean;
   /** longest a cut waits for a sentence to finish before taking a breath pause */
@@ -416,6 +422,7 @@ export const DEFAULT_SETTINGS: Settings = {
   clutchPreRoll: 5,
   mergeGap: 1.5,
   titleCards: true,
+  teaser: { enabled: true, seconds: 10, label: 'MATCH HIGHLIGHTS', whoosh: false },
   protectSpeech: true,
   speechMaxWait: 8,
   sentenceGap: 1,

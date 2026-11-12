@@ -29,6 +29,10 @@ export interface RenderInput {
   frame?: { width: number; height: number; graph: (src: VideoInfo) => string; overlays?: (clip: Clip) => Overlay[] };
   /** made for Instagram, TikTok and Facebook (see SOCIAL) instead of the source's own settings */
   social?: boolean;
+  /** the cold open ("coming up"): shots played first, hard cut, before the intro; their text comes from `captions` */
+  teaser?: Clip[];
+  /** a clip's own look (a cold open's grade, flashes and impact), `dur` being how long it plays */
+  look?: (clip: Clip, dur: number) => ClipLook | null;
 }
 
 /** A picture laid over a clip from `from` seconds into it (sliding in when that's inside the clip), in output pixels. */
@@ -51,17 +55,34 @@ export interface Overlay {
 }
 
 const SLIDE_S = 0.18;
+/** a cold open's shots cut hard: their sound only just faded, so a cut doesn't click */
+const TEASER_FADE_S = 0.02;
 
 /**
  * The clip's sound faded in and out at its cuts; not at a seamless edge (a
  * looping short's seam) or where it's crossfaded with its neighbour.
  */
-function afade(clip: Clip, next: Clip | undefined, dur: number, fade: number): string[] {
+function afadeFilter(clip: Clip, next: Clip | undefined, dur: number, fade: number): string | null {
   const parts = [
     ...(clip.seamless === 'start' || clip.blend ? [] : [`afade=t=in:d=${fade}`]),
     ...(clip.seamless === 'end' || next?.blend ? [] : [`afade=t=out:st=${(dur - fade).toFixed(3)}:d=${fade}`]),
   ];
-  return parts.length ? ['-af', parts.join(',')] : [];
+  return parts.length ? parts.join(',') : null;
+}
+const afade = (clip: Clip, next: Clip | undefined, dur: number, fade: number): string[] => {
+  const f = afadeFilter(clip, next, dur, fade);
+  return f ? ['-af', f] : [];
+};
+
+/**
+ * A clip's own look (a cold open's shot): video filters under its captions
+ * (`before`, a grade) and over them (`after`, a flash), and a sound mixed
+ * into its first audio track as it starts (an impact).
+ */
+export interface ClipLook {
+  before: string[];
+  after: string[];
+  impact: { file: string; volume: number } | null;
 }
 
 /** ffmpeg inputs and graph that lay the overlays (inputs 1..n) over `[in]`, ending in `[out]`. */
@@ -280,22 +301,19 @@ export async function renderReel(
     dur: b.dur,
     run: async (out: string) => copyFileSync(await b.file(signal), out),
   });
-  if (input.intro) plan.push(bookend(input.intro));
-  const seenRounds = new Set<number>();
-  for (const [ci, clip] of clips.entries()) {
-    const card = input.cards.get(clip.round);
-    if (card && !seenRounds.has(clip.round)) {
-      seenRounds.add(clip.round);
-      plan.push({ kind: 'card', dur: CARD_SECONDS, run: (out, prog) => renderCard(info, card, common, out, workDir, prog, signal) });
-    }
-    const dur = clip.end - clip.start;
-    const fade = Math.min(0.1, dur / 4);
+  /** one clip's segment: cut, its captions burned in, its sound faded at its edges (`next`: the clip after it, if any) */
+  const clipStep = (clip: Clip, next: Clip | undefined, maxFade: number) => {
+    // a clip played slower (a speed ramp) runs longer than the footage it shows
+    const speed = clip.speed && clip.speed > 0 ? clip.speed : 1;
+    const dur = (clip.end - clip.start) / speed;
+    const fade = Math.min(maxFade, dur / 4);
+    const look = input.look?.(clip, dur) ?? null;
     const subs = [input.captions?.(clip) ?? null].flat().filter((s): s is string => !!s);
-    plan.push({
-      kind: 'clip',
+    return {
+      kind: 'clip' as const,
       dur,
       blend: clip.blend,
-      run: (out, prog) => {
+      run: (out: string, prog: (s: number) => void) => {
         const src = input.sourceOf?.(clip) ?? { path: input.videoPath, info: input.info, offset: 0 };
         const filters: string[] = [];
         // a social upload is limited-range BT.709: a full-range recording is converted, not just relabelled
@@ -304,13 +322,40 @@ export async function renderReel(
         if (!frame && (src.info.width !== info.width || src.info.height !== info.height)) {
           filters.push(`scale=${info.width}:${info.height}:force_original_aspect_ratio=decrease`, `pad=${info.width}:${info.height}:(ow-iw)/2:(oh-ih)/2`, 'setsar=1');
         }
-        if (src.info.fps !== info.fps) filters.push(`fps=${info.fps}`);
+        // slowed: stretched in time (then the fps filter fills the frame rate back in)
+        if (speed !== 1) filters.push(`setpts=(PTS-STARTPTS)/${speed}`);
+        if (src.info.fps !== info.fps || speed !== 1) filters.push(`fps=${info.fps}`);
+        // its own look under the captions (a grade)
+        filters.push(...(look?.before ?? []));
         // captions are burned in while the clip is encoded anyway
         subs.forEach((ass, n) => {
           const assFile = out.replace(/\.mp4$/, n ? `.${n}.ass` : '.ass');
           writeFileSync(assFile, ass);
           filters.push(`ass='${filterPath(assFile)}':fontsdir='${filterPath(FONTS_DIR)}'`);
         });
+        // and over them (a flash)
+        filters.push(...(look?.after ?? []));
+        // slowed, or with a sound mixed in: the sound goes through one filter graph with the picture
+        if (!frame && (speed !== 1 || look?.impact)) {
+          const tracks = Math.min(info.audio.length, src.info.audio.length);
+          const chain = [speed !== 1 ? `atempo=${speed}` : null, afadeFilter(clip, next, dur, fade)].filter(Boolean).join(',') || 'anull';
+          const graph = [`[0:v:0]${filters.join(',') || 'null'}[v]`];
+          for (let i = 0; i < tracks; i++) {
+            if (i === 0 && look?.impact) {
+              graph.push(`[0:a:0]${chain}[m0]`, `[1:a]volume=${look.impact.volume}[hit]`, '[m0][hit]amix=inputs=2:duration=first:normalize=0[a0]');
+            } else graph.push(`[0:a:${i}]${chain}[a${i}]`);
+          }
+          return runFfmpeg(
+            [
+              '-ss', (clip.start - src.offset).toFixed(3), '-i', src.path, ...(look?.impact ? ['-i', look.impact.file] : []), '-t', dur.toFixed(3),
+              '-filter_complex', graph.join(';'),
+              '-map', '[v]', ...Array.from({ length: tracks }, (_, i) => ['-map', `[a${i}]`]).flat(),
+              ...common, out,
+            ],
+            prog,
+            signal,
+          );
+        }
         // pictures over the frame (a short's kill-feed entries), under the captions
         const over = frame?.overlays?.(clip) ?? [];
         const lay = over.length ? overlayGraph(over, info.fps) : null;
@@ -326,14 +371,27 @@ export async function renderReel(
                 ]
               : ['-map', '0:v:0', '-map', audioMap, ...(filters.length ? ['-vf', filters.join(',')] : [])]),
             // a short fade at each cut, except where a looping short's seam runs straight on
-            ...afade(clip, clips[ci + 1], dur, fade),
+            ...afade(clip, next, dur, fade),
             ...common, out,
           ],
           prog,
           signal,
         );
       },
-    });
+    };
+  };
+
+  // the cold open: its shots cut hard into one another, before the channel's intro
+  (input.teaser ?? []).forEach((c, i, all) => plan.push(clipStep(c, all[i + 1], TEASER_FADE_S)));
+  if (input.intro) plan.push(bookend(input.intro));
+  const seenRounds = new Set<number>();
+  for (const [ci, clip] of clips.entries()) {
+    const card = input.cards.get(clip.round);
+    if (card && !seenRounds.has(clip.round)) {
+      seenRounds.add(clip.round);
+      plan.push({ kind: 'card', dur: CARD_SECONDS, run: (out, prog) => renderCard(info, card, common, out, workDir, prog, signal) });
+    }
+    plan.push(clipStep(clip, clips[ci + 1], 0.1));
   }
 
   if (input.outro) plan.push(bookend(input.outro));

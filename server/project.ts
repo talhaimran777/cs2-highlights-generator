@@ -9,7 +9,7 @@ import { planClips, protectSpeech, roundCardText } from './edit/plan.ts';
 import { applyEdits } from './edit/edits.ts';
 import { encodeArgs, renderReel, SOCIAL, type Bookend } from './edit/render.ts';
 import { bumperFile, bumperSeconds, reelTarget, type BumperKind } from './branding/bumper.ts';
-import { imageSize, probe, type VideoInfo } from './util/ffmpeg.ts';
+import { imageSize, probe, runFfmpeg, type VideoInfo } from './util/ffmpeg.ts';
 import { detectSpeech, type Speech } from './audio/speech.ts';
 import { DEFAULT_SETTINGS, NO_EDITS, type CaptionLine, type Edits, type Clip, type MatchData, type Moment, type RoundIntro, type FeedKill, type Settings, type Short, type Source, type SyncModel } from './types.ts';
 import { computePeaks, PEAKS_PER_SEC, readPeaks } from './audio/peaks.ts';
@@ -21,7 +21,8 @@ import { buildAss } from './captions/ass.ts';
 import { fontMetrics, resolveFont } from './captions/fonts.ts';
 import { loopOrder, matchShortClips, matchShortKills, matchShortRounds, SHORT_GAP_S, SHORT_MIN_KILLS, sourceShortClips, sourceShortKills, sourceShortRounds } from './shorts/plan.ts';
 import { FEED_FADE_S, FEED_ROW, FEED_SHIFT_S, feedGoneAt, feedImageRect, feedOnScreen, holdKills, holdsFeed, feedMargin, feedStay, feedTextSize, feedTopPct, fitFeedScale, killfeedAss, slideFrom } from './shorts/killfeed.ts';
-import { placeTitle, titleAss, titlePreset } from './shorts/title.ts';
+import { placeTitle, TITLE_FONT, titleAss, titlePreset } from './shorts/title.ts';
+import { WHOOSH_SOURCE, planTeaser, TEASER_TAG, teaserCuts, teaserLook, teaserText, type TeaserMoment } from './teaser.ts';
 import { grabFeedEntries } from './shorts/feedgrab.ts';
 import { buildStory, shortStoryFromClip, shortStoryFromMatch, type MatchStory, type ShortStory } from './titles/story.ts';
 import { generateShortTitles, generateTitles, type TitleSet } from './titles/generate.ts';
@@ -95,6 +96,12 @@ export function withDefaults(s: Partial<Settings>): Settings {
     shortKillfeed: { ...DEFAULT_SETTINGS.shortKillfeed, ...s.shortKillfeed },
     shortOverlay: { ...DEFAULT_SETTINGS.shortOverlay, ...s.shortOverlay },
     shortTitle: { ...DEFAULT_SETTINGS.shortTitle, ...s.shortTitle },
+    // the open's first defaults ("COMING *UP*", 12 s) give way to today's (the label says it was never changed)
+    teaser: {
+      ...DEFAULT_SETTINGS.teaser,
+      ...s.teaser,
+      ...(s.teaser?.label === 'COMING *UP*' ? { label: DEFAULT_SETTINGS.teaser.label, seconds: s.teaser.seconds === 12 ? DEFAULT_SETTINGS.teaser.seconds : s.teaser.seconds } : {}),
+    },
     // only today's fields (an older `lead` is dropped)
     shortLoop: { enabled: s.shortLoop?.enabled ?? DEFAULT_SETTINGS.shortLoop.enabled, after: s.shortLoop?.after ?? DEFAULT_SETTINGS.shortLoop.after },
   };
@@ -662,17 +669,40 @@ export function shortLoopOrder(p: Project, s: Short, clips = shortClipsFor(p, s)
   return l.enabled ? loopOrder(clips, shortKills(p, s.round), l.after) : null;
 }
 
-export async function renderProject(p: Project, onProgress?: (f: number) => void, signal?: AbortSignal): Promise<string> {
+/** Where an opening-only test render goes (next to the highlight video). */
+export const openingPath = (p: Project) => (p.outputPath ?? defaultOutputPath(p)).replace(/\.mp4$/, '_coming-up.mp4');
+
+/**
+ * Renders the highlight video: the cold open, the intro, the clips (round
+ * cards between them), the outro. `onlyOpening`: just the cold open and the
+ * intro after it, to try its look out quickly (made even while it's off).
+ */
+export async function renderProject(p: Project, onProgress?: (f: number) => void, signal?: AbortSignal, onlyOpening = false): Promise<string> {
   if (!p.sync && !recordingOnly(p) && !clipsMode(p)) throw new Error('Sync the recording first');
-  const clips = clipsFor(p);
-  if (clips.length === 0) throw new Error('No clips enabled');
+  const clips = onlyOpening ? [] : clipsFor(p);
+  if (clips.length === 0 && !onlyOpening) throw new Error('No clips enabled');
   const cards = new Map<number, { title: string; subtitle: string }>();
   if (p.settings.titleCards && !recordingOnly(p)) {
     for (const c of clips) {
       cards.set(c.round, clipsMode(p) ? clipCardText(p.sources![c.round - 1], c.round - 1, p.moments) : roundCardText(p.match, c.round, p.moments));
     }
   }
-  const outPath = p.outputPath ?? defaultOutputPath(p);
+  // the cold open: the best shots, cut hard, under "COMING UP" (a demo match only: it knows every kill)
+  const cuts = teaserCuts(projectTeaser(p, onlyOpening));
+  if (onlyOpening && cuts.length === 0) throw new Error('Not enough kills in the video’s rounds for an opening');
+  const teaser: Clip[] = cuts.map((c, i) => ({
+    round: c.round, start: c.start, end: c.end, momentIds: [], label: c.tag || 'Shot', speed: c.speed,
+    teaser: { tag: c.tag, first: c.first, kicker: c.kicker, pop: c.pop, flashIn: c.flashIn, flashOut: c.flashOut },
+    // a speed ramp's two halves are the same footage running on: no sound fade where they meet
+    ...(cuts[i + 1] && Math.abs(cuts[i + 1].start - c.end) < 1e-6 ? { seamless: 'end' as const } : {}),
+    ...(cuts[i - 1] && Math.abs(cuts[i - 1].end - c.start) < 1e-6 ? { seamless: 'start' as const } : {}),
+  }));
+  // the whoosh as each moment starts, when it's on
+  const impact = cuts.length && p.settings.teaser.whoosh ? await whooshFile(signal) : null;
+  const titleFont = resolveFont(TITLE_FONT);
+  const teaserTitle = (text: string, style: typeof TEASER_TAG, dur: number) => titleAss(text, style, dur, p.video, titleFont, fontMetrics(TITLE_FONT));
+  const reelCaptionsOf = clipCaptions(p);
+  const outPath = onlyOpening ? openingPath(p) : (p.outputPath ?? defaultOutputPath(p));
   const b = p.settings.branding;
   // a captions test is only for checking captions; everything else gets the channel's intro / outro
   const branded = p.mode !== 'captions' && !!b.name.trim();
@@ -680,16 +710,38 @@ export async function renderProject(p: Project, onProgress?: (f: number) => void
   const bookend = (kind: BumperKind): Bookend => ({ dur: bumperSeconds(kind), file: (signal) => bumperFile(kind, b, target, BUMPER_CACHE, signal) });
   await renderReel(
     {
-      videoPath: p.videoPath, info: p.video, clips, cards, outPath, workDir: join(DATA_DIR, 'work', p.id), captions: clipCaptions(p),
+      videoPath: p.videoPath, info: p.video, clips, cards, outPath,
+      // its own folder: the full render may run at the same time
+      workDir: join(DATA_DIR, 'work', onlyOpening ? `${p.id}-opening` : p.id),
+      teaser,
+      // the open's text over the time it plays (a slowed cut plays longer)
+      captions: (c) => (c.teaser ? teaserText(c.teaser, p.settings.teaser.label, (c.end - c.start) / (c.speed ?? 1), teaserTitle, p.video) : reelCaptionsOf(c)),
+      look: (c, dur) => (c.teaser ? teaserLook(c.teaser, dur, impact) : null),
       sourceOf: clipsMode(p) ? (c) => sourceAt(p, c.start) : undefined,
       intro: branded && b.intro ? bookend('intro') : undefined,
-      outro: branded && b.outro ? bookend('outro') : undefined,
+      outro: branded && b.outro && !onlyOpening ? bookend('outro') : undefined,
     },
     onProgress,
     signal,
   );
-  p.outputPath = outPath;
+  if (!onlyOpening) p.outputPath = outPath;
   return outPath;
+}
+
+/** The cold open's whoosh (see WHOOSH_SOURCE), made once and kept. */
+async function whooshFile(signal?: AbortSignal): Promise<string> {
+  const file = join(DATA_DIR, 'cache', 'whoosh.wav');
+  if (!existsSync(file)) {
+    mkdirSync(dirname(file), { recursive: true });
+    await runFfmpeg(['-y', '-f', 'lavfi', '-i', WHOOSH_SOURCE, '-c:a', 'pcm_s16le', file], undefined, signal);
+  }
+  return file;
+}
+
+/** The highlight video's cold open: a demo match's best shots from rounds in the video (none when it's off, unless `evenOff`: to show what it would be). */
+export function projectTeaser(p: Project, evenOff = false): TeaserMoment[] {
+  if ((!p.settings.teaser.enabled && !evenOff) || clipsMode(p) || recordingOnly(p)) return [];
+  return planTeaser(p.match, p.settings.steamId, p.sync, new Set(clipsFor(p).map((c) => c.round)), p.video.duration, p.settings.teaser.seconds);
 }
 
 /** Titles can be written for a match with a demo and the player picked (not clips or a bare recording). */

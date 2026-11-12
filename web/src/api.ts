@@ -3,8 +3,9 @@ import type { VideoInfo } from '../../server/util/ffmpeg.ts';
 import type { Job } from '../../server/jobs.ts';
 import type { ExportSettings } from '../../server/edit/render.ts';
 import type { TitleIdea, TitleSet } from '../../server/titles/generate.ts';
+import type { TeaserMoment } from '../../server/teaser.ts';
 
-export type { TitleIdea, TitleSet };
+export type { TitleIdea, TitleSet, TeaserMoment };
 export type { CaptionLine, CaptionSettings, CaptionWord, Clip, Edits, FeedKill, Kill, Moment, Rect, Settings, Short, ShortLayout, Source, SyncModel, Job, ExportSettings };
 
 export interface ProjectView {
@@ -36,6 +37,11 @@ export interface ProjectView {
   baseClips: Clip[];
   edits: Edits;
   reelDuration: number;
+  /** the cold open's moments (what it would be, even while it's off) */
+  teaser: TeaserMoment[];
+  /** the opening-only test render: its last run and where it goes */
+  openingJob: Job | null;
+  openingPath: string;
   defaultOutputPath: string;
   /** false when the remembered player isn't in this match */
   hasPlayer: boolean;
@@ -137,6 +143,8 @@ export const api = {
     req<ProjectView>('POST', `/api/projects/${id}/sync/manual`, { tick, videoSec }),
   nudge: (id: string, delta: number, round?: number) => req<ProjectView>('POST', `/api/projects/${id}/sync/nudge`, { delta, round }),
   render: (id: string) => req<Job>('POST', `/api/projects/${id}/render`),
+  /** just the cold open (and the intro after it), to try its look out */
+  renderOpening: (id: string) => req<Job>('POST', `/api/projects/${id}/render?only=opening`),
   detectSpeech: (id: string) => req<Job>('POST', `/api/projects/${id}/speech`),
   transcribe: (id: string) => req<Job>('POST', `/api/projects/${id}/transcribe`),
   startPeaks: (id: string) => req<Job>('POST', `/api/projects/${id}/peaks`),
